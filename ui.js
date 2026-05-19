@@ -74,8 +74,11 @@ function updatePathInfo() {
   const st = pathStats();
   let html = `<div class="path-stats">`
     + `<div class="row"><span>Hexes</span><span>${st.hexes}</span></div>`
+    + `<div class="row"><span>Distance</span><span>${st.miles.toLocaleString()} mi / ${st.km.toLocaleString(undefined, { maximumFractionDigits: 0 })} km</span></div>`
     + `<div class="row"><span>Subhexes in mask</span><span>${st.subhexes}</span></div>`
-    + `<div class="row"><span>Cost</span><span>${st.cost.toFixed(1)}</span></div>`;
+    + `<div class="row"><span>Cost</span><span>${st.cost.toFixed(1)}</span></div>`
+    + (st.embarks ? `<div class="row"><span>Embarks</span><span>${st.embarks}</span></div>` : "")
+    + (st.sails   ? `<div class="row"><span>Sailing steps</span><span>${st.sails}</span></div>` : "");
   const terrains = Object.keys(st.byTerrain).sort();
   for (const t of terrains) {
     html += `<div class="row"><span>${escapeHtml(t)}</span><span>${st.byTerrain[t]}</span></div>`;
@@ -90,7 +93,7 @@ function updateStatus() {
   if (toId)   s += `  ·  To: ${SUBHEX_INDEX.get(toId).name}`;
   if (pathHexIds && pathHexIds.length > 0) {
     const st = pathStats();
-    s += `  ·  ${st.hexes} hexes, cost ${st.cost.toFixed(1)}`;
+    s += `  ·  ${st.hexes} hexes (${st.miles} mi / ${Math.round(st.km)} km), cost ${st.cost.toFixed(1)}`;
   }
   statusEl.textContent = s;
 }

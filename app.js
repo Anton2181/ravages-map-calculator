@@ -2,21 +2,28 @@
 
 // =================== Config ===================
 const LAYERS = [
-  { id: "base",        file: "Ravages_ver_6.3_hex.png", label: "Player map (base)",  on: false, opacity: 1.00 },
-  { id: "sea",         file: "sea.png",                 label: "Sea fill",            on: true,  opacity: 1.00 },
-  { id: "continent",   file: "Continent Meat.png",      label: "Continent meat",      on: false, opacity: 1.00 },
-  { id: "terrain",     file: "Terrain.png",             label: "Terrain (elevation)", on: true,  opacity: 1.00 },
-  { id: "rivers",      file: "rivers.png",              label: "Rivers",              on: false, opacity: 1.00 },
-  { id: "roads",       file: "Roads.png",               label: "Roads",               on: false, opacity: 1.00 },
-  { id: "displayable", file: "displayable grid.png",    label: "Displayable grid",    on: false, opacity: 1.00 },
-  { id: "simple",      file: "simple grid.png",         label: "Simple grid",         on: false, opacity: 0.40 },
+  { id: "sea",         file: "sea.png",                 label: "Sea fill",               on: true,  opacity: 1.00 },
+  { id: "continent",   file: "Continent Meat.png",      label: "Continent meat",         on: false, opacity: 1.00 },
+  { id: "terrain",     file: "Terrain.png",             label: "Terrain (elevation)",    on: true,  opacity: 1.00 },
+  { id: "rivers",      file: "rivers.png",              label: "Rivers",                 on: false, opacity: 1.00 },
+  { id: "roads",       file: "Roads.png",               label: "Roads",                  on: false, opacity: 1.00 },
+  { id: "ctf",         file: "citiestownsforts.png",    label: "Cities / towns / forts", on: false, opacity: 1.00 },
+  { id: "simple",      file: "simple grid.png",         label: "Simple grid",            on: false, opacity: 0.40 },
+  { id: "base",        file: "Ravages_ver_6.3_hex.png", label: "Player map (base)",      on: false, opacity: 1.00 },
 ];
-const CLASSES = ["Flatlands", "Plains", "Woodland", "Hills", "Mountains", "Peaks", "Lake", "Sea", "Ocean"];
+const CLASSES = ["Flatlands", "Plains", "Woodland", "Hills", "Mountains", "Peaks", "Lake", "Sea", "Ocean", "Sailing", "Embark"];
 const DEFAULT_WEIGHTS = {
   "Flatlands": 1, "Plains": 1, "Woodland": 2,
   "Hills": 2, "Mountains": 5, "Peaks": 8,
   "Lake": 15, "Sea": 20, "Ocean": 20,
+  // Special edge weights (not hex terrain types):
+  //   Sailing — water -> water step (cheap; ships travel fast).
+  //   Embark  — land <-> water boundary crossing (loading or unloading a ship).
+  "Sailing": 1, "Embark": 5,
 };
+
+// Hex terrains classified as water. Used to pick which edge weight applies.
+const WATER_TERRAINS = new Set(["Ocean", "Sea", "Lake"]);
 // URL of the public Google Sheet that maps hex id -> main terrain (refetched
 // each session so edits in the sheet immediately affect pathfinding).
 const HEX_TERRAIN_CSV_URL = "https://docs.google.com/spreadsheets/d/1jC2kO_Hidhg4WoL-jBGw1lKKD5s6a1-xoqv1omTZR_k/gviz/tq?tqx=out:csv&gid=0";
@@ -221,9 +228,17 @@ function recomputePath() {
     const [d, u] = heap.pop();
     if (u === dstHex) break;
     if (d > dist.get(u)) continue;
+    const uTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(u) : null;
+    const uIsWater = uTerrain ? WATER_TERRAINS.has(uTerrain) : false;
     for (const v of hexNeighbors(u)) {
-      const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(v) : null;
-      const w = terrain ? +weights[terrain] : NaN;
+      const vTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(v) : null;
+      if (!vTerrain) continue;
+      const vIsWater = WATER_TERRAINS.has(vTerrain);
+      // Edge cost depends on which side(s) of shore we're on.
+      let w;
+      if (uIsWater && vIsWater)        w = +weights["Sailing"];
+      else if (uIsWater !== vIsWater)  w = +weights["Embark"];
+      else                             w = +weights[vTerrain];
       if (!isFinite(w) || w <= 0) continue;  // impassable / unknown
       const nd = d + w;
       if (!dist.has(v) || nd < dist.get(v)) {
@@ -492,16 +507,32 @@ function pathStats() {
   }
   let cost = 0;
   const byTerrain = {};
+  let embarks = 0, sails = 0;
   for (let i = 0; i < pathHexIds.length; i++) {
     const hid = pathHexIds[i];
     const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null;
     if (terrain) byTerrain[terrain] = (byTerrain[terrain] || 0) + 1;
     if (i > 0 && terrain) {
-      const w = +weights[terrain];
+      const prevTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(pathHexIds[i - 1]) : null;
+      const prevIsWater = prevTerrain ? WATER_TERRAINS.has(prevTerrain) : false;
+      const curIsWater  = WATER_TERRAINS.has(terrain);
+      let w;
+      if (prevIsWater && curIsWater)        { w = +weights["Sailing"]; sails++; }
+      else if (prevIsWater !== curIsWater)  { w = +weights["Embark"];  embarks++; }
+      else                                   { w = +weights[terrain]; }
       if (isFinite(w)) cost += w;
     }
   }
-  return { hexes: pathHexIds.length, subhexes: pathSubhexIds ? pathSubhexIds.size : 0, cost, byTerrain };
+  // One hex of movement = 30 miles. Distance is the count of inter-hex
+  // transitions (hexes - 1), since the starting hex is where you begin.
+  const miles = Math.max(0, pathHexIds.length - 1) * 30;
+  const km    = miles * 1.609344;
+  return {
+    hexes: pathHexIds.length,
+    subhexes: pathSubhexIds ? pathSubhexIds.size : 0,
+    cost, byTerrain, embarks, sails,
+    miles, km,
+  };
 }
 function drawHexOutlines() {
   if (!SHOW_HEX_OUTLINE || !pathIds || pathIds.length === 0) return;
