@@ -27,12 +27,14 @@ function buildLayerControls() {
   }
 }
 
+const WEIGHT_LABELS = { "Embark": "Embark / disembark" };
 function buildWeightControls() {
   weightsEl.innerHTML = "";
   for (const cls of CLASSES) {
     const row = document.createElement("div");
     row.className = "weight-row";
-    row.innerHTML = `<span class="swatch ${cls}"></span><span class="name">${cls}</span>`
+    const label = WEIGHT_LABELS[cls] || cls;
+    row.innerHTML = `<span class="swatch ${cls}"></span><span class="name">${escapeHtml(label)}</span>`
       + `<input type="number" min="0" step="0.5" value="${weights[cls]}" />`;
     row.querySelector("input").addEventListener("change", (e) => {
       const v = parseFloat(e.target.value);
@@ -77,8 +79,7 @@ function updatePathInfo() {
     + `<div class="row"><span>Distance</span><span>${st.miles.toLocaleString()} mi / ${st.km.toLocaleString(undefined, { maximumFractionDigits: 0 })} km</span></div>`
     + `<div class="row"><span>Subhexes in mask</span><span>${st.subhexes}</span></div>`
     + `<div class="row"><span>Cost</span><span>${st.cost.toFixed(1)}</span></div>`
-    + (st.embarks ? `<div class="row"><span>Embarks</span><span>${st.embarks}</span></div>` : "")
-    + (st.sails   ? `<div class="row"><span>Sailing steps</span><span>${st.sails}</span></div>` : "");
+    + (st.embarks ? `<div class="row"><span>Embarks</span><span>${st.embarks}</span></div>` : "");
   const terrains = Object.keys(st.byTerrain).sort();
   for (const t of terrains) {
     html += `<div class="row"><span>${escapeHtml(t)}</span><span>${st.byTerrain[t]}</span></div>`;
@@ -249,4 +250,66 @@ function buildLineControls() {
     const isHidden = tpanels.classList.toggle("hidden");
     tbtn.textContent = isHidden ? "Show settings" : "Hide settings";
   });
+}
+
+// ----- Reachability (isochrone) panel -----
+function buildIsochroneControls() {
+  isoEl.innerHTML = "";
+
+  const onRow = document.createElement("div");
+  onRow.className = "layer-row";
+  onRow.innerHTML = `<input type="checkbox" id="iso-on" ${ISOCHRONE_MODE ? "checked" : ""} />`
+    + `<label for="iso-on">Enable (click to set origin)</label>`;
+  onRow.querySelector("input").addEventListener("change", (e) => {
+    ISOCHRONE_MODE = e.target.checked;
+    if (!ISOCHRONE_MODE) {
+      isochroneSourceId = null;
+      isochroneHexIds = null;
+      isochroneSubhexIds = null;
+    } else if (isochroneSourceId != null) {
+      computeIsochrone();
+    }
+    renderSelection(); updateStatus();
+  });
+  isoEl.appendChild(onRow);
+
+  const bRow = document.createElement("div");
+  bRow.className = "weight-row";
+  bRow.innerHTML = `<span class="name">Budget</span>`
+    + `<input type="range" min="1" max="200" step="1" value="${ISOCHRONE_BUDGET}" />`
+    + `<span class="alpha-val">${ISOCHRONE_BUDGET}</span>`;
+  const bSlider = bRow.querySelector("input");
+  const bLabel  = bRow.querySelector(".alpha-val");
+  bSlider.addEventListener("input", (e) => {
+    ISOCHRONE_BUDGET = +e.target.value;
+    bLabel.textContent = ISOCHRONE_BUDGET;
+    if (ISOCHRONE_MODE && isochroneSourceId != null) {
+      computeIsochrone();
+      renderSelection(); updateStatus();
+    }
+  });
+  isoEl.appendChild(bRow);
+
+  const cRow = document.createElement("div");
+  cRow.className = "color-row";
+  const hex = rgbToHex(ISOCHRONE_COLOR);
+  const aPct = Math.round((ISOCHRONE_ALPHA / 255) * 100);
+  cRow.innerHTML = `<span class="name">Color</span>`
+    + `<input type="color" value="${hex}" />`
+    + `<input type="range" class="alpha" min="0" max="100" value="${aPct}" title="opacity" />`
+    + `<span class="alpha-val">${aPct}%</span>`;
+  const colorInput = cRow.querySelector("input[type=color]");
+  const alphaInput = cRow.querySelector("input[type=range]");
+  const alphaVal   = cRow.querySelector(".alpha-val");
+  colorInput.addEventListener("input", (e) => {
+    ISOCHRONE_COLOR = hexToRgb(e.target.value);
+    renderSelection();
+  });
+  alphaInput.addEventListener("input", (e) => {
+    const pct = +e.target.value;
+    ISOCHRONE_ALPHA = Math.round((pct / 100) * 255);
+    alphaVal.textContent = pct + "%";
+    renderSelection();
+  });
+  isoEl.appendChild(cRow);
 }

@@ -32,6 +32,12 @@
       <div id="path-info"></div>
     </div>
 
+    <div class="panel-section">
+      <h3>Reachability (isochrone)</h3>
+      <div id="isochrone"></div>
+      <div class="help" style="margin-top:6px;">Pick a hex to see everywhere reachable within a cost budget. Embark / disembark and water weights apply the same way as in the From/To path.</div>
+    </div>
+
     <div id="settings-toggle-row" class="panel-section">
       <span class="button" id="settings-toggle">Show settings</span>
     </div>
@@ -40,7 +46,7 @@
     <div class="panel-section">
       <h3>Traversal weights</h3>
       <div id="weights"></div>
-      <div class="help" style="margin-top:6px;">Cost is paid per hex traversed; each hex's cost = max(weights of subhexes you pass through inside it). Same-hex moves between subhexes are free in distance but raise that hex's max if a heavier class is entered.</div>
+      <div class="help" style="margin-top:6px;">Each hex you enter costs its terrain weight. Lake / Sea / Ocean weights apply when sailing water-to-water. <b>Embark / disembark</b> is added each time the route crosses the shoreline. Starting hex is free. Path recomputes on every change.</div>
     </div>
     <div class="panel-section">
       <h3>Colors</h3>

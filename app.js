@@ -3,23 +3,22 @@
 // =================== Config ===================
 const LAYERS = [
   { id: "sea",         file: "sea.png",                 label: "Sea fill",               on: true,  opacity: 1.00 },
-  { id: "continent",   file: "Continent Meat.png",      label: "Continent meat",         on: false, opacity: 1.00 },
+  { id: "continent",   file: "Continent Meat.png",      label: "Outline"        ,         on: false, opacity: 1.00 },
   { id: "terrain",     file: "Terrain.png",             label: "Terrain (elevation)",    on: true,  opacity: 1.00 },
   { id: "rivers",      file: "rivers.png",              label: "Rivers",                 on: false, opacity: 1.00 },
   { id: "roads",       file: "Roads.png",               label: "Roads",                  on: false, opacity: 1.00 },
   { id: "ctf",         file: "citiestownsforts.png",    label: "Cities / towns / forts", on: false, opacity: 1.00 },
   { id: "simple",      file: "simple grid.png",         label: "Simple grid",            on: false, opacity: 0.40 },
-  { id: "base",        file: "Ravages_ver_6.3_hex.png", label: "Player map (base)",      on: false, opacity: 1.00 },
+  { id: "base",        file: "Ravages_ver_6.3_hex.png", label: "Player map"        ,      on: false, opacity: 1.00 },
 ];
-const CLASSES = ["Flatlands", "Plains", "Woodland", "Hills", "Mountains", "Peaks", "Lake", "Sea", "Ocean", "Sailing", "Embark"];
+const CLASSES = ["Flatlands", "Plains", "Woodland", "Hills", "Mountains", "Peaks", "Lake", "Sea", "Ocean", "Embark"];
 const DEFAULT_WEIGHTS = {
   "Flatlands": 1, "Plains": 1, "Woodland": 2,
   "Hills": 2, "Mountains": 5, "Peaks": 8,
-  "Lake": 15, "Sea": 20, "Ocean": 20,
-  // Special edge weights (not hex terrain types):
-  //   Sailing — water -> water step (cheap; ships travel fast).
-  //   Embark  — land <-> water boundary crossing (loading or unloading a ship).
-  "Sailing": 1, "Embark": 5,
+  // Water hex traversal weights (used directly when sailing water->water):
+  "Lake": 2, "Sea": 3, "Ocean": 4,
+  // Embark — land <-> water boundary crossing (loading or unloading a ship).
+  "Embark": 5,
 };
 
 // Hex terrains classified as water. Used to pick which edge weight applies.
@@ -36,6 +35,12 @@ let LINE_WIDTH = 3, POINT_SIZE = 0, LINE_AA = false;
 let SHOW_HEX_OUTLINE = false;
 let HEX_OUTLINE_COLOR = [0, 0, 0], HEX_OUTLINE_ALPHA = 255;
 let HEX_OUTLINE_WIDTH = 1, HEX_OUTLINE_AA = false;
+let ISOCHRONE_MODE = false;
+let ISOCHRONE_BUDGET = 10;
+let ISOCHRONE_COLOR = [120, 220, 255], ISOCHRONE_ALPHA = 110;
+let isochroneSourceId = null;        // clicked subhex id
+let isochroneHexIds = null;          // Set of hex ids reachable within budget
+let isochroneSubhexIds = null;       // Set of subhex ids for the mask fill
 
 // =================== DOM ===================
 const stage       = document.getElementById("stage");
@@ -49,6 +54,7 @@ const pathInfoEl  = document.getElementById("path-info");
 const weightsEl   = document.getElementById("weights");
 const colorsEl    = document.getElementById("colors");
 const lineEl      = document.getElementById("line-style");
+const isoEl       = document.getElementById("isochrone");
 const tooltipEl   = document.getElementById("hover-tooltip");
 const statusEl    = document.getElementById("status");
 const loadingEl   = document.getElementById("loading");
@@ -210,6 +216,50 @@ function pointToHex(x, y) {
   return best;
 }
 
+
+// =================== Isochrone (reachability) ===================
+// Dijkstra outward from the source hex using the same edge-cost model as the
+// path finder, but stopped at ISOCHRONE_BUDGET. Result: the set of reachable
+// hexes (and the subhexes inside them) within that budget.
+function computeIsochrone() {
+  isochroneHexIds = null; isochroneSubhexIds = null;
+  if (isochroneSourceId == null) return;
+  const sub = SUBHEX_INDEX.get(isochroneSourceId);
+  if (!sub) return;
+  const srcHex = sub.hex;
+  const dist = new Map();
+  dist.set(srcHex, 0);
+  const heap = new MinHeap();
+  heap.push([0, srcHex]);
+  const reached = new Set([srcHex]);
+  while (heap.size() > 0) {
+    const [d, u] = heap.pop();
+    if (d > (dist.get(u) ?? Infinity)) continue;
+    const uTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(u) : null;
+    const uIsWater = uTerrain ? WATER_TERRAINS.has(uTerrain) : false;
+    for (const v of hexNeighbors(u)) {
+      const vTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(v) : null;
+      if (!vTerrain) continue;
+      const vIsWater = WATER_TERRAINS.has(vTerrain);
+      const w = (uIsWater !== vIsWater) ? (+weights["Embark"]) : (+weights[vTerrain]);
+      if (!isFinite(w) || w <= 0) continue;
+      const nd = d + w;
+      if (nd > ISOCHRONE_BUDGET) continue;
+      if (nd < (dist.get(v) ?? Infinity)) {
+        dist.set(v, nd);
+        reached.add(v);
+        heap.push([nd, v]);
+      }
+    }
+  }
+  isochroneHexIds = reached;
+  const subSet = new Set();
+  for (const hid of reached) {
+    for (const s of (SUBHEXES_BY_HEX.get(hid) || [])) subSet.add(s.id);
+  }
+  isochroneSubhexIds = subSet;
+}
+
 // =================== Pathfinding wrapper ===================
 function recomputePath() {
   pathIds = null; pathSet = null;
@@ -235,9 +285,10 @@ function recomputePath() {
       if (!vTerrain) continue;
       const vIsWater = WATER_TERRAINS.has(vTerrain);
       // Edge cost depends on which side(s) of shore we're on.
+      // Water->water uses the destination water hex's own weight (Lake/Sea/Ocean).
+      // Land<->water pays the Embark/disembark cost. Land->land pays terrain.
       let w;
-      if (uIsWater && vIsWater)        w = +weights["Sailing"];
-      else if (uIsWater !== vIsWater)  w = +weights["Embark"];
+      if (uIsWater !== vIsWater)       w = +weights["Embark"];
       else                             w = +weights[vTerrain];
       if (!isFinite(w) || w <= 0) continue;  // impassable / unknown
       const nd = d + w;
@@ -470,6 +521,34 @@ function renderLayers() {
 }
 const _scratchCanvas = document.createElement("canvas");
 const _scratchCtx = _scratchCanvas.getContext("2d");
+// Fill every pixel whose subhex id is in subSet with rgba(rgb, alpha).
+// One full-image pass via a single offscreen canvas for efficiency.
+const _isoCanvas = document.createElement("canvas");
+const _isoCtx = _isoCanvas.getContext("2d");
+function fillSubhexSet(subSet, rgb, alpha) {
+  if (!subSet || subSet.size === 0 || !SUBHEX_ID_IMG_DATA) return;
+  const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
+  if (_isoCanvas.width !== W || _isoCanvas.height !== H) {
+    _isoCanvas.width = W; _isoCanvas.height = H;
+  } else {
+    _isoCtx.clearRect(0, 0, W, H);
+  }
+  const img = _isoCtx.createImageData(W, H);
+  const px = SUBHEX_ID_IMG_DATA.data;
+  let oi = 0;
+  for (let i = 0; i < W * H; i++) {
+    const p = i * 4;
+    const id = px[p] | (px[p+1] << 8) | (px[p+2] << 16);
+    if (subSet.has(id)) {
+      img.data[oi]   = rgb[0]; img.data[oi+1] = rgb[1];
+      img.data[oi+2] = rgb[2]; img.data[oi+3] = alpha;
+    }
+    oi += 4;
+  }
+  _isoCtx.putImageData(img, 0, 0);
+  hlCtx.drawImage(_isoCanvas, 0, 0);
+}
+
 function fillSubhex(sub, rgb, alpha) {
   if (!sub) return;
   const [x0, y0, x1, y1] = sub.bbox;
@@ -507,7 +586,7 @@ function pathStats() {
   }
   let cost = 0;
   const byTerrain = {};
-  let embarks = 0, sails = 0;
+  let embarks = 0;
   for (let i = 0; i < pathHexIds.length; i++) {
     const hid = pathHexIds[i];
     const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null;
@@ -517,9 +596,8 @@ function pathStats() {
       const prevIsWater = prevTerrain ? WATER_TERRAINS.has(prevTerrain) : false;
       const curIsWater  = WATER_TERRAINS.has(terrain);
       let w;
-      if (prevIsWater && curIsWater)        { w = +weights["Sailing"]; sails++; }
-      else if (prevIsWater !== curIsWater)  { w = +weights["Embark"];  embarks++; }
-      else                                   { w = +weights[terrain]; }
+      if (prevIsWater !== curIsWater) { w = +weights["Embark"]; embarks++; }
+      else                             { w = +weights[terrain]; }
       if (isFinite(w)) cost += w;
     }
   }
@@ -530,7 +608,7 @@ function pathStats() {
   return {
     hexes: pathHexIds.length,
     subhexes: pathSubhexIds ? pathSubhexIds.size : 0,
-    cost, byTerrain, embarks, sails,
+    cost, byTerrain, embarks,
     miles, km,
   };
 }
@@ -622,6 +700,11 @@ function drawHexOutlines() {
 
 function renderSelection() {
   hlCtx.clearRect(0, 0, hlCanvas.width, hlCanvas.height);
+  // Reachability fill (rendered under the path so the From/To/path overlay
+  // remains visible if both are active).
+  if (ISOCHRONE_MODE && isochroneSubhexIds && isochroneSubhexIds.size > 0) {
+    fillSubhexSet(isochroneSubhexIds, ISOCHRONE_COLOR, ISOCHRONE_ALPHA);
+  }
   if (pathIds && pathIds.length > 0) {
     for (const sid of pathIds) {
       if (sid === fromId || sid === toId) continue;
@@ -730,6 +813,12 @@ function handleClick(e) {
   if (!ipt) return;
   const sid = lookupSubhex(ipt.x | 0, ipt.y | 0);
   if (!sid) return;
+  if (ISOCHRONE_MODE) {
+    isochroneSourceId = sid;
+    computeIsochrone();
+    renderSelection(); updateStatus();
+    return;
+  }
   if (fromId == null) {
     fromId = sid; toId = null; pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
   } else if (toId == null && sid !== fromId) {
@@ -747,6 +836,7 @@ function handleClick(e) {
   buildWeightControls();
   buildColorControls();
   buildLineControls();
+  buildIsochroneControls();
   updateEndpoints();
   try { await loadAll(); }
   catch (e) {
