@@ -50,6 +50,11 @@ let LINE_WIDTH = 3, POINT_SIZE = 0, LINE_AA = false;
 let SHOW_HEX_OUTLINE = false;
 let HEX_OUTLINE_COLOR = [0, 0, 0], HEX_OUTLINE_ALPHA = 255;
 let HEX_OUTLINE_WIDTH = 1, HEX_OUTLINE_AA = false;
+// Debug: when on, the binary mask routeThroughMask actually fed to A* is
+// painted over hl-canvas as a translucent magenta overlay so you can see
+// exactly which pixels are passable (and which got restricted away).
+let DEBUG_SHOW_MASK = false;
+let _lastRouteMask = null;   // { mask: Uint8Array, mw, mh, bx0, by0 } from the most recent routeThroughMask
 let ISOCHRONE_MODE = false;
 let ISOCHRONE_BUDGET = 10;
 let ISOCHRONE_COLOR = [120, 220, 255], ISOCHRONE_ALPHA = 110;
@@ -83,11 +88,14 @@ let IMAGES = {};
 let view = { x: 0, y: 0, scale: 1.0 };
 let weights = Object.assign({}, DEFAULT_WEIGHTS);
 let roadWeights = Object.assign({}, DEFAULT_ROAD_WEIGHTS);
-// Binary mask over the full map image: 1 where the Roads.png layer has a
-// non-transparent pixel. Built once after layers load (see buildRoadPixelMask).
-// Used to XOR the road into the path mask within road-flagged hexes — see
-// routeThroughMask for the contiguity-check logic.
+// Binary masks over the full map image. Built once after layers load.
+// ROAD_PIXEL_MASK  = roads.png ∪ citiestownsforts.png — used for the per-hex
+//                    road restriction.
+// RIVER_PIXEL_MASK = rivers.png alone — merged in with the road mask for
+//                    hexes flagged as BOTH road AND river, so the restriction
+//                    in a road+river hex follows either the road or the river.
 let ROAD_PIXEL_MASK = null;
+let RIVER_PIXEL_MASK = null;
 let fromId = null, toId = null;
 // Exact click pixels for From / To. These are what the path line actually
 // starts / ends at — the subhex id is still tracked because it controls cost,
@@ -243,21 +251,17 @@ async function loadAll() {
   for (const c of [mapCanvas, hlCanvas]) {
     c.width = HEX_DATA.image_width; c.height = HEX_DATA.image_height;
   }
-  buildRoadPixelMask();
+  buildPixelMasks();
   loadingEl.classList.add("hidden");
 }
 
-// Rasterize Roads.png + citiestownsforts.png into a single binary mask we can
-// sample per pixel. Stored on ROAD_PIXEL_MASK as Uint8Array of length
-// (image_width * image_height). Cities/towns/forts are MERGED in here — for
-// the per-hex routing restriction below they count as road infrastructure
-// (streets continuing through a town are still "road" for our purposes) —
-// but the Layers panel still toggles them separately. This is the only place
-// the two layers are unioned.
-function buildRoadPixelMask() {
-  ROAD_PIXEL_MASK = null;
-  const sources = ["roads", "ctf"].map(id => IMAGES[id]).filter(Boolean);
-  if (sources.length === 0) return;
+// Rasterize a list of map layers into a single binary mask. A pixel counts
+// as set if it has meaningful alpha (cutoff 32/255 catches anti-aliased
+// edges) in ANY of the source layers — i.e. the layers are OR'd together.
+// Returns null if none of the layers loaded.
+function buildBinaryMaskFromLayers(layerIds) {
+  const sources = layerIds.map(id => IMAGES[id]).filter(Boolean);
+  if (sources.length === 0) return null;
   const W = sources[0].naturalWidth, H = sources[0].naturalHeight;
   const mask = new Uint8Array(W * H);
   for (const img of sources) {
@@ -266,14 +270,40 @@ function buildRoadPixelMask() {
     const ctx = c.getContext("2d", { willReadFrequently: true });
     ctx.drawImage(img, 0, 0);
     const px = ctx.getImageData(0, 0, W, H).data;
-    // Pixel counts as road if it has meaningful alpha. Low cutoff (32/255)
-    // catches semi-transparent anti-aliased edges. OR'd across the source
-    // layers so a pixel painted in EITHER counts.
     for (let i = 0, j = 0; i < mask.length; i++, j += 4) {
       if (px[j + 3] > 32) mask[i] = 1;
     }
   }
-  ROAD_PIXEL_MASK = mask;
+  return mask;
+}
+
+// Build both pixel masks used by the per-hex routing restriction.
+// Cities/towns/forts are unioned into the road mask only here (so streets
+// through a town still count as road); the Layers panel toggles them
+// separately. Rivers stay in their own mask so they're only mixed in for
+// hexes flagged as BOTH road AND river.
+function buildPixelMasks() {
+  ROAD_PIXEL_MASK  = buildBinaryMaskFromLayers(["roads", "ctf"]);
+  RIVER_PIXEL_MASK = buildBinaryMaskFromLayers(["rivers"]);
+}
+
+// Does any pixel inside hex `hid` count as a road pixel in ROAD_PIXEL_MASK?
+// Used to detect river hexes that have a road bleeding through them even
+// without the spreadsheet Road flag. We scan the subhex bboxes (cheap — a
+// few thousand pixels max per hex) and bail on the first hit.
+function hexHasRoadPixels(hid) {
+  if (!ROAD_PIXEL_MASK || !SUBHEX_ID_IMG_DATA) return false;
+  const W = SUBHEX_ID_IMG_DATA.width;
+  for (const s of (SUBHEXES_BY_HEX.get(hid) || [])) {
+    const [x0, y0, x1, y1] = s.bbox;
+    for (let y = y0; y <= y1; y++) {
+      const off = y * W;
+      for (let x = x0; x <= x1; x++) {
+        if (ROAD_PIXEL_MASK[off + x]) return true;
+      }
+    }
+  }
+  return false;
 }
 
 // =================== Hex math ===================
@@ -504,23 +534,44 @@ function routeThroughMask(subSet) {
     const p = fromPx || { x: sStart.centroid[0], y: sStart.centroid[1] };
     return [{ x: p.x, y: p.y }];
   }
-  // Road hexes on the path, PLUS any road-flagged hex directly adjacent to a
-  // path road hex. The adjacent ones aren't on the hex-level shortest path
-  // but their road pixels often continue the painted road we want to snap
-  // to — by including them, A* can detour briefly onto the wider road network
-  // wherever that keeps the route on the road. Drives both the bbox expansion
-  // (so we can reach those subhexes) and the per-hex restriction loop below.
+  // Road hexes on the path, PLUS *every* hex directly adjacent to a path
+  // road hex — REGARDLESS of whether the neighbor is itself flagged Road
+  // in the sheet. Some hexes have bits of painted road bleeding through
+  // them without earning the Road flag; by sweeping every neighbor into
+  // the restriction loop we catch those stray road pixels. Neighbors with
+  // no road pixels at all are made impassable by the restriction (their
+  // mask gets cleared and there's nothing to re-set) — which is fine,
+  // because A* never *had* to traverse them and revert-on-fail still
+  // saves any hex whose absence would actually break From->To.
   const pathRoadSet = new Set();
   if (pathHexIds && HEX_ROAD) {
     for (const hid of pathHexIds) if (HEX_ROAD.get(hid)) pathRoadSet.add(hid);
   }
-  const adjRoadSet = new Set();
-  for (const hid of pathRoadSet) {
-    for (const nb of hexNeighbors(hid)) {
-      if (!pathRoadSet.has(nb) && HEX_ROAD && HEX_ROAD.get(nb)) adjRoadSet.add(nb);
+  // mergedHexes = path hexes whose restriction set is roads ∪ rivers. Covers
+  // two cases:
+  //   (a) hex is flagged BOTH road AND river in the sheet, OR
+  //   (b) hex is flagged river AND has any road pixels painted through it
+  //       (even without the Road flag) — caught visually by scanning the hex's
+  //       subhex bboxes against ROAD_PIXEL_MASK. (b) lets us treat river
+  //       crossings that incidentally have a road overlay as road+river even
+  //       when the spreadsheet hasn't been updated.
+  const mergedHexes = new Set();
+  if (HEX_RIVER && RIVER_PIXEL_MASK && pathHexIds) {
+    for (const hid of pathHexIds) {
+      if (!HEX_RIVER.get(hid)) continue;
+      if (pathRoadSet.has(hid) || hexHasRoadPixels(hid)) mergedHexes.add(hid);
     }
   }
-  const roadHexList = [...pathRoadSet, ...adjRoadSet];
+  // Hexes that get restricted (road-flagged path hexes + merged hexes that
+  // aren't road-flagged). Adjacents expand from this combined set.
+  const restrictPathHexes = new Set([...pathRoadSet, ...mergedHexes]);
+  const adjAnyHexes = new Set();
+  for (const hid of restrictPathHexes) {
+    for (const nb of hexNeighbors(hid)) {
+      if (!restrictPathHexes.has(nb)) adjAnyHexes.add(nb);
+    }
+  }
+  const roadHexList = [...restrictPathHexes, ...adjAnyHexes];
 
   const data = SUBHEX_ID_IMG_DATA.data;
   const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
@@ -556,9 +607,9 @@ function routeThroughMask(subSet) {
   // every adjacent road hex on top of the caller's subSet — subhexes of the
   // adj road hexes aren't in subSet (those hexes aren't on the hex path) but
   // we still want their pixels to be passable so A* can route through them.
-  const extSubSet = adjRoadSet.size > 0 ? new Set(subSet) : subSet;
+  const extSubSet = adjAnyHexes.size > 0 ? new Set(subSet) : subSet;
   if (extSubSet !== subSet) {
-    for (const hid of adjRoadSet) {
+    for (const hid of adjAnyHexes) {
       for (const s of (SUBHEXES_BY_HEX.get(hid) || [])) extSubSet.add(s.id);
     }
   }
@@ -580,7 +631,14 @@ function routeThroughMask(subSet) {
         const allList = hexPxByHex.get(sub.hex);
         if (allList) {
           allList.push(idx);
-          if (ROAD_PIXEL_MASK && ROAD_PIXEL_MASK[fullRowOff + fullX]) {
+          // Build the per-hex "restricted-to" pixel set:
+          //   road pixel  → always counts
+          //   river pixel → only counts for road+river hexes (mergedHexes)
+          //                 so the restriction in those hexes covers road
+          //                 ∪ river, letting A* follow either.
+          const isRoadPx  = ROAD_PIXEL_MASK  && ROAD_PIXEL_MASK[fullRowOff + fullX];
+          const isRiverPx = RIVER_PIXEL_MASK && RIVER_PIXEL_MASK[fullRowOff + fullX];
+          if (isRoadPx || (isRiverPx && mergedHexes.has(sub.hex))) {
             roadPxByHex.get(sub.hex).push(idx);
           }
         }
@@ -591,29 +649,52 @@ function routeThroughMask(subSet) {
   const startPt = fromPx ? { x: fromPx.x, y: fromPx.y } : { x: sStart.centroid[0], y: sStart.centroid[1] };
   const endPt   = toPx   ? { x: toPx.x,   y: toPx.y   } : { x: sEnd.centroid[0],   y: sEnd.centroid[1]   };
 
-  // For each road hex in path order: tentatively RESTRICT the mask within
+  // For each road hex IN roadHexList (path road hexes AND adjacent road
+  // hexes — both kinds get restricted): tentatively RESTRICT the mask within
   // that hex to just the road/city pixels (clear everything else in the hex,
   // re-set only the road pixels). Verify From->To still reaches. Keep on
   // success, revert on failure. Each hex is decided on its own; a road hex
   // whose road doesn't actually span the hex falls back to its full mask
   // and the other road hexes still take effect.
   //
-  // EXCEPTION: the From and To hexes are NEVER restricted. If we did, the
-  // user's click pixel would usually fall outside the road and snapToMask
-  // would jump it straight to the nearest road pixel — producing a sharp
-  // diagonal line from the click to wherever the road happens to be. By
-  // leaving those hexes' full masks intact, A* finds the shortest pixel
-  // route from the click through allowed subhexes to the road's entry on
-  // the hex border (the next hex IS restricted, so A* still has to enter
-  // it on a road pixel) — which gives a smooth optimal connection.
+  // EXCEPTIONS to restriction:
+  //  - The From and To hexes — if restricted, snapToMask would jump the click
+  //    pixel straight to the nearest road pixel and produce a sharp diagonal.
+  //    Leaving them unrestricted lets A* find the shortest pixel route from
+  //    the click through allowed subhexes to the road's hex-border entry
+  //    (the next hex IS restricted, so A* still has to enter it on a road
+  //    pixel) — a smooth optimal connection.
+  //  - Path hexes flagged as River BUT NOT Road — restricting to the road
+  //    can produce a weird detour around the ford, and there's no road to
+  //    restrict to anyway. Better to let A* route freely through the full
+  //    hex mask there. Scoped to MAIN-PATH hexes only (pathHexIds), NOT
+  //    adjacent road hexes — those still get restricted even if they're
+  //    rivers (off-path "courtesy" additions shouldn't swell open terrain).
+  //  - Road+river path hexes: NOT skipped — we DO restrict them, but the
+  //    restriction set is roads ∪ rivers (see mergedHexes below), so A*
+  //    can follow either the painted road or the river through the hex.
   const skipHexes = new Set();
   if (sStart) skipHexes.add(sStart.hex);
   if (sEnd)   skipHexes.add(sEnd.hex);
+  if (HEX_RIVER && pathHexIds) {
+    for (const hid of pathHexIds) {
+      // Skip only river path hexes that AREN'T being merged-restricted —
+      // i.e. true river-only hexes with no road pixels at all. Hexes in
+      // mergedHexes (road+river by flag, or river with road pixels) go
+      // through the restriction loop normally.
+      if (HEX_RIVER.get(hid) && !mergedHexes.has(hid)) skipHexes.add(hid);
+    }
+  }
   for (const hid of roadHexList) {
     if (skipHexes.has(hid)) continue;
     const allPx  = hexPxByHex.get(hid)  || [];
     const roadPx = roadPxByHex.get(hid) || [];
-    if (allPx.length === 0 || roadPx.length === 0) continue;
+    if (allPx.length === 0) continue;
+    // NOTE: we no longer early-out when roadPx is empty. A neighbor with no
+    // road pixels at all SHOULD become impassable (otherwise its broadened
+    // mask is an open corridor for detours through pure terrain). Revert-on-
+    // fail below still recovers any hex whose absence would actually break
+    // From->To.
     const saved = new Uint8Array(allPx.length);
     for (let i = 0; i < allPx.length; i++) {
       saved[i] = mask[allPx[i]];
@@ -625,6 +706,9 @@ function routeThroughMask(subSet) {
     }
   }
 
+  // Stash the final mask for the debug overlay so the next render can paint
+  // exactly what A* saw.
+  _lastRouteMask = { mask, mw, mh, bx0, by0 };
   return routeInBinaryMask(mask, mw, mh, bx0, by0, startPt, endPt) || [];
 }
 
@@ -657,9 +741,9 @@ function routeInBinaryMask(mask, mw, mh, bx0, by0, startPt, endPt) {
   return cleaned;
 }
 
-function drawPathLine() {
-  const pts = buildPathLinePoints();
-  if (pts.length < 2) return;
+function drawPathLine(pts) {
+  pts = pts || buildPathLinePoints();
+  if (!pts || pts.length < 2) return;
   const rgba = `rgba(${PATH_LINE_COLOR.join(",")},${LINE_ALPHA/255})`;
   if (LINE_AA) {
     hlCtx.strokeStyle = rgba;
@@ -714,14 +798,57 @@ function drawLineBresenham(x0, y0, x1, y1, thick, half) {
 }
 
 // =================== Rendering ===================
+// Layer ids that should be drawn ABOVE the isochrone overlay. Anything in
+// this set sits on top of the iso fill; everything not in it sits below.
+// Result: iso fill is sandwiched between commanderies (below) and rivers
+// (above), exactly as requested.
+const LAYERS_ABOVE_ISO = new Set(["rivers", "roads", "ctf", "simple", "base"]);
+
 function renderLayers() {
   mapCtx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
+  let drewIso = false;
   for (const l of LAYERS) {
+    // Insert the iso overlay JUST before the first "above" layer in the stack.
+    if (!drewIso && LAYERS_ABOVE_ISO.has(l.id)) {
+      drawIsoOnMap();
+      drewIso = true;
+    }
     if (!l.on || !IMAGES[l.id]) continue;
     mapCtx.globalAlpha = l.opacity;
     mapCtx.drawImage(IMAGES[l.id], 0, 0);
   }
+  // If no "above" layers exist in LAYERS, draw iso at the top of the stack.
+  if (!drewIso) drawIsoOnMap();
   mapCtx.globalAlpha = 1.0;
+}
+
+// Iso fill, rendered ONTO mapCtx (so it can sit between map layers, not above
+// everything like hl-canvas content). One full-image pass through the subhex
+// id buffer, painting iso color + alpha wherever the subhex id is reachable.
+function drawIsoOnMap() {
+  if (!ISOCHRONE_MODE || !isochroneSubhexIds || isochroneSubhexIds.size === 0) return;
+  if (!SUBHEX_ID_IMG_DATA) return;
+  const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
+  if (_isoCanvas.width !== W || _isoCanvas.height !== H) {
+    _isoCanvas.width = W; _isoCanvas.height = H;
+  } else {
+    _isoCtx.clearRect(0, 0, W, H);
+  }
+  const img = _isoCtx.createImageData(W, H);
+  const px = SUBHEX_ID_IMG_DATA.data;
+  let oi = 0;
+  for (let i = 0; i < W * H; i++) {
+    const p = i * 4;
+    const id = px[p] | (px[p+1] << 8) | (px[p+2] << 16);
+    if (isochroneSubhexIds.has(id)) {
+      img.data[oi]   = ISOCHRONE_COLOR[0]; img.data[oi+1] = ISOCHRONE_COLOR[1];
+      img.data[oi+2] = ISOCHRONE_COLOR[2]; img.data[oi+3] = ISOCHRONE_ALPHA;
+    }
+    oi += 4;
+  }
+  _isoCtx.putImageData(img, 0, 0);
+  mapCtx.globalAlpha = 1.0;
+  mapCtx.drawImage(_isoCanvas, 0, 0);
 }
 const _scratchCanvas = document.createElement("canvas");
 const _scratchCtx = _scratchCanvas.getContext("2d");
@@ -729,6 +856,38 @@ const _scratchCtx = _scratchCanvas.getContext("2d");
 // One full-image pass via a single offscreen canvas for efficiency.
 const _isoCanvas = document.createElement("canvas");
 const _isoCtx = _isoCanvas.getContext("2d");
+// Scratch buffer for the debug route-mask overlay (sized per call to the
+// bounding box of the last computed mask).
+const _dbgMaskCanvas = document.createElement("canvas");
+const _dbgMaskCtx = _dbgMaskCanvas.getContext("2d");
+
+// Paint the binary mask the routing actually used onto hl-canvas, in
+// translucent magenta. No-op when DEBUG_SHOW_MASK is off, no mask exists,
+// or there is no active route to display — the mask should appear and
+// disappear together with the path line, so it can't outlive the route.
+function drawDebugMask() {
+  if (!DEBUG_SHOW_MASK || !_lastRouteMask) return;
+  if (!pathIds || pathIds.length < 2) return;
+  const { mask, mw, mh, bx0, by0 } = _lastRouteMask;
+  if (_dbgMaskCanvas.width !== mw || _dbgMaskCanvas.height !== mh) {
+    _dbgMaskCanvas.width = mw; _dbgMaskCanvas.height = mh;
+  } else {
+    _dbgMaskCtx.clearRect(0, 0, mw, mh);
+  }
+  const img = _dbgMaskCtx.createImageData(mw, mh);
+  // Bright magenta @ ~45% alpha — distinct from path/iso/terrain colors.
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i]) continue;
+    const p = i * 4;
+    img.data[p]     = 255;
+    img.data[p + 1] = 0;
+    img.data[p + 2] = 255;
+    img.data[p + 3] = 115;
+  }
+  _dbgMaskCtx.putImageData(img, 0, 0);
+  hlCtx.drawImage(_dbgMaskCanvas, bx0, by0);
+}
+
 function fillSubhexSet(subSet, rgb, alpha) {
   if (!subSet || subSet.size === 0 || !SUBHEX_ID_IMG_DATA) return;
   const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
@@ -910,11 +1069,10 @@ function drawHexOutlines() {
 
 function renderSelection() {
   hlCtx.clearRect(0, 0, hlCanvas.width, hlCanvas.height);
-  // Reachability fill (rendered under the path so the From/To/path overlay
-  // remains visible if both are active).
-  if (ISOCHRONE_MODE && isochroneSubhexIds && isochroneSubhexIds.size > 0) {
-    fillSubhexSet(isochroneSubhexIds, ISOCHRONE_COLOR, ISOCHRONE_ALPHA);
-  }
+  // NOTE: the reachability fill now lives on map-canvas (sandwiched between
+  // commanderies and rivers in the layer stack), drawn by renderLayers via
+  // drawIsoOnMap. Any code path that mutates iso state must call renderLayers
+  // after renderSelection so the map-canvas overlay is kept in sync.
   if (pathIds && pathIds.length > 0) {
     for (const sid of pathIds) {
       if (sid === fromId || sid === toId) continue;
@@ -923,8 +1081,16 @@ function renderSelection() {
   }
   if (fromId != null) fillSubhex(SUBHEX_INDEX.get(fromId), START_COLOR, START_ALPHA);
   if (toId   != null) fillSubhex(SUBHEX_INDEX.get(toId),   END_COLOR,   END_ALPHA);
-  if (pathIds && pathIds.length > 1) drawPathLine();
+  // Build the line points first so _lastRouteMask is refreshed before the
+  // debug overlay reads it; without that we'd paint the mask from the
+  // previous render and the route line from the current one.
+  const linePts = (pathIds && pathIds.length > 1) ? buildPathLinePoints() : null;
+  if (linePts) drawPathLine(linePts);
   drawHexOutlines();
+  // Debug overlay goes LAST so the magenta sits on top of everything else
+  // on hl-canvas (path line + hex outlines) and you can see exactly what
+  // pixels A* could traverse for the route currently displayed.
+  drawDebugMask();
 }
 
 // =================== Pan/Zoom ===================
@@ -1032,7 +1198,7 @@ function handleClick(e) {
   if (ISOCHRONE_MODE) {
     isochroneSourceId = sid;
     computeIsochrone();
-    renderSelection(); updateStatus();
+    renderLayers(); renderSelection(); updateStatus();
     return;
   }
   const clickPx = { x: ipt.x, y: ipt.y };
@@ -1116,11 +1282,10 @@ function handleClick(e) {
 
 function renderSelection() {
   hlCtx.clearRect(0, 0, hlCanvas.width, hlCanvas.height);
-  // Reachability fill (rendered under the path so the From/To/path overlay
-  // remains visible if both are active).
-  if (ISOCHRONE_MODE && isochroneSubhexIds && isochroneSubhexIds.size > 0) {
-    fillSubhexSet(isochroneSubhexIds, ISOCHRONE_COLOR, ISOCHRONE_ALPHA);
-  }
+  // NOTE: the reachability fill now lives on map-canvas (sandwiched between
+  // commanderies and rivers in the layer stack), drawn by renderLayers via
+  // drawIsoOnMap. Any code path that mutates iso state must call renderLayers
+  // after renderSelection so the map-canvas overlay is kept in sync.
   if (pathIds && pathIds.length > 0) {
     for (const sid of pathIds) {
       if (sid === fromId || sid === toId) continue;
@@ -1129,8 +1294,16 @@ function renderSelection() {
   }
   if (fromId != null) fillSubhex(SUBHEX_INDEX.get(fromId), START_COLOR, START_ALPHA);
   if (toId   != null) fillSubhex(SUBHEX_INDEX.get(toId),   END_COLOR,   END_ALPHA);
-  if (pathIds && pathIds.length > 1) drawPathLine();
+  // Build the line points first so _lastRouteMask is refreshed before the
+  // debug overlay reads it; without that we'd paint the mask from the
+  // previous render and the route line from the current one.
+  const linePts = (pathIds && pathIds.length > 1) ? buildPathLinePoints() : null;
+  if (linePts) drawPathLine(linePts);
   drawHexOutlines();
+  // Debug overlay goes LAST so the magenta sits on top of everything else
+  // on hl-canvas (path line + hex outlines) and you can see exactly what
+  // pixels A* could traverse for the route currently displayed.
+  drawDebugMask();
 }
 
 // =================== Pan/Zoom ===================
@@ -1238,7 +1411,7 @@ function handleClick(e) {
   if (ISOCHRONE_MODE) {
     isochroneSourceId = sid;
     computeIsochrone();
-    renderSelection(); updateStatus();
+    renderLayers(); renderSelection(); updateStatus();
     return;
   }
   const clickPx = { x: ipt.x, y: ipt.y };

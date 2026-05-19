@@ -96,7 +96,7 @@ function buildWeightControls() {
         recomputePath(); renderSelection(); updatePathInfo(); updateStatus();
       }
       if (ISOCHRONE_MODE && isochroneSourceId != null) {
-        computeIsochrone(); renderSelection(); updateStatus();
+        computeIsochrone(); renderLayers(); renderSelection(); updateStatus();
       }
     };
     inputs[0].addEventListener("change", (e) => {
@@ -173,6 +173,7 @@ function clearSelection() {
   fromId = toId = null; pathIds = null; pathSet = null;
   pathHexIds = null; pathSubhexIds = null;
   fromPx = toPx = null;
+  _lastRouteMask = null;
   renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
 }
 
@@ -329,6 +330,20 @@ function buildLineControls() {
     renderSelection();
   });
   lineEl.appendChild(oaaRow);
+
+  // [debug] Route-mask overlay — paints the binary mask routeThroughMask
+  // actually fed to A* as a translucent magenta layer over hl-canvas. Useful
+  // for confirming which pixels are restricted to road and which subhexes
+  // are passable in a given route.
+  const dbgRow = document.createElement("div");
+  dbgRow.className = "layer-row";
+  dbgRow.innerHTML = `<input type="checkbox" id="debug-mask" ${DEBUG_SHOW_MASK ? "checked" : ""} />`
+    + `<label for="debug-mask">[debug] Route mask</label>`;
+  dbgRow.querySelector("input").addEventListener("change", (e) => {
+    DEBUG_SHOW_MASK = e.target.checked;
+    renderSelection();
+  });
+  lineEl.appendChild(dbgRow);
 }
 
 // Settings panel show/hide toggle.
@@ -358,7 +373,7 @@ function buildIsochroneControls() {
     } else if (isochroneSourceId != null) {
       computeIsochrone();
     }
-    renderSelection(); updateStatus();
+    renderLayers(); renderSelection(); updateStatus();
   });
   isoEl.appendChild(onRow);
 
@@ -374,14 +389,14 @@ function buildIsochroneControls() {
     bLabel.textContent = ISOCHRONE_BUDGET;
     if (ISOCHRONE_MODE && isochroneSourceId != null) {
       computeIsochrone();
-      renderSelection(); updateStatus();
+      renderLayers(); renderSelection(); updateStatus();
     }
   });
   makeEditable(bLabel,
     (t) => { const n = parseFloat(t); return isFinite(n) && n > 0 ? n : null; },
     (v) => {
       ISOCHRONE_BUDGET = v; bSlider.value = v;
-      if (ISOCHRONE_MODE && isochroneSourceId != null) { computeIsochrone(); renderSelection(); updateStatus(); }
+      if (ISOCHRONE_MODE && isochroneSourceId != null) { computeIsochrone(); renderLayers(); renderSelection(); updateStatus(); }
     },
     () => String(ISOCHRONE_BUDGET));
   isoEl.appendChild(bRow);
@@ -399,17 +414,17 @@ function buildIsochroneControls() {
   const alphaVal   = cRow.querySelector(".alpha-val");
   colorInput.addEventListener("input", (e) => {
     ISOCHRONE_COLOR = hexToRgb(e.target.value);
-    renderSelection();
+    renderLayers();
   });
   alphaInput.addEventListener("input", (e) => {
     const pct = +e.target.value;
     ISOCHRONE_ALPHA = Math.round((pct / 100) * 255);
     alphaVal.textContent = pct + "%";
-    renderSelection();
+    renderLayers();
   });
   makeEditable(alphaVal,
     (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(0, Math.min(100, n)) : null; },
-    (v) => { ISOCHRONE_ALPHA = Math.round((v / 100) * 255); alphaInput.value = v; renderSelection(); },
+    (v) => { ISOCHRONE_ALPHA = Math.round((v / 100) * 255); alphaInput.value = v; renderLayers(); },
     () => Math.round((ISOCHRONE_ALPHA / 255) * 100) + "%");
   isoEl.appendChild(cRow);
 }
@@ -428,7 +443,7 @@ function buildIsochroneControls() {
         // Collapse the panel -> also turn off the click-capture mode so normal
         // From/To clicking comes back. Keeps state in case you re-open it.
         ISOCHRONE_MODE = false;
-        renderSelection();
+        renderLayers(); renderSelection();
         // Refresh the checkbox in the panel so it matches state next time.
         buildIsochroneControls();
       }
