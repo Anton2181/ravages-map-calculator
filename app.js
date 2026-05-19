@@ -2,14 +2,17 @@
 
 // =================== Config ===================
 const LAYERS = [
-  { id: "sea",         file: "sea.png",                 label: "Sea fill",               on: true,  opacity: 1.00 },
-  { id: "continent",   file: "Continent Meat.png",      label: "Outline"        ,         on: false, opacity: 1.00 },
-  { id: "terrain",     file: "Terrain.png",             label: "Terrain (elevation)",    on: true,  opacity: 1.00 },
-  { id: "rivers",      file: "rivers.png",              label: "Rivers",                 on: false, opacity: 1.00 },
-  { id: "roads",       file: "Roads.png",               label: "Roads",                  on: false, opacity: 1.00 },
-  { id: "ctf",         file: "citiestownsforts.png",    label: "Cities / towns / forts", on: false, opacity: 1.00 },
-  { id: "simple",      file: "simple grid.png",         label: "Simple grid",            on: false, opacity: 0.40 },
-  { id: "base",        file: "Ravages_ver_6.3_hex.png", label: "Player map"        ,      on: false, opacity: 1.00 },
+  { id: "sea",         file: "sea.png",                 label: "Sea fill",               on: true,  opacity: 1.00, hidden: true },
+  { id: "continent",   file: "Continent Meat.png",      label: "Outline",                on: true,  opacity: 1.00 },
+  { id: "terrain",     file: "Terrain.png",             label: "Terrain",                on: true,  opacity: 1.00 },
+  { id: "core",        file: "core commanderies.png",      label: "Core commanderies",      on: false, opacity: 1.00 },
+  { id: "frontier",    file: "frontier commanderies.png",  label: "Frontier commanderies",  on: false, opacity: 1.00 },
+  { id: "provinces",   file: "provinces commanderies.png", label: "Province commanderies",  on: false, opacity: 1.00 },
+  { id: "rivers",      file: "rivers.png",              label: "Rivers",                 on: true,  opacity: 1.00 },
+  { id: "roads",       file: "Roads.png",               label: "Roads",                  on: true,  opacity: 1.00 },
+  { id: "ctf",         file: "citiestownsforts.png",    label: "Cities / towns / forts", on: true,  opacity: 1.00 },
+  { id: "simple",      file: "simple grid.png",         label: "Hex grid",               on: false, opacity: 0.40 },
+  { id: "base",        file: "Ravages_ver_6.3_hex.png", label: "Hex ID map",             on: false, opacity: 1.00 },
 ];
 const CLASSES = ["Flatlands", "Plains", "Woodland", "Hills", "Mountains", "Peaks", "Lake", "Sea", "Ocean", "Embark"];
 const DEFAULT_WEIGHTS = {
@@ -18,6 +21,18 @@ const DEFAULT_WEIGHTS = {
   // Water hex traversal weights (used directly when sailing water->water):
   "Lake": 2, "Sea": 3, "Ocean": 4,
   // Embark — land <-> water boundary crossing (loading or unloading a ship).
+  "Embark": 5,
+};
+// Road column of the traversal-weight matrix. When the destination hex has the
+// "Road" flag set in the sheet, we use THIS table's value for the terrain
+// instead of the default column — i.e., roads shave weight off a hex's
+// inherent terrain cost. Embark/disembark and water-to-water still use the
+// default column (a road doesn't help you load a ship or sail faster).
+const DEFAULT_ROAD_WEIGHTS = {
+  "Flatlands": 0.5, "Plains": 0.5, "Woodland": 1,
+  "Hills": 1, "Mountains": 2, "Peaks": 4,
+  // Water and embark default to the same value — see comment above.
+  "Lake": 2, "Sea": 3, "Ocean": 4,
   "Embark": 5,
 };
 
@@ -67,11 +82,25 @@ let NEIGHBORS = null;
 let IMAGES = {};
 let view = { x: 0, y: 0, scale: 1.0 };
 let weights = Object.assign({}, DEFAULT_WEIGHTS);
+let roadWeights = Object.assign({}, DEFAULT_ROAD_WEIGHTS);
+// Binary mask over the full map image: 1 where the Roads.png layer has a
+// non-transparent pixel. Built once after layers load (see buildRoadPixelMask).
+// Used to XOR the road into the path mask within road-flagged hexes — see
+// routeThroughMask for the contiguity-check logic.
+let ROAD_PIXEL_MASK = null;
 let fromId = null, toId = null;
+// Exact click pixels for From / To. These are what the path line actually
+// starts / ends at — the subhex id is still tracked because it controls cost,
+// the route mask, and the From/To highlight, but the visual road runs to the
+// pixel the user actually clicked rather than the subhex centroid.
+let fromPx = null, toPx = null;
 let pathIds = null, pathSet = null;
 let pathHexIds = null;          // ordered hex ids on the path
 let pathSubhexIds = null;        // Set of subhex ids included in the drawing mask
 let HEX_TERRAIN = null;          // Map<hex_id, terrain_string>
+let HEX_STRONGHOLD = null;       // Map<hex_id, bool>
+let HEX_RIVER = null;            // Map<hex_id, bool>
+let HEX_ROAD = null;             // Map<hex_id, bool>
 let SUBHEXES_BY_HEX = null;      // Map<hex_id, array of subhex objects>
 
 // =================== Loading ===================
@@ -84,8 +113,22 @@ function loadImage(src) {
   });
 }
 
-// Fetch the public spreadsheet CSV and parse Hexcode -> Terrain.
+// Recognize a CSV cell as a "yes" flag. Tolerates "yes"/"y"/"true"/"1"/"x"
+// (case-insensitive). Empty cells and any other value are false.
+function isYes(v) {
+  if (v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === "yes" || s === "y" || s === "true" || s === "1" || s === "x";
+}
+
+// Fetch the public spreadsheet CSV and parse all per-hex columns we care about:
+// Terrain (main terrain type, used for movement cost) plus the yes/no flag
+// columns Stronghold / River / Road. Populates HEX_TERRAIN and the three
+// HEX_<flag> module globals. Returns HEX_TERRAIN for the loader's convenience.
 async function loadHexTerrains() {
+  HEX_STRONGHOLD = new Map();
+  HEX_RIVER = new Map();
+  HEX_ROAD = new Map();
   try {
     const r = await fetch(HEX_TERRAIN_CSV_URL, { cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
@@ -97,15 +140,24 @@ async function loadHexTerrains() {
     let iTerrain = header.findIndex(h => /terrain/i.test(h));
     if (iId < 0) iId = 0;
     if (iTerrain < 0) iTerrain = 1;
+    // Optional flag columns — find by header name; missing column => all false.
+    const iStronghold = header.findIndex(h => /stronghold|fort|castle/i.test(h));
+    const iRiver      = header.findIndex(h => /river/i.test(h));
+    const iRoad       = header.findIndex(h => /road/i.test(h));
     const out = new Map();
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i];
       if (!row || row.length === 0) continue;
       const id = parseInt(row[iId], 10);
+      if (!Number.isFinite(id)) continue;
       const terrain = (row[iTerrain] || "").trim();
-      if (Number.isFinite(id) && terrain) out.set(id, terrain);
+      if (terrain) out.set(id, terrain);
+      if (iStronghold >= 0 && isYes(row[iStronghold])) HEX_STRONGHOLD.set(id, true);
+      if (iRiver      >= 0 && isYes(row[iRiver]))      HEX_RIVER.set(id, true);
+      if (iRoad       >= 0 && isYes(row[iRoad]))       HEX_ROAD.set(id, true);
     }
-    console.log(`Loaded ${out.size} hex terrain entries from sheet.`);
+    console.log(`Loaded ${out.size} hex terrain entries from sheet `
+      + `(${HEX_STRONGHOLD.size} strongholds, ${HEX_RIVER.size} rivers, ${HEX_ROAD.size} roads).`);
     return out;
   } catch (e) {
     console.warn("Failed to load terrain CSV:", e);
@@ -191,7 +243,37 @@ async function loadAll() {
   for (const c of [mapCanvas, hlCanvas]) {
     c.width = HEX_DATA.image_width; c.height = HEX_DATA.image_height;
   }
+  buildRoadPixelMask();
   loadingEl.classList.add("hidden");
+}
+
+// Rasterize Roads.png + citiestownsforts.png into a single binary mask we can
+// sample per pixel. Stored on ROAD_PIXEL_MASK as Uint8Array of length
+// (image_width * image_height). Cities/towns/forts are MERGED in here — for
+// the per-hex routing restriction below they count as road infrastructure
+// (streets continuing through a town are still "road" for our purposes) —
+// but the Layers panel still toggles them separately. This is the only place
+// the two layers are unioned.
+function buildRoadPixelMask() {
+  ROAD_PIXEL_MASK = null;
+  const sources = ["roads", "ctf"].map(id => IMAGES[id]).filter(Boolean);
+  if (sources.length === 0) return;
+  const W = sources[0].naturalWidth, H = sources[0].naturalHeight;
+  const mask = new Uint8Array(W * H);
+  for (const img of sources) {
+    const c = document.createElement("canvas");
+    c.width = W; c.height = H;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0);
+    const px = ctx.getImageData(0, 0, W, H).data;
+    // Pixel counts as road if it has meaningful alpha. Low cutoff (32/255)
+    // catches semi-transparent anti-aliased edges. OR'd across the source
+    // layers so a pixel painted in EITHER counts.
+    for (let i = 0, j = 0; i < mask.length; i++, j += 4) {
+      if (px[j + 3] > 32) mask[i] = 1;
+    }
+  }
+  ROAD_PIXEL_MASK = mask;
 }
 
 // =================== Hex math ===================
@@ -241,7 +323,10 @@ function computeIsochrone() {
       const vTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(v) : null;
       if (!vTerrain) continue;
       const vIsWater = WATER_TERRAINS.has(vTerrain);
-      const w = (uIsWater !== vIsWater) ? (+weights["Embark"]) : (+weights[vTerrain]);
+      const vHasRoad = HEX_ROAD && HEX_ROAD.get(v);
+      const w = (uIsWater !== vIsWater)
+        ? (+weights["Embark"])
+        : (+(vHasRoad ? roadWeights : weights)[vTerrain]);
       if (!isFinite(w) || w <= 0) continue;
       const nd = d + w;
       if (nd > ISOCHRONE_BUDGET) continue;
@@ -284,12 +369,15 @@ function recomputePath() {
       const vTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(v) : null;
       if (!vTerrain) continue;
       const vIsWater = WATER_TERRAINS.has(vTerrain);
+      const vHasRoad = HEX_ROAD && HEX_ROAD.get(v);
       // Edge cost depends on which side(s) of shore we're on.
       // Water->water uses the destination water hex's own weight (Lake/Sea/Ocean).
-      // Land<->water pays the Embark/disembark cost. Land->land pays terrain.
+      // Land<->water pays the Embark/disembark cost. Land->land pays terrain,
+      // pulling from the ROAD column of the weight matrix when v is flagged as
+      // a Road hex — i.e., the road shaves some weight off the inherent terrain.
       let w;
       if (uIsWater !== vIsWater)       w = +weights["Embark"];
-      else                             w = +weights[vTerrain];
+      else                             w = +(vHasRoad ? roadWeights : weights)[vTerrain];
       if (!isFinite(w) || w <= 0) continue;  // impassable / unknown
       const nd = d + w;
       if (!dist.has(v) || nd < dist.get(v)) {
@@ -402,45 +490,161 @@ function buildPathLinePoints() {
 }
 
 // Build the union mask of the given subhex id set, then A* + string-pull from
-// the From centroid to the To centroid through it. Returns [] if either
-// endpoint isn't reachable.
+// the From pixel to the To pixel through it. Each Road-flagged hex on the
+// path is then evaluated INDIVIDUALLY: we RESTRICT that hex's passable area
+// down to its road/city pixels (so A* can only cross the hex by walking the
+// painted road), and keep the restriction only if From can still reach To.
+// A bad/disconnected road hex falls back to its full mask while the other
+// road hexes still snap to the road — so the rendered path follows the
+// painted road wherever the road is contiguous from edge to edge.
 function routeThroughMask(subSet) {
   const sStart = SUBHEX_INDEX.get(fromId), sEnd = SUBHEX_INDEX.get(toId);
   if (!sStart || !sEnd) return [];
   if (fromId === toId) {
-    return [{ x: sStart.centroid[0], y: sStart.centroid[1] }];
+    const p = fromPx || { x: sStart.centroid[0], y: sStart.centroid[1] };
+    return [{ x: p.x, y: p.y }];
   }
+  // Road hexes on the path, PLUS any road-flagged hex directly adjacent to a
+  // path road hex. The adjacent ones aren't on the hex-level shortest path
+  // but their road pixels often continue the painted road we want to snap
+  // to — by including them, A* can detour briefly onto the wider road network
+  // wherever that keeps the route on the road. Drives both the bbox expansion
+  // (so we can reach those subhexes) and the per-hex restriction loop below.
+  const pathRoadSet = new Set();
+  if (pathHexIds && HEX_ROAD) {
+    for (const hid of pathHexIds) if (HEX_ROAD.get(hid)) pathRoadSet.add(hid);
+  }
+  const adjRoadSet = new Set();
+  for (const hid of pathRoadSet) {
+    for (const nb of hexNeighbors(hid)) {
+      if (!pathRoadSet.has(nb) && HEX_ROAD && HEX_ROAD.get(nb)) adjRoadSet.add(nb);
+    }
+  }
+  const roadHexList = [...pathRoadSet, ...adjRoadSet];
+
   const data = SUBHEX_ID_IMG_DATA.data;
   const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
   let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
-  for (const sid of subSet) {
-    const s = SUBHEX_INDEX.get(sid);
-    if (!s) continue;
+  const grow = (s) => {
     if (s.bbox[0] < bx0) bx0 = s.bbox[0];
     if (s.bbox[1] < by0) by0 = s.bbox[1];
     if (s.bbox[2] > bx1) bx1 = s.bbox[2];
     if (s.bbox[3] > by1) by1 = s.bbox[3];
+  };
+  for (const sid of subSet) {
+    const s = SUBHEX_INDEX.get(sid);
+    if (s) grow(s);
+  }
+  // Bbox must cover every subhex of every road hex so XOR can reach road
+  // pixels that fall in subhexes filtered out of subSet (e.g., Peaks subhexes
+  // of a Mountains road hex).
+  for (const hid of roadHexList) {
+    for (const s of (SUBHEXES_BY_HEX.get(hid) || [])) grow(s);
   }
   if (!isFinite(bx0)) return [];
   bx0 = Math.max(0, bx0 - 1); by0 = Math.max(0, by0 - 1);
   bx1 = Math.min(W - 1, bx1 + 1); by1 = Math.min(H - 1, by1 + 1);
   const mw = bx1 - bx0 + 1, mh = by1 - by0 + 1;
-  const mask = new Uint8Array(mw * mh);
-  for (let y = 0; y < mh; y++) {
-    const rowOff = (y + by0) * W;
-    for (let x = 0; x < mw; x++) {
-      const p = (rowOff + (x + bx0)) * 4;
-      const id = data[p] | (data[p+1] << 8) | (data[p+2] << 16);
-      if (subSet.has(id)) mask[y * mw + x] = 1;
+
+  // Build the standard mask. Also collect, per road hex, the mask-local indices
+  // of (a) every pixel that belongs to the hex and (b) just the road pixels
+  // within the hex. We use these below to RESTRICT each road hex's passable
+  // area down to the painted road, so A* must follow the road through that
+  // hex instead of cutting through open terrain alongside it.
+  //
+  // For the passable check we use an EXTENDED set that adds every subhex of
+  // every adjacent road hex on top of the caller's subSet — subhexes of the
+  // adj road hexes aren't in subSet (those hexes aren't on the hex path) but
+  // we still want their pixels to be passable so A* can route through them.
+  const extSubSet = adjRoadSet.size > 0 ? new Set(subSet) : subSet;
+  if (extSubSet !== subSet) {
+    for (const hid of adjRoadSet) {
+      for (const s of (SUBHEXES_BY_HEX.get(hid) || [])) extSubSet.add(s.id);
     }
   }
-  const startPt = { x: sStart.centroid[0], y: sStart.centroid[1] };
-  const endPt   = { x: sEnd.centroid[0],   y: sEnd.centroid[1]   };
+  const mask = new Uint8Array(mw * mh);
+  const hexPxByHex  = new Map();   // hex_id -> all mask indices belonging to the hex
+  const roadPxByHex = new Map();   // hex_id -> subset of those that are road pixels
+  for (const hid of roadHexList) { hexPxByHex.set(hid, []); roadPxByHex.set(hid, []); }
+  for (let y = 0; y < mh; y++) {
+    const fullY = y + by0;
+    const fullRowOff = fullY * W;
+    for (let x = 0; x < mw; x++) {
+      const fullX = x + bx0;
+      const p = (fullRowOff + fullX) * 4;
+      const sid = data[p] | (data[p+1] << 8) | (data[p+2] << 16);
+      const idx = y * mw + x;
+      if (extSubSet.has(sid)) mask[idx] = 1;
+      const sub = SUBHEX_INDEX.get(sid);
+      if (sub) {
+        const allList = hexPxByHex.get(sub.hex);
+        if (allList) {
+          allList.push(idx);
+          if (ROAD_PIXEL_MASK && ROAD_PIXEL_MASK[fullRowOff + fullX]) {
+            roadPxByHex.get(sub.hex).push(idx);
+          }
+        }
+      }
+    }
+  }
+
+  const startPt = fromPx ? { x: fromPx.x, y: fromPx.y } : { x: sStart.centroid[0], y: sStart.centroid[1] };
+  const endPt   = toPx   ? { x: toPx.x,   y: toPx.y   } : { x: sEnd.centroid[0],   y: sEnd.centroid[1]   };
+
+  // For each road hex in path order: tentatively RESTRICT the mask within
+  // that hex to just the road/city pixels (clear everything else in the hex,
+  // re-set only the road pixels). Verify From->To still reaches. Keep on
+  // success, revert on failure. Each hex is decided on its own; a road hex
+  // whose road doesn't actually span the hex falls back to its full mask
+  // and the other road hexes still take effect.
+  //
+  // EXCEPTION: the From and To hexes are NEVER restricted. If we did, the
+  // user's click pixel would usually fall outside the road and snapToMask
+  // would jump it straight to the nearest road pixel — producing a sharp
+  // diagonal line from the click to wherever the road happens to be. By
+  // leaving those hexes' full masks intact, A* finds the shortest pixel
+  // route from the click through allowed subhexes to the road's entry on
+  // the hex border (the next hex IS restricted, so A* still has to enter
+  // it on a road pixel) — which gives a smooth optimal connection.
+  const skipHexes = new Set();
+  if (sStart) skipHexes.add(sStart.hex);
+  if (sEnd)   skipHexes.add(sEnd.hex);
+  for (const hid of roadHexList) {
+    if (skipHexes.has(hid)) continue;
+    const allPx  = hexPxByHex.get(hid)  || [];
+    const roadPx = roadPxByHex.get(hid) || [];
+    if (allPx.length === 0 || roadPx.length === 0) continue;
+    const saved = new Uint8Array(allPx.length);
+    for (let i = 0; i < allPx.length; i++) {
+      saved[i] = mask[allPx[i]];
+      mask[allPx[i]] = 0;
+    }
+    for (const i of roadPx) mask[i] = 1;
+    if (!maskHasRoute(mask, mw, mh, bx0, by0, startPt, endPt)) {
+      for (let i = 0; i < allPx.length; i++) mask[allPx[i]] = saved[i];
+    }
+  }
+
+  return routeInBinaryMask(mask, mw, mh, bx0, by0, startPt, endPt) || [];
+}
+
+// Cheap contiguity check: snap From and To into the mask and run A*. Returns
+// true iff a route exists. Used by the per-hex XOR acceptance loop.
+function maskHasRoute(mask, mw, mh, bx0, by0, startPt, endPt) {
   const sX = snapToMask(mask, mw, mh, Math.round(startPt.x - bx0), Math.round(startPt.y - by0));
   const eX = snapToMask(mask, mw, mh, Math.round(endPt.x   - bx0), Math.round(endPt.y   - by0));
-  if (!sX || !eX) return [];
+  if (!sX || !eX) return false;
+  return !!aStarInMask(mask, mw, mh, sX[0], sX[1], eX[0], eX[1]);
+}
+
+// A* in a binary mask + string-pull smoothing, returning the pixel polyline in
+// FULL-IMAGE coordinates (or null if From/To aren't reachable in this mask).
+function routeInBinaryMask(mask, mw, mh, bx0, by0, startPt, endPt) {
+  const sX = snapToMask(mask, mw, mh, Math.round(startPt.x - bx0), Math.round(startPt.y - by0));
+  const eX = snapToMask(mask, mw, mh, Math.round(endPt.x   - bx0), Math.round(endPt.y   - by0));
+  if (!sX || !eX) return null;
   const rawPath = aStarInMask(mask, mw, mh, sX[0], sX[1], eX[0], eX[1]);
-  if (!rawPath) return [];
+  if (!rawPath) return null;
   const smoothed = stringPull(rawPath, mask, mw, mh);
   const pts = [startPt];
   for (const [px, py] of smoothed) pts.push({ x: px + bx0, y: py + by0 });
@@ -582,22 +786,27 @@ function fillSubhex(sub, rgb, alpha) {
 // over hexes the path enters (excludes the starting hex).
 function pathStats() {
   if (!pathHexIds || pathHexIds.length === 0) {
-    return { hexes: 0, subhexes: 0, cost: 0, byTerrain: {} };
+    return { hexes: 0, subhexes: 0, cost: 0, byTerrain: {}, strongholds: 0, rivers: 0, roads: 0 };
   }
   let cost = 0;
   const byTerrain = {};
   let embarks = 0;
+  let strongholds = 0, rivers = 0, roads = 0;
   for (let i = 0; i < pathHexIds.length; i++) {
     const hid = pathHexIds[i];
     const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null;
     if (terrain) byTerrain[terrain] = (byTerrain[terrain] || 0) + 1;
+    if (HEX_STRONGHOLD && HEX_STRONGHOLD.get(hid)) strongholds++;
+    if (HEX_RIVER      && HEX_RIVER.get(hid))      rivers++;
+    if (HEX_ROAD       && HEX_ROAD.get(hid))       roads++;
     if (i > 0 && terrain) {
       const prevTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(pathHexIds[i - 1]) : null;
       const prevIsWater = prevTerrain ? WATER_TERRAINS.has(prevTerrain) : false;
       const curIsWater  = WATER_TERRAINS.has(terrain);
+      const curHasRoad  = HEX_ROAD && HEX_ROAD.get(hid);
       let w;
       if (prevIsWater !== curIsWater) { w = +weights["Embark"]; embarks++; }
-      else                             { w = +weights[terrain]; }
+      else                             { w = +(curHasRoad ? roadWeights : weights)[terrain]; }
       if (isFinite(w)) cost += w;
     }
   }
@@ -609,6 +818,7 @@ function pathStats() {
     hexes: pathHexIds.length,
     subhexes: pathSubhexIds ? pathSubhexIds.size : 0,
     cost, byTerrain, embarks,
+    strongholds, rivers, roads,
     miles, km,
   };
 }
@@ -792,7 +1002,13 @@ stage.addEventListener("mousemove", (e) => {
       const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hx.id) : null;
       const tw = (terrain && weights[terrain] != null) ? +weights[terrain] : null;
       const terrainStr = terrain ? `  ·  ${terrain}${isFinite(tw) ? ` (w ${tw})` : ""}` : "";
-      tooltipEl.textContent = `${pad4(hx.id)}${terrainStr}${sname ? `  ·  ${sname}` : ""}`;
+      // Per-hex yes/no flags from the spreadsheet.
+      const flags = [];
+      if (HEX_ROAD && HEX_ROAD.get(hx.id)) flags.push("Road");
+      if (HEX_RIVER && HEX_RIVER.get(hx.id)) flags.push("River");
+      if (HEX_STRONGHOLD && HEX_STRONGHOLD.get(hx.id)) flags.push("Stronghold");
+      const flagsStr = flags.length ? `  ·  ${flags.join(", ")}` : "";
+      tooltipEl.textContent = `${pad4(hx.id)}${terrainStr}${flagsStr}${sname ? `  ·  ${sname}` : ""}`;
       const r = stage.getBoundingClientRect();
       tooltipEl.style.left = (e.clientX - r.left) + "px";
       tooltipEl.style.top  = (e.clientY - r.top)  + "px";
@@ -819,13 +1035,18 @@ function handleClick(e) {
     renderSelection(); updateStatus();
     return;
   }
+  const clickPx = { x: ipt.x, y: ipt.y };
   if (fromId == null) {
-    fromId = sid; toId = null; pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
+    fromId = sid; fromPx = clickPx;
+    toId = null;  toPx   = null;
+    pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
   } else if (toId == null && sid !== fromId) {
-    toId = sid;
+    toId = sid; toPx = clickPx;
     recomputePath();
   } else {
-    fromId = sid; toId = null; pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
+    fromId = sid; fromPx = clickPx;
+    toId = null;  toPx   = null;
+    pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
   }
   renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
 }
@@ -847,3 +1068,210 @@ function handleClick(e) {
   renderLayers();
   resetView();
 })();
+
+// === GARBAGE BELOW — DEAD CODE, IGNORE ===
+/*
+    // Neighbor (row, col) per edge index. Edge i = verts[i] -> verts[(i+1)%6].
+    // Edge 0 = NE, 1 = E, 2 = SE, 3 = SW, 4 = W, 5 = NW. Offset row offsets RIGHT.
+    let nbrs;
+    if (row % 2 === 0) {
+      nbrs = [
+        [row - 1, col    ], // NE
+        [row,     col + 1], // E
+        [row + 1, col    ], // SE
+        [row + 1, col - 1], // SW
+        [row,     col - 1], // W
+        [row - 1, col - 1], // NW
+      ];
+    } else {
+      nbrs = [
+        [row - 1, col + 1], // NE
+        [row,     col + 1], // E
+        [row + 1, col + 1], // SE
+        [row + 1, col    ], // SW
+        [row,     col - 1], // W
+        [row - 1, col    ], // NW
+      ];
+    }
+    if (HEX_OUTLINE_AA) {
+      hlCtx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const [nr, nc] = nbrs[i];
+        if (hasHex(nr, nc)) continue;          // internal border — skip
+        const a = verts[i], b = verts[(i + 1) % 6];
+        hlCtx.moveTo(a[0], a[1]);
+        hlCtx.lineTo(b[0], b[1]);
+      }
+      hlCtx.stroke();
+    } else {
+      for (let i = 0; i < 6; i++) {
+        const [nr, nc] = nbrs[i];
+        if (hasHex(nr, nc)) continue;
+        const a = verts[i], b = verts[(i + 1) % 6];
+        drawLineBresenham(a[0], a[1], b[0], b[1], thick, half);
+      }
+    }
+  }
+}
+
+function renderSelection() {
+  hlCtx.clearRect(0, 0, hlCanvas.width, hlCanvas.height);
+  // Reachability fill (rendered under the path so the From/To/path overlay
+  // remains visible if both are active).
+  if (ISOCHRONE_MODE && isochroneSubhexIds && isochroneSubhexIds.size > 0) {
+    fillSubhexSet(isochroneSubhexIds, ISOCHRONE_COLOR, ISOCHRONE_ALPHA);
+  }
+  if (pathIds && pathIds.length > 0) {
+    for (const sid of pathIds) {
+      if (sid === fromId || sid === toId) continue;
+      fillSubhex(SUBHEX_INDEX.get(sid), PATH_COLOR, PATH_ALPHA);
+    }
+  }
+  if (fromId != null) fillSubhex(SUBHEX_INDEX.get(fromId), START_COLOR, START_ALPHA);
+  if (toId   != null) fillSubhex(SUBHEX_INDEX.get(toId),   END_COLOR,   END_ALPHA);
+  if (pathIds && pathIds.length > 1) drawPathLine();
+  drawHexOutlines();
+}
+
+// =================== Pan/Zoom ===================
+function applyView() {
+  const t = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
+  mapCanvas.style.transform = t;
+  hlCanvas.style.transform = t;
+  updateStatus();
+}
+function resetView() {
+  const r = stage.getBoundingClientRect();
+  const sx = r.width / HEX_DATA.image_width;
+  const sy = r.height / HEX_DATA.image_height;
+  view.scale = Math.min(sx, sy);
+  view.x = (r.width - HEX_DATA.image_width * view.scale) / 2;
+  view.y = (r.height - HEX_DATA.image_height * view.scale) / 2;
+  applyView();
+}
+function zoomAt(clientX, clientY, factor) {
+  const r = stage.getBoundingClientRect();
+  const lx = clientX - r.left, ly = clientY - r.top;
+  const ix = (lx - view.x) / view.scale;
+  const iy = (ly - view.y) / view.scale;
+  view.scale = Math.max(0.05, Math.min(8, view.scale * factor));
+  view.x = lx - ix * view.scale;
+  view.y = ly - iy * view.scale;
+  applyView();
+}
+function stageToImage(clientX, clientY) {
+  const r = stage.getBoundingClientRect();
+  const ix = (clientX - r.left - view.x) / view.scale;
+  const iy = (clientY - r.top  - view.y) / view.scale;
+  if (ix < 0 || iy < 0 || ix >= HEX_DATA.image_width || iy >= HEX_DATA.image_height) return null;
+  return { x: ix, y: iy };
+}
+function lookupSubhex(px, py) {
+  if (!SUBHEX_ID_IMG_DATA) return 0;
+  const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
+  if (px < 0 || py < 0 || px >= W || py >= H) return 0;
+  const i = (py * W + px) * 4;
+  const d = SUBHEX_ID_IMG_DATA.data;
+  return d[i] | (d[i+1] << 8) | (d[i+2] << 16);
+}
+
+// =================== Interaction ===================
+let panning = false, panStart = null, mouseDownPos = null;
+stage.addEventListener("mousedown", (e) => {
+  if (e.button !== 0) return;
+  panning = true;
+  panStart = { x: e.clientX - view.x, y: e.clientY - view.y };
+  mouseDownPos = { x: e.clientX, y: e.clientY };
+  stage.classList.add("panning");
+});
+window.addEventListener("mousemove", (e) => {
+  if (panning) {
+    view.x = e.clientX - panStart.x;
+    view.y = e.clientY - panStart.y;
+    applyView();
+  }
+});
+window.addEventListener("mouseup", (e) => {
+  if (!panning) return;
+  panning = false;
+  stage.classList.remove("panning");
+  const moved = Math.hypot(e.clientX - mouseDownPos.x, e.clientY - mouseDownPos.y);
+  if (moved < 4) handleClick(e);
+});
+stage.addEventListener("mousemove", (e) => {
+  const ipt = stageToImage(e.clientX, e.clientY);
+  if (ipt) {
+    const hx = pointToHex(ipt.x, ipt.y);
+    if (hx) {
+      const sid = lookupSubhex(ipt.x | 0, ipt.y | 0);
+      const sname = sid ? SUBHEX_INDEX.get(sid)?.name : null;
+      const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hx.id) : null;
+      const tw = (terrain && weights[terrain] != null) ? +weights[terrain] : null;
+      const terrainStr = terrain ? `  ·  ${terrain}${isFinite(tw) ? ` (w ${tw})` : ""}` : "";
+      // Per-hex yes/no flags from the spreadsheet.
+      const flags = [];
+      if (HEX_ROAD && HEX_ROAD.get(hx.id)) flags.push("Road");
+      if (HEX_RIVER && HEX_RIVER.get(hx.id)) flags.push("River");
+      if (HEX_STRONGHOLD && HEX_STRONGHOLD.get(hx.id)) flags.push("Stronghold");
+      const flagsStr = flags.length ? `  ·  ${flags.join(", ")}` : "";
+      tooltipEl.textContent = `${pad4(hx.id)}${terrainStr}${flagsStr}${sname ? `  ·  ${sname}` : ""}`;
+      const r = stage.getBoundingClientRect();
+      tooltipEl.style.left = (e.clientX - r.left) + "px";
+      tooltipEl.style.top  = (e.clientY - r.top)  + "px";
+      tooltipEl.classList.remove("hidden");
+      return;
+    }
+  }
+  tooltipEl.classList.add("hidden");
+});
+stage.addEventListener("mouseleave", () => tooltipEl.classList.add("hidden"));
+stage.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
+}, { passive: false });
+
+function handleClick(e) {
+  const ipt = stageToImage(e.clientX, e.clientY);
+  if (!ipt) return;
+  const sid = lookupSubhex(ipt.x | 0, ipt.y | 0);
+  if (!sid) return;
+  if (ISOCHRONE_MODE) {
+    isochroneSourceId = sid;
+    computeIsochrone();
+    renderSelection(); updateStatus();
+    return;
+  }
+  const clickPx = { x: ipt.x, y: ipt.y };
+  if (fromId == null) {
+    fromId = sid; fromPx = clickPx;
+    toId = null;  toPx   = null;
+    pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
+  } else if (toId == null && sid !== fromId) {
+    toId = sid; toPx = clickPx;
+    recomputePath();
+  } else {
+    fromId = sid; fromPx = clickPx;
+    toId = null;  toPx   = null;
+    pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
+  }
+  renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
+}
+
+// =================== Init ===================
+(async () => {
+  buildLayerControls();
+  buildWeightControls();
+  buildColorControls();
+  buildLineControls();
+  buildIsochroneControls();
+  updateEndpoints();
+  try { await loadAll(); }
+  catch (e) {
+    loadingEl.textContent = "Failed to load: " + (e?.message || e);
+    console.error(e);
+    return;
+  }
+  renderLayers();
+  resetView();
+})();
+*/

@@ -27,6 +27,10 @@ html, body {
   width: 300px; background: var(--panel);
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column; overflow-y: auto;
+  /* Reserve space for the vertical scrollbar even when no scrollbar is shown,
+     so the inner content width doesn't jump (e.g. the "Hide settings" button
+     becoming narrower when the panel expands and adds a scrollbar). */
+  scrollbar-gutter: stable;
 }
 #stage {
   flex: 1; position: relative; overflow: hidden;
@@ -153,7 +157,25 @@ canvas {
 #settings-toggle { flex: 1; text-align: center; }
 #settings-panels.hidden { display: none; }
 
+/* Toggleable reachability group — mirrors the settings pattern. */
+#reach-toggle-row { display: flex; }
+#reach-toggle { flex: 1; text-align: center; }
+#reach-panels.hidden { display: none; }
+
 .swatch.Flatlands { background: #b9d775; }
 .swatch.Woodland  { background: #4a8d4a; }
 .swatch.Lake      { background: #6db7e0; }
 .swatch.Ocean     { background: #2a5b9c; }
+
+.editable-val {
+  flex: 0 0 56px;
+  width: 56px;
+  min-width: 0;
+  box-sizing: border-box;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--accent); border-radius: 4px;
+  padding: 1px 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  text-align: right;
+}

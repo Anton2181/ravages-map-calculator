@@ -32,10 +32,16 @@
       <div id="path-info"></div>
     </div>
 
+    <div id="reach-toggle-row" class="panel-section">
+      <span class="button" id="reach-toggle">Show reachability</span>
+    </div>
+
+    <div id="reach-panels" class="hidden">
     <div class="panel-section">
       <h3>Reachability (isochrone)</h3>
       <div id="isochrone"></div>
       <div class="help" style="margin-top:6px;">Pick a hex to see everywhere reachable within a cost budget. Embark / disembark and water weights apply the same way as in the From/To path.</div>
+    </div>
     </div>
 
     <div id="settings-toggle-row" class="panel-section">
@@ -46,7 +52,7 @@
     <div class="panel-section">
       <h3>Traversal weights</h3>
       <div id="weights"></div>
-      <div class="help" style="margin-top:6px;">Each hex you enter costs its terrain weight. Lake / Sea / Ocean weights apply when sailing water-to-water. <b>Embark / disembark</b> is added each time the route crosses the shoreline. Starting hex is free. Path recomputes on every change.</div>
+      <div class="help" style="margin-top:6px;">Each hex you enter costs its terrain weight. Lake / Sea / Ocean weights apply when sailing water-to-water. <b>Embark / disembark</b> is added each time the route crosses the shoreline. If the destination hex is flagged as a <b>Road</b> in the sheet, the <b>Road column</b> value replaces the default for that hex. Starting hex is free. Path recomputes on every change.</div>
     </div>
     <div class="panel-section">
       <h3>Colors</h3>

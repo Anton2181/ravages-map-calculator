@@ -9,9 +9,53 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// Make a small read-only value span editable on double-click.
+// onParse(text) -> parsed value or null on invalid.
+// onApply(value) -> store + propagate; should also update the matching slider.
+// reformat() -> string to display after committing (read from current state).
+function makeEditable(span, onParse, onApply, reformat) {
+  span.style.cursor = "text";
+  span.title = "Double-click to edit";
+  span.addEventListener("dblclick", () => {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = span.textContent;
+    input.size = 4;
+    input.className = "editable-val";
+    // Inline style as a belt-and-braces guard against flex parents (.weight-row)
+    // that have no constraints on their other children — without this the input
+    // can balloon to its UA default ~150px width and push the row off the panel.
+    input.style.flex = "0 0 56px";
+    input.style.width = "56px";
+    input.style.maxWidth = "56px";
+    input.style.minWidth = "0";
+    input.style.boxSizing = "border-box";
+    span.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    function commit(save) {
+      if (done) return; done = true;
+      if (save) {
+        const v = onParse(input.value);
+        if (v != null) onApply(v);
+      }
+      span.textContent = reformat();
+      input.replaceWith(span);
+    }
+    input.addEventListener("blur", () => commit(true));
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commit(true); }
+      else if (e.key === "Escape") { e.preventDefault(); commit(false); }
+    });
+  });
+}
+
+
 function buildLayerControls() {
   layersEl.innerHTML = "";
   for (const l of LAYERS) {
+    if (l.hidden) continue;
     const row = document.createElement("div");
     row.className = "layer-row";
     row.innerHTML = `<input type="checkbox" id="layer-${l.id}" ${l.on ? "checked" : ""} />`
@@ -30,19 +74,42 @@ function buildLayerControls() {
 const WEIGHT_LABELS = { "Embark": "Embark / disembark" };
 function buildWeightControls() {
   weightsEl.innerHTML = "";
+  // Header row above the two input columns.
+  const head = document.createElement("div");
+  head.className = "weight-row";
+  const headStyle = "width:70px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.08em;text-align:center;";
+  head.innerHTML = `<span class="swatch" style="visibility:hidden"></span>`
+    + `<span class="name"></span>`
+    + `<span style="${headStyle}">Default</span>`
+    + `<span style="${headStyle}">Road</span>`;
+  weightsEl.appendChild(head);
   for (const cls of CLASSES) {
     const row = document.createElement("div");
     row.className = "weight-row";
     const label = WEIGHT_LABELS[cls] || cls;
     row.innerHTML = `<span class="swatch ${cls}"></span><span class="name">${escapeHtml(label)}</span>`
-      + `<input type="number" min="0" step="0.5" value="${weights[cls]}" />`;
-    row.querySelector("input").addEventListener("change", (e) => {
-      const v = parseFloat(e.target.value);
-      weights[cls] = (isFinite(v) && v > 0) ? v : DEFAULT_WEIGHTS[cls];
-      e.target.value = weights[cls];
+      + `<input type="number" min="0" step="0.5" value="${weights[cls]}" data-col="default" />`
+      + `<input type="number" min="0" step="0.5" value="${roadWeights[cls]}" data-col="road" />`;
+    const inputs = row.querySelectorAll("input");
+    const reroute = () => {
       if (fromId != null && toId != null) {
         recomputePath(); renderSelection(); updatePathInfo(); updateStatus();
       }
+      if (ISOCHRONE_MODE && isochroneSourceId != null) {
+        computeIsochrone(); renderSelection(); updateStatus();
+      }
+    };
+    inputs[0].addEventListener("change", (e) => {
+      const v = parseFloat(e.target.value);
+      weights[cls] = (isFinite(v) && v > 0) ? v : DEFAULT_WEIGHTS[cls];
+      e.target.value = weights[cls];
+      reroute();
+    });
+    inputs[1].addEventListener("change", (e) => {
+      const v = parseFloat(e.target.value);
+      roadWeights[cls] = (isFinite(v) && v > 0) ? v : DEFAULT_ROAD_WEIGHTS[cls];
+      e.target.value = roadWeights[cls];
+      reroute();
     });
     weightsEl.appendChild(row);
   }
@@ -79,7 +146,10 @@ function updatePathInfo() {
     + `<div class="row"><span>Distance</span><span>${st.miles.toLocaleString()} mi / ${st.km.toLocaleString(undefined, { maximumFractionDigits: 0 })} km</span></div>`
     + `<div class="row"><span>Subhexes in mask</span><span>${st.subhexes}</span></div>`
     + `<div class="row"><span>Cost</span><span>${st.cost.toFixed(1)}</span></div>`
-    + (st.embarks ? `<div class="row"><span>Embarks</span><span>${st.embarks}</span></div>` : "");
+    + (st.embarks     ? `<div class="row"><span>Embarks</span><span>${st.embarks}</span></div>`         : "")
+    + (st.roads       ? `<div class="row"><span>Road hexes</span><span>${st.roads}</span></div>`         : "")
+    + (st.rivers      ? `<div class="row"><span>River hexes</span><span>${st.rivers}</span></div>`       : "")
+    + (st.strongholds ? `<div class="row"><span>Strongholds</span><span>${st.strongholds}</span></div>` : "");
   const terrains = Object.keys(st.byTerrain).sort();
   for (const t of terrains) {
     html += `<div class="row"><span>${escapeHtml(t)}</span><span>${st.byTerrain[t]}</span></div>`;
@@ -102,16 +172,19 @@ function updateStatus() {
 function clearSelection() {
   fromId = toId = null; pathIds = null; pathSet = null;
   pathHexIds = null; pathSubhexIds = null;
+  fromPx = toPx = null;
   renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
 }
 
 document.getElementById("reset-view").addEventListener("click", () => resetView());
 document.getElementById("reset-layers").addEventListener("click", () => {
-  for (const l of LAYERS) { l.on = (l.id === "sea" || l.id === "terrain"); l.opacity = 1.0; }
+  const onIds = new Set(["sea", "continent", "terrain", "rivers", "roads", "ctf"]);
+  for (const l of LAYERS) { l.on = onIds.has(l.id); l.opacity = 1.0; }
   buildLayerControls(); renderLayers();
 });
 document.getElementById("swap").addEventListener("click", () => {
   const t = fromId; fromId = toId; toId = t;
+  const tp = fromPx; fromPx = toPx; toPx = tp;
   if (fromId != null && toId != null) recomputePath();
   else { pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null; }
   renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
@@ -162,6 +235,10 @@ function buildColorControls() {
       alphaVal.textContent = pct + "%";
       renderSelection();
     });
+    makeEditable(alphaVal,
+      (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(0, Math.min(100, n)) : null; },
+      (v) => { c.setA(Math.round((v / 100) * 255)); alphaInput.value = v; renderSelection(); },
+      () => Math.round((c.getA() / 255) * 100) + "%");
     colorsEl.appendChild(row);
   }
 }
@@ -181,6 +258,10 @@ function buildLineControls() {
     lwLabel.textContent = LINE_WIDTH + "px";
     renderSelection();
   });
+  makeEditable(lwLabel,
+    (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(1, Math.min(10, n)) : null; },
+    (v) => { LINE_WIDTH = v; lwSlider.value = v; renderSelection(); },
+    () => LINE_WIDTH + "px");
   lineEl.appendChild(lwRow);
 
   const psRow = document.createElement("div");
@@ -195,6 +276,10 @@ function buildLineControls() {
     psLabel.textContent = POINT_SIZE + "px";
     renderSelection();
   });
+  makeEditable(psLabel,
+    (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(0, Math.min(10, n)) : null; },
+    (v) => { POINT_SIZE = v; psSlider.value = v; renderSelection(); },
+    () => POINT_SIZE + "px");
   lineEl.appendChild(psRow);
 
   const aaRow = document.createElement("div");
@@ -229,6 +314,10 @@ function buildLineControls() {
     owLabel.textContent = HEX_OUTLINE_WIDTH + "px";
     renderSelection();
   });
+  makeEditable(owLabel,
+    (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(1, Math.min(10, n)) : null; },
+    (v) => { HEX_OUTLINE_WIDTH = v; owSlider.value = v; renderSelection(); },
+    () => HEX_OUTLINE_WIDTH + "px");
   lineEl.appendChild(owRow);
 
   const oaaRow = document.createElement("div");
@@ -288,6 +377,13 @@ function buildIsochroneControls() {
       renderSelection(); updateStatus();
     }
   });
+  makeEditable(bLabel,
+    (t) => { const n = parseFloat(t); return isFinite(n) && n > 0 ? n : null; },
+    (v) => {
+      ISOCHRONE_BUDGET = v; bSlider.value = v;
+      if (ISOCHRONE_MODE && isochroneSourceId != null) { computeIsochrone(); renderSelection(); updateStatus(); }
+    },
+    () => String(ISOCHRONE_BUDGET));
   isoEl.appendChild(bRow);
 
   const cRow = document.createElement("div");
@@ -311,5 +407,31 @@ function buildIsochroneControls() {
     alphaVal.textContent = pct + "%";
     renderSelection();
   });
+  makeEditable(alphaVal,
+    (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(0, Math.min(100, n)) : null; },
+    (v) => { ISOCHRONE_ALPHA = Math.round((v / 100) * 255); alphaInput.value = v; renderSelection(); },
+    () => Math.round((ISOCHRONE_ALPHA / 255) * 100) + "%");
   isoEl.appendChild(cRow);
+}
+
+// Reachability section show/hide toggle (mirrors the Settings panel pattern:
+// the heading + body live in a sibling panel-section that gets hidden, so the
+// whole section vanishes when collapsed and only the toggle button remains).
+{
+  const tbtn = document.getElementById("reach-toggle");
+  const tpanels = document.getElementById("reach-panels");
+  if (tbtn && tpanels) {
+    tbtn.addEventListener("click", () => {
+      const isHidden = tpanels.classList.toggle("hidden");
+      tbtn.textContent = isHidden ? "Show reachability" : "Hide reachability";
+      if (isHidden && ISOCHRONE_MODE) {
+        // Collapse the panel -> also turn off the click-capture mode so normal
+        // From/To clicking comes back. Keeps state in case you re-open it.
+        ISOCHRONE_MODE = false;
+        renderSelection();
+        // Refresh the checkbox in the panel so it matches state next time.
+        buildIsochroneControls();
+      }
+    });
+  }
 }
