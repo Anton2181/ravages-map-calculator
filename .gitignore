@@ -1,0 +1,18 @@
+# Leftover build artifacts that shouldn't be served.
+index.html.head
+debug_overlay.png
+verify_*.png
+verify2_*.png
+crop_*.png
+zoomed_*.png
+preview_selection.png
+grid_compare.png
+right_topedge.png
+bottom_leftedge.png
+displayable_bin.png
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Ravages Map Calculator</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="header">
+      <h1>Ravages Map Calculator</h1>
+      <div class="sub">Click to set From, click again for To. Path auto-computes.</div>
+    </div>
+
+    <div class="panel-section">
+      <h3>Layers</h3>
+      <div id="layers"></div>
+      <div class="button-row" style="margin-top:6px;">
+        <span class="button" id="reset-view">Reset view</span>
+        <span class="button" id="reset-layers">Reset layers</span>
+      </div>
+    </div>
+
+    <div class="panel-section">
+      <h3>Selection</h3>
+      <div id="endpoints"></div>
+      <div class="button-row">
+        <span class="button" id="swap">Swap</span>
+        <span class="button" id="clear-sel">Clear</span>
+      </div>
+      <div id="path-info"></div>
+    </div>
+
+    <div id="settings-toggle-row" class="panel-section">
+      <span class="button" id="settings-toggle">Show settings</span>
+    </div>
+
+    <div id="settings-panels" class="hidden">
+    <div class="panel-section">
+      <h3>Traversal weights</h3>
+      <div id="weights"></div>
+      <div class="help" style="margin-top:6px;">Cost is paid per hex traversed; each hex's cost = max(weights of subhexes you pass through inside it). Same-hex moves between subhexes are free in distance but raise that hex's max if a heavier class is entered.</div>
+    </div>
+    <div class="panel-section">
+      <h3>Colors</h3>
+      <div id="colors"></div>
+      <div class="help" style="margin-top:6px;">Tweak fill colors and opacity for the From/To/path subhexes and the path line.</div>
+    </div>
+    <div class="panel-section">
+      <h3>Path line</h3>
+      <div id="line-style"></div>
+    </div>
+    </div>
+  </aside>
+
+  <div id="stage">
+    <canvas id="map-canvas"></canvas>
+    <canvas id="hl-canvas"></canvas>
+    <div id="hover-tooltip" class="hidden"></div>
+    <div id="status">—</div>
+    <div id="loading">Loading map data…</div>
+  </div>
+</div>
+
+<script src="pathfinding.js"></script>
+<script src="ui.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
