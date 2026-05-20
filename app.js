@@ -119,6 +119,12 @@ let HEX_HAS_ROAD = null;
 let HEX_PIXELS = null;
 let HEX_ROAD_PIXELS = null;
 let HEX_RIVER_PIXELS = null;
+// For each hex whose CSV terrain is land but whose pixels include Ocean/Sea/
+// Lake subhexes, the full-image pixel indices of those water subhexes.
+// routeThroughMask attempts to clear these pixels from the mask; if doing so
+// keeps From->To reachable, the exclusion sticks; otherwise the hex's water
+// pixels are restored and the hex is added to skipHexes.
+let LAND_HEX_WATER_PIXELS = null;
 let fromId = null, toId = null;
 // Exact click pixels for From / To. These are what the path line actually
 // starts / ends at — the subhex id is still tracked because it controls cost,
@@ -268,6 +274,7 @@ async function loadAll() {
   SUBHEX_ID_IMG_DATA = sctx.getImageData(0, 0, sc.width, sc.height);
   loadingEl.textContent = "Indexing pixels…";
   precomputeHexIndexes();
+  precomputeLandHexWaterPixels();
   loadingEl.textContent = "Loading map layers…";
   await Promise.all(LAYERS.map(async (l) => {
     try { IMAGES[l.id] = await loadImage(encodeURI(l.file)); }
@@ -352,6 +359,27 @@ function precomputeHexIndexes() {
     const hid = HEX_ID_PX[i];
     if (!hid) continue;
     HEX_PIXELS.get(hid)[fillIdx[hid]++] = i;
+  }
+}
+
+// For every hex whose CSV terrain is land, walk its precomputed pixel list
+// and pull out the pixels whose subhex class is Ocean/Sea/Lake. The result
+// (LAND_HEX_WATER_PIXELS[hex_id]) lets routeThroughMask quickly attempt a
+// water-exclusion-per-hex without re-scanning pixels at route time.
+function precomputeLandHexWaterPixels() {
+  LAND_HEX_WATER_PIXELS = new Map();
+  if (!HEX_TERRAIN || !HEX_PIXELS || !SUBHEX_ID_PX || !SUBHEX_INDEX) return;
+  for (const [hid, terrain] of HEX_TERRAIN) {
+    if (!terrain || WATER_TERRAINS.has(terrain)) continue;
+    const pixels = HEX_PIXELS.get(hid);
+    if (!pixels) continue;
+    const waterIdxs = [];
+    for (let i = 0; i < pixels.length; i++) {
+      const fullIdx = pixels[i];
+      const sub = SUBHEX_INDEX.get(SUBHEX_ID_PX[fullIdx]);
+      if (sub && WATER_TERRAINS.has(sub.class)) waterIdxs.push(fullIdx);
+    }
+    if (waterIdxs.length > 0) LAND_HEX_WATER_PIXELS.set(hid, new Uint32Array(waterIdxs));
   }
 }
 
@@ -701,6 +729,13 @@ function routeThroughMask(subSet) {
     }
   }
   const mask = new Uint8Array(mw * mh);
+  // Parallel "path-only" mask: same shape as `mask` but only flips on for
+  // pixels in subSet (the caller's path-hex subhexes), not the broadened
+  // extSubSet. Water exclusion below uses THIS mask for its contiguity
+  // check, so the question becomes "can From still reach To through the
+  // PATH hexes alone after removing this hex's water?" — neighbors only
+  // come into play AFTER water exclusion, for the road-restriction step.
+  const pathOnlyMask = new Uint8Array(mw * mh);
   const hexPxByHex  = new Map();   // hex_id -> all mask indices belonging to the hex
   const roadPxByHex = new Map();   // hex_id -> subset of those that are road pixels
   for (const hid of roadHexList) { hexPxByHex.set(hid, []); roadPxByHex.set(hid, []); }
@@ -724,7 +759,9 @@ function routeThroughMask(subSet) {
       const fullX = fullIdx - fullY * W;
       if (fullX < bx0 || fullX > bx1 || fullY < by0 || fullY > by1) continue;
       const idx = (fullY - by0) * mw + (fullX - bx0);
-      if (extSubSet.has(subhexPx[fullIdx])) mask[idx] = 1;
+      const sidHere = subhexPx[fullIdx];
+      if (extSubSet.has(sidHere))   mask[idx]         = 1;
+      if (subSet.has(sidHere))      pathOnlyMask[idx] = 1;
       if (isRoadHex) allList.push(idx);
     }
     // Populate the "restricted-to" set from the precomputed per-hex pixel
@@ -796,6 +833,57 @@ function routeThroughMask(subSet) {
       if (HEX_RIVER.get(hid) && !mergedHexes.has(hid)) skipHexes.add(hid);
     }
   }
+
+  // Water-subhex exclusion pass. For each path hex marked as LAND in the
+  // sheet that contains Ocean/Sea/Lake-class subhexes, tentatively clear
+  // those subhex pixels from BOTH the main mask AND the path-only mask,
+  // then check connectivity on the path-only mask (so the question is
+  // "is From still reachable through path hexes alone?"). If yes, keep
+  // the exclusion in both. If the mask becomes non-contiguous WITHOUT
+  // help from adjacent neighbors, restore the hex's water pixels in both
+  // masks AND add the hex to skipHexes so the road-restriction loop below
+  // doesn't re-clear them. The skipHexes add applies to every such hex,
+  // including road+river ones — "restore the entire hex".
+  if (LAND_HEX_WATER_PIXELS && pathHexIds) {
+    for (const hid of pathHexIds) {
+      if (skipHexes.has(hid)) continue;
+      const waterPixels = LAND_HEX_WATER_PIXELS.get(hid);
+      if (!waterPixels || waterPixels.length === 0) continue;
+      const maskIdxs = [];
+      const savedFull = [];
+      const savedPath = [];
+      for (let pi = 0; pi < waterPixels.length; pi++) {
+        const fullIdx = waterPixels[pi];
+        const fullY = (fullIdx / W) | 0;
+        const fullX = fullIdx - fullY * W;
+        if (fullX < bx0 || fullX > bx1 || fullY < by0 || fullY > by1) continue;
+        const idx = (fullY - by0) * mw + (fullX - bx0);
+        maskIdxs.push(idx);
+        savedFull.push(mask[idx]);
+        savedPath.push(pathOnlyMask[idx]);
+        mask[idx]         = 0;
+        pathOnlyMask[idx] = 0;
+      }
+      if (maskIdxs.length === 0) continue;
+      if (!maskHasRoute(pathOnlyMask, mw, mh, bx0, by0, startPt, endPt)) {
+        for (let i = 0; i < maskIdxs.length; i++) {
+          mask[maskIdxs[i]]         = savedFull[i];
+          pathOnlyMask[maskIdxs[i]] = savedPath[i];
+        }
+        skipHexes.add(hid);
+      }
+    }
+  }
+
+  // Set for O(1) "is this hex on the path?" lookups inside the restriction
+  // loop — drives the choice of contiguity mask: path hexes are checked on
+  // pathOnlyMask (so the restriction can't be rescued by adjacent detours
+  // and a road+river hex whose road/river strip doesn't bridge entry-to-
+  // exit reverts to its full mask); adjacent hexes are checked on the full
+  // mask (so we still catch cases where the adjacent's broadening was the
+  // only thing keeping the full mask connected).
+  const pathHexIdSet = new Set(pathHexIds || []);
+
   for (const hid of roadHexList) {
     if (skipHexes.has(hid)) continue;
     const allPx  = hexPxByHex.get(hid)  || [];
@@ -806,14 +894,27 @@ function routeThroughMask(subSet) {
     // mask is an open corridor for detours through pure terrain). Revert-on-
     // fail below still recovers any hex whose absence would actually break
     // From->To.
-    const saved = new Uint8Array(allPx.length);
+    const isPathHex = pathHexIdSet.has(hid);
+    const saved     = new Uint8Array(allPx.length);
+    const savedPath = isPathHex ? new Uint8Array(allPx.length) : null;
     for (let i = 0; i < allPx.length; i++) {
       saved[i] = mask[allPx[i]];
       mask[allPx[i]] = 0;
+      if (isPathHex) {
+        savedPath[i] = pathOnlyMask[allPx[i]];
+        pathOnlyMask[allPx[i]] = 0;
+      }
     }
-    for (const i of roadPx) mask[i] = 1;
-    if (!maskHasRoute(mask, mw, mh, bx0, by0, startPt, endPt)) {
-      for (let i = 0; i < allPx.length; i++) mask[allPx[i]] = saved[i];
+    for (const i of roadPx) {
+      mask[i] = 1;
+      if (isPathHex) pathOnlyMask[i] = 1;
+    }
+    const checkMask = isPathHex ? pathOnlyMask : mask;
+    if (!maskHasRoute(checkMask, mw, mh, bx0, by0, startPt, endPt)) {
+      for (let i = 0; i < allPx.length; i++) {
+        mask[allPx[i]] = saved[i];
+        if (isPathHex) pathOnlyMask[allPx[i]] = savedPath[i];
+      }
     }
   }
 
