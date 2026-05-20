@@ -18,10 +18,12 @@ const CLASSES = ["Flatlands", "Plains", "Woodland", "Hills", "Mountains", "Peaks
 const DEFAULT_WEIGHTS = {
   "Flatlands": 1, "Plains": 1, "Woodland": 2,
   "Hills": 2, "Mountains": 5, "Peaks": 8,
-  // Water hex traversal weights (used directly when sailing water->water):
-  "Lake": 2, "Sea": 3, "Ocean": 4,
+  // Water hex traversal weights (used directly when sailing water->water).
+  // Sailing is faster than overland, so lakes and seas are cheap; ocean
+  // is the slowest water but still cheaper than rough land.
+  "Lake": 0.5, "Sea": 0.5, "Ocean": 1,
   // Embark — land <-> water boundary crossing (loading or unloading a ship).
-  "Embark": 5,
+  "Embark": 3,
 };
 // Road column of the traversal-weight matrix. When the destination hex has the
 // "Road" flag set in the sheet, we use THIS table's value for the terrain
@@ -31,9 +33,9 @@ const DEFAULT_WEIGHTS = {
 const DEFAULT_ROAD_WEIGHTS = {
   "Flatlands": 0.5, "Plains": 0.5, "Woodland": 1,
   "Hills": 1, "Mountains": 2, "Peaks": 4,
-  // Water and embark default to the same value — see comment above.
-  "Lake": 2, "Sea": 3, "Ocean": 4,
-  "Embark": 5,
+  // Water and embark mirror the default column (roads don't help shipping).
+  "Lake": 0.5, "Sea": 0.5, "Ocean": 1,
+  "Embark": 3,
 };
 
 // Hex terrains classified as water. Used to pick which edge weight applies.
@@ -96,6 +98,27 @@ let roadWeights = Object.assign({}, DEFAULT_ROAD_WEIGHTS);
 //                    in a road+river hex follows either the road or the river.
 let ROAD_PIXEL_MASK = null;
 let RIVER_PIXEL_MASK = null;
+// Pre-decoded per-pixel index buffers, populated once at load. They turn the
+// inner routing loop's per-pixel cost from "4 byte reads + bit-ops + a Map
+// lookup" into a single typed-array read.
+//   SUBHEX_ID_PX[fullIdx]  = subhex id at that pixel
+//   HEX_ID_PX[fullIdx]     = its containing hex id (0 if outside any hex)
+// Memory: ~35 MB + ~17 MB respectively for the 4400×2037 board.
+let SUBHEX_ID_PX = null;
+let HEX_ID_PX = null;
+// Pre-computed set of hex ids that contain at least one road pixel. Replaces
+// the per-call hexHasRoadPixels bbox scan with O(1) membership.
+let HEX_HAS_ROAD = null;
+// Per-hex pixel lists in FULL-IMAGE coordinates. Let routeThroughMask skip
+// the per-route bbox scan entirely — we iterate only the pixels that belong
+// to relevant hexes, not the whole bbox (which on a long route can be 5-10×
+// the relevant-pixel area). All three are Map<hex_id, Uint32Array>.
+//   HEX_PIXELS       — every pixel of the hex
+//   HEX_ROAD_PIXELS  — pixels of the hex that are road pixels
+//   HEX_RIVER_PIXELS — pixels of the hex that are river pixels
+let HEX_PIXELS = null;
+let HEX_ROAD_PIXELS = null;
+let HEX_RIVER_PIXELS = null;
 let fromId = null, toId = null;
 // Exact click pixels for From / To. These are what the path line actually
 // starts / ends at — the subhex id is still tracked because it controls cost,
@@ -243,6 +266,8 @@ async function loadAll() {
   const sctx = sc.getContext("2d", { willReadFrequently: true });
   sctx.drawImage(sIm, 0, 0);
   SUBHEX_ID_IMG_DATA = sctx.getImageData(0, 0, sc.width, sc.height);
+  loadingEl.textContent = "Indexing pixels…";
+  precomputeHexIndexes();
   loadingEl.textContent = "Loading map layers…";
   await Promise.all(LAYERS.map(async (l) => {
     try { IMAGES[l.id] = await loadImage(encodeURI(l.file)); }
@@ -252,6 +277,7 @@ async function loadAll() {
     c.width = HEX_DATA.image_width; c.height = HEX_DATA.image_height;
   }
   buildPixelMasks();
+  precomputeHexRoadRiverPixels();
   loadingEl.classList.add("hidden");
 }
 
@@ -287,23 +313,85 @@ function buildPixelMasks() {
   RIVER_PIXEL_MASK = buildBinaryMaskFromLayers(["rivers"]);
 }
 
-// Does any pixel inside hex `hid` count as a road pixel in ROAD_PIXEL_MASK?
-// Used to detect river hexes that have a road bleeding through them even
-// without the spreadsheet Road flag. We scan the subhex bboxes (cheap — a
-// few thousand pixels max per hex) and bail on the first hit.
-function hexHasRoadPixels(hid) {
-  if (!ROAD_PIXEL_MASK || !SUBHEX_ID_IMG_DATA) return false;
-  const W = SUBHEX_ID_IMG_DATA.width;
-  for (const s of (SUBHEXES_BY_HEX.get(hid) || [])) {
-    const [x0, y0, x1, y1] = s.bbox;
-    for (let y = y0; y <= y1; y++) {
-      const off = y * W;
-      for (let x = x0; x <= x1; x++) {
-        if (ROAD_PIXEL_MASK[off + x]) return true;
-      }
+// Pre-decode the RGBA subhex-id image into flat typed arrays, then group
+// pixels by their containing hex. Three things come out of this pass:
+//   SUBHEX_ID_PX[i] = subhex id at pixel i           (Uint32)
+//   HEX_ID_PX[i]    = hex id at pixel i, 0 if none   (Uint16)
+//   HEX_PIXELS[hid] = Uint32Array of pixel indices for hex hid
+// Lets the routing inner loop read pixel→subhex/hex in one typed-array hit
+// AND iterate only the pixels that belong to relevant hexes (skipping the
+// bbox-scan altogether for long routes).
+function precomputeHexIndexes() {
+  if (!SUBHEX_ID_IMG_DATA || !SUBHEX_INDEX) return;
+  const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
+  const N = W * H;
+  const data = SUBHEX_ID_IMG_DATA.data;
+  SUBHEX_ID_PX = new Uint32Array(N);
+  HEX_ID_PX = new Uint16Array(N);
+  // Pass 1: decode subhex/hex ids, count pixels per hex.
+  const maxHex = (HEX_DATA && HEX_DATA.rows)
+    ? (HEX_DATA.rows.length * HEX_DATA.cols_per_row + 1)
+    : 65536;
+  const counts = new Int32Array(maxHex);
+  for (let i = 0, j = 0; i < N; i++, j += 4) {
+    const sid = data[j] | (data[j+1] << 8) | (data[j+2] << 16);
+    SUBHEX_ID_PX[i] = sid;
+    const sub = SUBHEX_INDEX.get(sid);
+    if (sub) {
+      HEX_ID_PX[i] = sub.hex;
+      counts[sub.hex]++;
     }
   }
-  return false;
+  // Pass 2: allocate per-hex pixel arrays, fill them in image-scan order.
+  HEX_PIXELS = new Map();
+  for (let hid = 1; hid < maxHex; hid++) {
+    if (counts[hid] > 0) HEX_PIXELS.set(hid, new Uint32Array(counts[hid]));
+  }
+  const fillIdx = new Int32Array(maxHex);
+  for (let i = 0; i < N; i++) {
+    const hid = HEX_ID_PX[i];
+    if (!hid) continue;
+    HEX_PIXELS.get(hid)[fillIdx[hid]++] = i;
+  }
+}
+
+// Walk each hex's pixel list once and split out the road / river pixels.
+// Also populates HEX_HAS_ROAD as a side effect — it's just "hexes with a
+// non-empty HEX_ROAD_PIXELS entry", so we set both in the same loop.
+function precomputeHexRoadRiverPixels() {
+  HEX_ROAD_PIXELS = new Map();
+  HEX_RIVER_PIXELS = new Map();
+  HEX_HAS_ROAD = new Set();
+  if (!HEX_PIXELS) return;
+  for (const [hid, pixels] of HEX_PIXELS) {
+    let roadCount = 0, riverCount = 0;
+    // Count first, then allocate exactly — avoids growing temporaries.
+    if (ROAD_PIXEL_MASK) {
+      for (let i = 0; i < pixels.length; i++) if (ROAD_PIXEL_MASK[pixels[i]]) roadCount++;
+    }
+    if (RIVER_PIXEL_MASK) {
+      for (let i = 0; i < pixels.length; i++) if (RIVER_PIXEL_MASK[pixels[i]]) riverCount++;
+    }
+    if (roadCount > 0) {
+      const arr = new Uint32Array(roadCount);
+      let k = 0;
+      for (let i = 0; i < pixels.length; i++) if (ROAD_PIXEL_MASK[pixels[i]]) arr[k++] = pixels[i];
+      HEX_ROAD_PIXELS.set(hid, arr);
+      HEX_HAS_ROAD.add(hid);
+    }
+    if (riverCount > 0) {
+      const arr = new Uint32Array(riverCount);
+      let k = 0;
+      for (let i = 0; i < pixels.length; i++) if (RIVER_PIXEL_MASK[pixels[i]]) arr[k++] = pixels[i];
+      HEX_RIVER_PIXELS.set(hid, arr);
+    }
+  }
+}
+
+// O(1) lookup backed by the precomputed HEX_HAS_ROAD set. Returns false if
+// the precompute hasn't run yet (defensive — shouldn't happen post-load).
+function hexHasRoadPixels(hid) {
+  return HEX_HAS_ROAD ? HEX_HAS_ROAD.has(hid) : false;
 }
 
 // =================== Hex math ===================
@@ -573,7 +661,6 @@ function routeThroughMask(subSet) {
   }
   const roadHexList = [...restrictPathHexes, ...adjAnyHexes];
 
-  const data = SUBHEX_ID_IMG_DATA.data;
   const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
   let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
   const grow = (s) => {
@@ -617,29 +704,53 @@ function routeThroughMask(subSet) {
   const hexPxByHex  = new Map();   // hex_id -> all mask indices belonging to the hex
   const roadPxByHex = new Map();   // hex_id -> subset of those that are road pixels
   for (const hid of roadHexList) { hexPxByHex.set(hid, []); roadPxByHex.set(hid, []); }
-  for (let y = 0; y < mh; y++) {
-    const fullY = y + by0;
-    const fullRowOff = fullY * W;
-    for (let x = 0; x < mw; x++) {
-      const fullX = x + bx0;
-      const p = (fullRowOff + fullX) * 4;
-      const sid = data[p] | (data[p+1] << 8) | (data[p+2] << 16);
-      const idx = y * mw + x;
-      if (extSubSet.has(sid)) mask[idx] = 1;
-      const sub = SUBHEX_INDEX.get(sid);
-      if (sub) {
-        const allList = hexPxByHex.get(sub.hex);
-        if (allList) {
-          allList.push(idx);
-          // Build the per-hex "restricted-to" pixel set:
-          //   road pixel  → always counts
-          //   river pixel → only counts for road+river hexes (mergedHexes)
-          //                 so the restriction in those hexes covers road
-          //                 ∪ river, letting A* follow either.
-          const isRoadPx  = ROAD_PIXEL_MASK  && ROAD_PIXEL_MASK[fullRowOff + fullX];
-          const isRiverPx = RIVER_PIXEL_MASK && RIVER_PIXEL_MASK[fullRowOff + fullX];
-          if (isRoadPx || (isRiverPx && mergedHexes.has(sub.hex))) {
-            roadPxByHex.get(sub.hex).push(idx);
+  // Pull typed-array references into locals so the JIT doesn't re-resolve.
+  const subhexPx = SUBHEX_ID_PX;
+  // Iterate ONLY the pixels of the hexes that matter for the route — path
+  // hexes (for mask building from subSet) and adj hexes (whose subhexes
+  // are added to extSubSet). HEX_PIXELS gives the full pixel list per hex
+  // in image-scan order. This replaces a full bbox scan (which on long
+  // routes can be 5-10× the relevant-pixel area).
+  const relevantHexes = new Set(adjAnyHexes);
+  if (pathHexIds) for (const hid of pathHexIds) relevantHexes.add(hid);
+  for (const hid of relevantHexes) {
+    const pixels = HEX_PIXELS ? HEX_PIXELS.get(hid) : null;
+    if (!pixels) continue;
+    const isRoadHex = hexPxByHex.has(hid);
+    const allList   = isRoadHex ? hexPxByHex.get(hid)  : null;
+    for (let pi = 0; pi < pixels.length; pi++) {
+      const fullIdx = pixels[pi];
+      const fullY = (fullIdx / W) | 0;
+      const fullX = fullIdx - fullY * W;
+      if (fullX < bx0 || fullX > bx1 || fullY < by0 || fullY > by1) continue;
+      const idx = (fullY - by0) * mw + (fullX - bx0);
+      if (extSubSet.has(subhexPx[fullIdx])) mask[idx] = 1;
+      if (isRoadHex) allList.push(idx);
+    }
+    // Populate the "restricted-to" set from the precomputed per-hex pixel
+    // lists. Road pixels always count; river pixels only count when the
+    // hex is in mergedHexes (road+river, or river with road pixels through it).
+    if (isRoadHex) {
+      const roadList = roadPxByHex.get(hid);
+      const roadSrc = HEX_ROAD_PIXELS ? HEX_ROAD_PIXELS.get(hid) : null;
+      if (roadSrc) {
+        for (let pi = 0; pi < roadSrc.length; pi++) {
+          const fullIdx = roadSrc[pi];
+          const fullY = (fullIdx / W) | 0;
+          const fullX = fullIdx - fullY * W;
+          if (fullX < bx0 || fullX > bx1 || fullY < by0 || fullY > by1) continue;
+          roadList.push((fullY - by0) * mw + (fullX - bx0));
+        }
+      }
+      if (mergedHexes.has(hid)) {
+        const riverSrc = HEX_RIVER_PIXELS ? HEX_RIVER_PIXELS.get(hid) : null;
+        if (riverSrc) {
+          for (let pi = 0; pi < riverSrc.length; pi++) {
+            const fullIdx = riverSrc[pi];
+            const fullY = (fullIdx / W) | 0;
+            const fullX = fullIdx - fullY * W;
+            if (fullX < bx0 || fullX > bx1 || fullY < by0 || fullY > by1) continue;
+            roadList.push((fullY - by0) * mw + (fullX - bx0));
           }
         }
       }
@@ -712,13 +823,66 @@ function routeThroughMask(subSet) {
   return routeInBinaryMask(mask, mw, mh, bx0, by0, startPt, endPt) || [];
 }
 
-// Cheap contiguity check: snap From and To into the mask and run A*. Returns
-// true iff a route exists. Used by the per-hex XOR acceptance loop.
+// Cheap contiguity check: snap From and To into the mask and run BFS. Returns
+// true iff a route exists. Used by the per-hex restriction acceptance loop —
+// BFS (no heap, no heuristic) is enough for a yes/no reachability question,
+// and the scratch buffers below are reused across calls so we don't pay
+// allocation cost on every restriction.
 function maskHasRoute(mask, mw, mh, bx0, by0, startPt, endPt) {
   const sX = snapToMask(mask, mw, mh, Math.round(startPt.x - bx0), Math.round(startPt.y - by0));
   const eX = snapToMask(mask, mw, mh, Math.round(endPt.x   - bx0), Math.round(endPt.y   - by0));
   if (!sX || !eX) return false;
-  return !!aStarInMask(mask, mw, mh, sX[0], sX[1], eX[0], eX[1]);
+  return maskBfsReachable(mask, mw, mh, sX[0], sX[1], eX[0], eX[1]);
+}
+
+// Reusable scratch buffers for maskBfsReachable. Re-allocated only when the
+// mask grows beyond the previous capacity; cleared via fill() per call.
+let _bfsVisited = null, _bfsQueue = null;
+
+// 8-connected BFS reachability test. Returns true iff (sx, sy) reaches
+// (tx, ty) in `mask`. Diagonals require both orthogonal neighbors to be
+// passable (no corner-cutting), matching aStarInMask's semantics.
+function maskBfsReachable(mask, mw, mh, sx, sy, tx, ty) {
+  if (sx < 0 || sx >= mw || sy < 0 || sy >= mh) return false;
+  if (tx < 0 || tx >= mw || ty < 0 || ty >= mh) return false;
+  const start = sy * mw + sx, goal = ty * mw + tx;
+  if (!mask[start] || !mask[goal]) return false;
+  const N = mw * mh;
+  if (!_bfsVisited || _bfsVisited.length < N) {
+    _bfsVisited = new Uint8Array(N);
+    _bfsQueue   = new Int32Array(N);
+  } else {
+    _bfsVisited.fill(0, 0, N);
+  }
+  const visited = _bfsVisited, queue = _bfsQueue;
+  let qHead = 0, qTail = 0;
+  visited[start] = 1;
+  queue[qTail++] = start;
+  while (qHead < qTail) {
+    const cur = queue[qHead++];
+    if (cur === goal) return true;
+    const cy = (cur / mw) | 0;
+    const cx = cur - cy * mw;
+    for (let dy = -1; dy <= 1; dy++) {
+      const ny = cy + dy;
+      if (ny < 0 || ny >= mh) continue;
+      const nyMw = ny * mw;
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = cx + dx;
+        if (nx < 0 || nx >= mw) continue;
+        const ni = nyMw + nx;
+        if (visited[ni] || !mask[ni]) continue;
+        // No corner-cutting: both orthogonal neighbors must be passable.
+        if (dx !== 0 && dy !== 0) {
+          if (!mask[cy * mw + nx] || !mask[nyMw + cx]) continue;
+        }
+        visited[ni] = 1;
+        queue[qTail++] = ni;
+      }
+    }
+  }
+  return false;
 }
 
 // A* in a binary mask + string-pull smoothing, returning the pixel polyline in
