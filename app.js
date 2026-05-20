@@ -875,48 +875,35 @@ function routeThroughMask(subSet) {
     }
   }
 
-  // Set for O(1) "is this hex on the path?" lookups inside the restriction
-  // loop — drives the choice of contiguity mask: path hexes are checked on
-  // pathOnlyMask (so the restriction can't be rescued by adjacent detours
-  // and a road+river hex whose road/river strip doesn't bridge entry-to-
-  // exit reverts to its full mask); adjacent hexes are checked on the full
-  // mask (so we still catch cases where the adjacent's broadening was the
-  // only thing keeping the full mask connected).
-  const pathHexIdSet = new Set(pathHexIds || []);
-
-  for (const hid of roadHexList) {
-    if (skipHexes.has(hid)) continue;
+  // Restriction is applied in TWO passes so the path-hex acceptance check
+  // sees the actual final-mask state, not a still-broadened version:
+  //   Pass 1 — adjacent hexes: tentatively restrict to road pixels (or kill
+  //            entirely if no road pixels). Check on the full mask, since
+  //            adjacents only existed in the mask via broadening anyway —
+  //            their disappearance can legitimately break the route and we
+  //            need revert-on-fail for that.
+  //   Pass 2 — path hexes that earned road restriction (pathRoadSet ∪
+  //            mergedHexes): tentatively restrict, then check on the full
+  //            mask AFTER Pass 1 has already removed adjacent broadening.
+  //            So the route now has to flow through path hexes and the
+  //            adjacents' road pixels — i.e. the real route network.
+  //            A restriction that would split THAT mask reverts.
+  const restrict = (hid) => {
     const allPx  = hexPxByHex.get(hid)  || [];
     const roadPx = roadPxByHex.get(hid) || [];
-    if (allPx.length === 0) continue;
-    // NOTE: we no longer early-out when roadPx is empty. A neighbor with no
-    // road pixels at all SHOULD become impassable (otherwise its broadened
-    // mask is an open corridor for detours through pure terrain). Revert-on-
-    // fail below still recovers any hex whose absence would actually break
-    // From->To.
-    const isPathHex = pathHexIdSet.has(hid);
-    const saved     = new Uint8Array(allPx.length);
-    const savedPath = isPathHex ? new Uint8Array(allPx.length) : null;
+    if (allPx.length === 0) return;
+    const saved = new Uint8Array(allPx.length);
     for (let i = 0; i < allPx.length; i++) {
       saved[i] = mask[allPx[i]];
       mask[allPx[i]] = 0;
-      if (isPathHex) {
-        savedPath[i] = pathOnlyMask[allPx[i]];
-        pathOnlyMask[allPx[i]] = 0;
-      }
     }
-    for (const i of roadPx) {
-      mask[i] = 1;
-      if (isPathHex) pathOnlyMask[i] = 1;
+    for (const i of roadPx) mask[i] = 1;
+    if (!maskHasRoute(mask, mw, mh, bx0, by0, startPt, endPt)) {
+      for (let i = 0; i < allPx.length; i++) mask[allPx[i]] = saved[i];
     }
-    const checkMask = isPathHex ? pathOnlyMask : mask;
-    if (!maskHasRoute(checkMask, mw, mh, bx0, by0, startPt, endPt)) {
-      for (let i = 0; i < allPx.length; i++) {
-        mask[allPx[i]] = saved[i];
-        if (isPathHex) pathOnlyMask[allPx[i]] = savedPath[i];
-      }
-    }
-  }
+  };
+  for (const hid of adjAnyHexes)       { if (!skipHexes.has(hid)) restrict(hid); }
+  for (const hid of restrictPathHexes) { if (!skipHexes.has(hid)) restrict(hid); }
 
   // Stash the final mask for the debug overlay so the next render can paint
   // exactly what A* saw.
