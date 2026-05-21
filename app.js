@@ -579,9 +579,92 @@ function dijkstraHexPath(srcHex, dstHex) {
   return hexPath;
 }
 
-// Drawing mask for one hex path: for each path hex, include every subhex
-// whose CLASS weight is <= the hex's main-terrain weight. Endpoints are
-// always included so the user's clicked subhexes stay reachable in the mask.
+// Subhex-level Dijkstra. Each subhex is a node; the edge cost between two
+// subhexes is:
+//   * Hex terrain weight, paid ONCE when crossing into a new hex (uses the
+//     destination hex's main terrain — Road column if flagged Road).
+//   * PLUS one Embark, paid whenever the move crosses a naval/non-naval
+//     subhex-class boundary (anywhere, regardless of which hex(es) the
+//     subhexes belong to).
+// Internal same-hex same-class moves cost 0 (movement inside a hex is free).
+// Result: stranded naval subhexes inside a sheet-Land hex become "ferry
+// zones" the router pays Embark to cross — so Dijkstra prefers a longer
+// pure-land path over a short shortcut through water-class subhexes.
+function dijkstraSubhexPath(fromSubId, toSubId) {
+  if (fromSubId == null || toSubId == null) return null;
+  if (fromSubId === toSubId) return [fromSubId];
+  if (!NEIGHBORS) return null;
+  const dist = new Map();
+  const prev = new Map();
+  const heap = new MinHeap();
+  dist.set(fromSubId, 0);
+  heap.push([0, fromSubId]);
+  while (heap.size() > 0) {
+    const [d, u] = heap.pop();
+    if (u === toSubId) break;
+    if (d > (dist.get(u) ?? Infinity)) continue;
+    const uSub = SUBHEX_INDEX.get(u);
+    if (!uSub) continue;
+    const uIsNaval = WATER_TERRAINS.has(uSub.class);
+    const adj = NEIGHBORS.get(u);
+    if (!adj) continue;
+    for (const v of adj) {
+      const vSub = SUBHEX_INDEX.get(v);
+      if (!vSub) continue;
+      const vIsNaval = WATER_TERRAINS.has(vSub.class);
+      let edgeCost = 0;
+      if (uSub.hex !== vSub.hex) {
+        // Crossing into a new hex: pay destination hex's terrain weight.
+        const vTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(vSub.hex) : null;
+        if (!vTerrain) continue;
+        const vHasRoad = HEX_ROAD && HEX_ROAD.get(vSub.hex);
+        const w = +(vHasRoad ? roadWeights : weights)[vTerrain];
+        if (!isFinite(w) || w <= 0) continue;   // impassable / unknown
+        edgeCost += w;
+      }
+      // Naval boundary crossing — pay Embark regardless of which hex we're
+      // in. This is what makes the router avoid sea-shortcuts through
+      // sheet-Land hexes that are mostly water-class subhexes.
+      if (uIsNaval !== vIsNaval) {
+        const e = +weights["Embark"];
+        if (isFinite(e) && e > 0) edgeCost += e;
+      }
+      const nd = d + edgeCost;
+      if (nd < (dist.get(v) ?? Infinity)) {
+        dist.set(v, nd);
+        prev.set(v, u);
+        heap.push([nd, v]);
+      }
+    }
+  }
+  if (!dist.has(toSubId)) return null;
+  const path = [];
+  let cur = toSubId;
+  while (cur != null) {
+    path.push(cur);
+    if (cur === fromSubId) break;
+    cur = prev.get(cur);
+  }
+  path.reverse();
+  return path;
+}
+
+// Drawing mask for one hex path. Includes every subhex whose CLASS weight is
+// <= the hex's main-terrain weight. Naval subhexes (Lake / Sea / Ocean) are
+// kept in the mask EVERYWHERE — including inside Land-sheet hexes that
+// contain stranded water. The line is free to drift across them; the
+// subhex-level embark counter (countSubhexEmbarks) charges the Embark cost
+// for every coastline crossing, so cutting a corner across water is no
+// longer free.
+//
+// Helper still used by routeThroughMask's adjacent-hex broadening to skip
+// road-restriction broadening into stranded naval pixels (those wouldn't be
+// road pixels anyway). Doesn't affect the main mask.
+function isStrandedNavalSubhex(sub) {
+  if (!sub || !WATER_TERRAINS.has(sub.class)) return false;
+  const parentTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(sub.hex) : null;
+  return !parentTerrain || !WATER_TERRAINS.has(parentTerrain);
+}
 function buildSubhexMaskForHexPath(hexPath, fromSubId, toSubId) {
   const subSet = new Set();
   if (fromSubId != null) subSet.add(fromSubId);
@@ -599,6 +682,45 @@ function buildSubhexMaskForHexPath(hexPath, fromSubId, toSubId) {
   return subSet;
 }
 
+// Walk the rendered polyline pixel-by-pixel and count subhex-level transitions
+// between naval-class subhexes (Lake / Sea / Ocean) and non-naval subhexes.
+// Each transition costs one embark/disembark. This is the "naval subhexes are
+// little ferry zones" rule: entry and exit incur Embark cost, but transit
+// inside the naval region is free (same as movement inside any hex is free).
+// Result: a route line that drifts across stranded water inside a Land hex
+// pays for the coast crossings instead of getting them for free.
+function countSubhexEmbarks(linePts) {
+  if (!linePts || linePts.length < 2 || !SUBHEX_ID_PX || !SUBHEX_ID_IMG_DATA) return 0;
+  const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
+  let prevIsWater = null;     // null = no sample yet
+  let crossings = 0;
+  const sample = (x, y) => {
+    if (x < 0 || y < 0 || x >= W || y >= H) return;
+    const sid = SUBHEX_ID_PX[y * W + x];
+    if (!sid) return;
+    const sub = SUBHEX_INDEX.get(sid);
+    if (!sub) return;
+    const w = WATER_TERRAINS.has(sub.class);
+    if (prevIsWater !== null && w !== prevIsWater) crossings++;
+    prevIsWater = w;
+  };
+  for (let i = 0; i < linePts.length - 1; i++) {
+    let x0 = Math.round(linePts[i].x),     y0 = Math.round(linePts[i].y);
+    const x1 = Math.round(linePts[i + 1].x), y1 = Math.round(linePts[i + 1].y);
+    const dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    const dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    let err = dx + dy;
+    while (true) {
+      sample(x0, y0);
+      if (x0 === x1 && y0 === y1) break;
+      const e2 = 2 * err;
+      if (e2 >= dy) { err += dy; x0 += sx; }
+      if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+  }
+  return crossings;
+}
+
 // Compute one segment between adjacent waypoints wa -> wb. Same-hex segments
 // are FREE (no cost, no hex added) — movement inside a hex doesn't accumulate
 // traversal cost in our model, so two waypoints in the same hex just produce
@@ -606,17 +728,33 @@ function buildSubhexMaskForHexPath(hexPath, fromSubId, toSubId) {
 // of interest. Cross-hex segments run Dijkstra and aggregate the same edge
 // cost terms updatePathInfo's old loop used (embark counts and all).
 function computeSegment(wa, wb) {
+  // Same-hex segment. Build the in-hex line up front and count subhex-level
+  // embarks on it — two clicks inside a single hex can still cross a
+  // shoreline if one's on a naval subhex and the other isn't.
   if (wa.hexId === wb.hexId) {
+    const sameSubhex = (wa.subhexId === wb.subhexId);
+    let linePts;
+    if (sameSubhex) {
+      linePts = [{ x: wa.px.x, y: wa.px.y }, { x: wb.px.x, y: wb.px.y }];
+    } else {
+      linePts = routeThroughMask(new Set([wa.subhexId, wb.subhexId]), {
+        fromId: wa.subhexId, toId: wb.subhexId,
+        fromPx: wa.px,       toPx: wb.px,
+        pathHexIds: [wa.hexId],
+        debugSink: {},
+      });
+      if (!linePts || linePts.length === 0) {
+        linePts = [{ x: wa.px.x, y: wa.px.y }, { x: wb.px.x, y: wb.px.y }];
+      }
+    }
+    const embarks = countSubhexEmbarks(linePts);
     return {
       hexIds: [wa.hexId],
       subhexIds: new Set([wa.subhexId, wb.subhexId]),
-      cost: 0, embarks: 0, sameHex: true, reachable: true,
-      // Same subhex: trivial straight line. Different subhex within the same
-      // hex: leave linePts null so computeSegmentLinePoints routes via mask
-      // and the line follows the subhex boundaries instead of cutting through.
-      linePts: (wa.subhexId === wb.subhexId)
-        ? [{ x: wa.px.x, y: wa.px.y }, { x: wb.px.x, y: wb.px.y }]
-        : null,
+      cost: embarks * (+weights["Embark"]),
+      embarks,
+      sameHex: true, reachable: true,
+      linePts,
       debugMask: null,
     };
   }
@@ -626,58 +764,104 @@ function computeSegment(wa, wb) {
     return { hexIds: [], subhexIds: new Set(), cost: 0, embarks: 0,
              sameHex: false, reachable: false, linePts: null, debugMask: null };
   }
-  const hexPath = dijkstraHexPath(fromSub.hex, toSub.hex);
-  if (!hexPath) {
+  // Run the subhex-level Dijkstra so the router itself accounts for naval
+  // boundary crossings (not just the post-hoc tally). This is what makes
+  // it choose the longer pure-land detour over the straight-line sea cut
+  // when the latter would rack up multiple embarks.
+  const subhexPath = dijkstraSubhexPath(wa.subhexId, wb.subhexId);
+  if (!subhexPath) {
     return { hexIds: [], subhexIds: new Set(), cost: 0, embarks: 0,
              sameHex: false, reachable: false, linePts: null, debugMask: null };
   }
-  const subSet = buildSubhexMaskForHexPath(hexPath, wa.subhexId, wb.subhexId);
-  // Per-segment cost + embark count. Same formula as the old pathStats loop.
-  let cost = 0, embarks = 0;
-  for (let i = 1; i < hexPath.length; i++) {
-    const hid = hexPath[i];
-    const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null;
-    if (!terrain) continue;
-    const prevTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(hexPath[i - 1]) : null;
-    const prevIsWater = prevTerrain ? WATER_TERRAINS.has(prevTerrain) : false;
-    const curIsWater  = WATER_TERRAINS.has(terrain);
-    const curHasRoad  = HEX_ROAD && HEX_ROAD.get(hid);
-    let w;
-    if (prevIsWater !== curIsWater) { w = +weights["Embark"]; embarks++; }
-    else                             { w = +(curHasRoad ? roadWeights : weights)[terrain]; }
-    if (isFinite(w)) cost += w;
+  // Derive the hex path (consecutive-dedupe) so the rest of the code keeps
+  // working with the existing hex-level abstractions (mask building, line
+  // rendering, route stats).
+  const hexPath = [];
+  for (const sid of subhexPath) {
+    const sub = SUBHEX_INDEX.get(sid);
+    if (!sub) continue;
+    if (hexPath.length === 0 || hexPath[hexPath.length - 1] !== sub.hex) {
+      hexPath.push(sub.hex);
+    }
   }
-  return { hexIds: hexPath, subhexIds: subSet, cost, embarks,
-           sameHex: false, reachable: true, linePts: null, debugMask: null };
-}
+  // Mask: chosen subhexes plus, for each path hex, every other subhex of the
+  // SAME naval/non-naval class that Dijkstra used in that hex. Gives A* room
+  // to maneuver around the chosen subhexes but keeps it on the same side of
+  // any coastline Dijkstra decided to keep — so the rendered line can't
+  // drift across naval boundaries Dijkstra avoided.
+  const subSet = new Set(subhexPath);
+  if (wa.subhexId != null) subSet.add(wa.subhexId);
+  if (wb.subhexId != null) subSet.add(wb.subhexId);
+  const hexClassUsed = new Map();   // hex_id -> Set<bool> (true = naval class used)
+  for (const sid of subhexPath) {
+    const sub = SUBHEX_INDEX.get(sid);
+    if (!sub) continue;
+    if (!hexClassUsed.has(sub.hex)) hexClassUsed.set(sub.hex, new Set());
+    hexClassUsed.get(sub.hex).add(WATER_TERRAINS.has(sub.class));
+  }
+  for (const [hid, classes] of hexClassUsed) {
+    const subs = SUBHEXES_BY_HEX.get(hid) || [];
+    for (const sub of subs) {
+      if (classes.has(WATER_TERRAINS.has(sub.class))) subSet.add(sub.id);
+    }
+  }
 
-// Lazy line-points builder for one segment. Stored back into the segment so
-// renders don't re-run A*+stringpull every frame. Uses the refactored
-// routeThroughMask with a per-segment ctx so each segment is routed through
-// its own mask + path-hex set, independently of any other segments.
-function computeSegmentLinePoints(segment, wa, wb) {
-  if (segment.linePts) return segment.linePts;
-  if (!segment.reachable) return null;
+  // Build the rendered line EAGERLY via routeThroughMask. Embark count + final
+  // cost both need the actual line now (subhex-level crossings), so deferring
+  // line construction to render time would leave segment.cost stale.
   const debugSink = {};
   const ctx = {
     fromId: wa.subhexId, toId: wb.subhexId,
     fromPx: wa.px,       toPx: wb.px,
-    pathHexIds: segment.hexIds,
+    pathHexIds: hexPath,
     debugSink,
   };
-  let pts = routeThroughMask(segment.subhexIds, ctx);
-  if ((!pts || pts.length === 0) && segment.hexIds.length > 0) {
-    // The filtered mask was non-contiguous from wa->wb — fall back to ALL
-    // subhexes of every path hex so the line still renders.
+  let linePts = routeThroughMask(subSet, ctx);
+  if ((!linePts || linePts.length === 0) && hexPath.length > 0) {
+    // Filtered mask was non-contiguous from wa->wb. Fall back to ALL subhexes
+    // of every path hex (no naval exclusion — the subhex-embark counter
+    // charges for every coastline crossing, so cutting corners is no longer
+    // free at cost-tally time).
     const fallback = new Set([wa.subhexId, wb.subhexId]);
-    for (const hid of segment.hexIds) {
+    for (const hid of hexPath) {
       for (const sub of (SUBHEXES_BY_HEX.get(hid) || [])) fallback.add(sub.id);
     }
-    pts = routeThroughMask(fallback, ctx);
+    linePts = routeThroughMask(fallback, ctx);
   }
-  segment.linePts   = (pts && pts.length > 0) ? pts : null;
-  segment.debugMask = debugSink.mask ? debugSink : null;
-  return segment.linePts;
+
+  // Per-hex terrain cost only. The hex-level embark-on-shore-crossing term is
+  // gone — embarks are now driven entirely by the subhex-level coastline
+  // crossings of the rendered line.
+  let terrainCost = 0;
+  for (let i = 1; i < hexPath.length; i++) {
+    const hid = hexPath[i];
+    const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null;
+    if (!terrain) continue;
+    const curHasRoad = HEX_ROAD && HEX_ROAD.get(hid);
+    const w = +(curHasRoad ? roadWeights : weights)[terrain];
+    if (isFinite(w)) terrainCost += w;
+  }
+
+  const embarks = linePts ? countSubhexEmbarks(linePts) : 0;
+  const embarkCost = embarks * (+weights["Embark"]);
+
+  return {
+    hexIds: hexPath,
+    subhexIds: subSet,
+    cost: terrainCost + embarkCost,
+    embarks,
+    sameHex: false, reachable: true,
+    linePts: (linePts && linePts.length > 0) ? linePts : null,
+    debugMask: debugSink.mask ? debugSink : null,
+  };
+}
+
+// Line points are built eagerly in computeSegment now (we need them up-front
+// to count subhex-level embark crossings into the segment's cost). This
+// wrapper stays as the renderSelection entry point so call sites don't have
+// to change, but it's just a getter.
+function computeSegmentLinePoints(segment, /* wa, wb unused */) {
+  return segment.linePts || null;
 }
 
 // Rebuild every segment of one route (after a waypoint changes, or weights/
@@ -935,24 +1119,15 @@ function routeThroughMask(subSet, ctx) {
   if (pathHexIds && HEX_ROAD) {
     for (const hid of pathHexIds) if (HEX_ROAD.get(hid)) pathRoadSet.add(hid);
   }
-  // mergedHexes = path hexes whose restriction set is roads ∪ rivers. Covers
-  // two cases:
-  //   (a) hex is flagged BOTH road AND river in the sheet, OR
-  //   (b) hex is flagged river AND has any road pixels painted through it
-  //       (even without the Road flag) — caught visually by scanning the hex's
-  //       subhex bboxes against ROAD_PIXEL_MASK. (b) lets us treat river
-  //       crossings that incidentally have a road overlay as road+river even
-  //       when the spreadsheet hasn't been updated.
-  const mergedHexes = new Set();
-  if (HEX_RIVER && RIVER_PIXEL_MASK && pathHexIds) {
-    for (const hid of pathHexIds) {
-      if (!HEX_RIVER.get(hid)) continue;
-      if (pathRoadSet.has(hid) || hexHasRoadPixels(hid)) mergedHexes.add(hid);
-    }
-  }
-  // Hexes that get restricted (road-flagged path hexes + merged hexes that
-  // aren't road-flagged). Adjacents expand from this combined set.
-  const restrictPathHexes = new Set([...pathRoadSet, ...mergedHexes]);
+  // River pixels are intentionally NOT mixed into the road-restricted mask
+  // anymore. A road+river hex (or any river-flagged hex) restricts to ROAD
+  // pixels only — river pixels do not count as a valid pass-through for the
+  // road restriction loop. Effect: routes follow the painted road inside
+  // road+river hexes even when the river offers a wider "channel" the line
+  // could otherwise drift onto.
+  // Hexes that get restricted (road-flagged path hexes only).
+  // Adjacents expand from this set.
+  const restrictPathHexes = new Set(pathRoadSet);
   const adjAnyHexes = new Set();
   for (const hid of restrictPathHexes) {
     for (const nb of hexNeighbors(hid)) {
@@ -997,7 +1172,16 @@ function routeThroughMask(subSet, ctx) {
   const extSubSet = adjAnyHexes.size > 0 ? new Set(subSet) : subSet;
   if (extSubSet !== subSet) {
     for (const hid of adjAnyHexes) {
-      for (const s of (SUBHEXES_BY_HEX.get(hid) || [])) extSubSet.add(s.id);
+      for (const s of (SUBHEXES_BY_HEX.get(hid) || [])) {
+        // Stranded naval subhexes (water-class inside a land hex) stay out of
+        // the mask even when broadening picks up an adjacent hex. Naval
+        // subhexes inside a water-terrain hex are still allowed — broadening
+        // never adds them in practice (adjAnyHexes are neighbors of road
+        // hexes, which are land), but the rule is consistent with the path-
+        // hex pass above so there's only one notion of "passable subhex".
+        if (isStrandedNavalSubhex(s)) continue;
+        extSubSet.add(s.id);
+      }
     }
   }
   const mask = new Uint8Array(mw * mh);
@@ -1037,8 +1221,8 @@ function routeThroughMask(subSet, ctx) {
       if (isRoadHex) allList.push(idx);
     }
     // Populate the "restricted-to" set from the precomputed per-hex pixel
-    // lists. Road pixels always count; river pixels only count when the
-    // hex is in mergedHexes (road+river, or river with road pixels through it).
+    // lists. Road pixels are the ONLY source — river pixels are deliberately
+    // not merged in, so road+river hexes still restrict to the painted road.
     if (isRoadHex) {
       const roadList = roadPxByHex.get(hid);
       const roadSrc = HEX_ROAD_PIXELS ? HEX_ROAD_PIXELS.get(hid) : null;
@@ -1049,18 +1233,6 @@ function routeThroughMask(subSet, ctx) {
           const fullX = fullIdx - fullY * W;
           if (fullX < bx0 || fullX > bx1 || fullY < by0 || fullY > by1) continue;
           roadList.push((fullY - by0) * mw + (fullX - bx0));
-        }
-      }
-      if (mergedHexes.has(hid)) {
-        const riverSrc = HEX_RIVER_PIXELS ? HEX_RIVER_PIXELS.get(hid) : null;
-        if (riverSrc) {
-          for (let pi = 0; pi < riverSrc.length; pi++) {
-            const fullIdx = riverSrc[pi];
-            const fullY = (fullIdx / W) | 0;
-            const fullX = fullIdx - fullY * W;
-            if (fullX < bx0 || fullX > bx1 || fullY < by0 || fullY > by1) continue;
-            roadList.push((fullY - by0) * mw + (fullX - bx0));
-          }
         }
       }
     }
@@ -1084,25 +1256,21 @@ function routeThroughMask(subSet, ctx) {
   //    the click through allowed subhexes to the road's hex-border entry
   //    (the next hex IS restricted, so A* still has to enter it on a road
   //    pixel) — a smooth optimal connection.
-  //  - Path hexes flagged as River BUT NOT Road — restricting to the road
-  //    can produce a weird detour around the ford, and there's no road to
-  //    restrict to anyway. Better to let A* route freely through the full
-  //    hex mask there. Scoped to MAIN-PATH hexes only (pathHexIds), NOT
+  //  - Path hexes flagged as River — skipped from restriction regardless of
+  //    whether the hex is ALSO flagged Road. River-only hexes have no road
+  //    pixels to restrict to anyway (skipping them avoids weird detours
+  //    around the ford); road+river hexes used to merge in river pixels so
+  //    they could be restricted, but that's been removed at the user's
+  //    request — so we just skip those too and let A* route freely through
+  //    the full hex mask. Scoped to MAIN-PATH hexes only (pathHexIds), NOT
   //    adjacent road hexes — those still get restricted even if they're
   //    rivers (off-path "courtesy" additions shouldn't swell open terrain).
-  //  - Road+river path hexes: NOT skipped — we DO restrict them, but the
-  //    restriction set is roads ∪ rivers (see mergedHexes below), so A*
-  //    can follow either the painted road or the river through the hex.
   const skipHexes = new Set();
   if (sStart) skipHexes.add(sStart.hex);
   if (sEnd)   skipHexes.add(sEnd.hex);
   if (HEX_RIVER && pathHexIds) {
     for (const hid of pathHexIds) {
-      // Skip only river path hexes that AREN'T being merged-restricted —
-      // i.e. true river-only hexes with no road pixels at all. Hexes in
-      // mergedHexes (road+river by flag, or river with road pixels) go
-      // through the restriction loop normally.
-      if (HEX_RIVER.get(hid) && !mergedHexes.has(hid)) skipHexes.add(hid);
+      if (HEX_RIVER.get(hid)) skipHexes.add(hid);
     }
   }
 
@@ -1154,8 +1322,8 @@ function routeThroughMask(subSet, ctx) {
   //            adjacents only existed in the mask via broadening anyway —
   //            their disappearance can legitimately break the route and we
   //            need revert-on-fail for that.
-  //   Pass 2 — path hexes that earned road restriction (pathRoadSet ∪
-  //            mergedHexes): tentatively restrict, then check on the full
+  //   Pass 2 — path road hexes (pathRoadSet — river-only and road+river
+  //            hexes are NOT restricted): tentatively restrict, then check on the full
   //            mask AFTER Pass 1 has already removed adjacent broadening.
   //            So the route now has to flow through path hexes and the
   //            adjacents' road pixels — i.e. the real route network.
