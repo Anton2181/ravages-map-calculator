@@ -9,11 +9,20 @@ terrain costs defined in the campaign's shared spreadsheet.
 1. **Hover** anywhere on the map — the tooltip shows the hex ID, its main
    terrain, its current traversal weight, and the specific subhex under the
    cursor.
-2. **Click** a subhex to set the route's **From** point. Click again to set
-   **To**. The optimal road is drawn between the two as a single line that
-   stays inside the terrain it claims to be crossing.
-3. Click again to start a new route. Use **Swap** to flip From and To, or
-   **Clear** (or press *Esc*) to reset.
+2. **Click** a subhex to drop a waypoint on the active route. Each subsequent
+   click appends another waypoint, so a single route can have any number of
+   stops: the optimal road is recomputed end-to-end after every click.
+3. Click **New route** in the sidebar to start a fresh, independent route.
+   Auto-assigned distinct colors keep multiple routes visually separated;
+   click a route's color swatch to cycle through the palette. Click a route's
+   name to make it active again so the next map click extends *that* route.
+4. **Undo** (or *Ctrl+Z*) pops the last waypoint from the active route.
+   Each waypoint chip has an *×* that removes just that point; each route
+   header has an *×* that removes the whole route. **Clear all** (or *Esc*)
+   wipes every route.
+5. Multiple waypoints in the same hex are explicitly supported — movement
+   inside a hex is free, so subsequent in-hex clicks are visible markers
+   along the route line but add no distance or cost.
 
 ### Layers
 The sidebar's **Layers** section toggles each map overlay independently and

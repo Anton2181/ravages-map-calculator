@@ -10,7 +10,7 @@
   <aside id="sidebar">
     <div class="header">
       <h1>Ravages Map Calculator</h1>
-      <div class="sub">Click to set From, click again for To. Path auto-computes.</div>
+      <div class="sub">Click to add waypoints. New route resets the trail.</div>
     </div>
 
     <div class="panel-section">
@@ -23,12 +23,13 @@
     </div>
 
     <div class="panel-section">
-      <h3>Selection</h3>
-      <div id="endpoints"></div>
-      <div class="button-row">
-        <span class="button" id="swap">Swap</span>
-        <span class="button" id="clear-sel">Clear</span>
+      <h3>Routes</h3>
+      <div class="button-row" style="margin-bottom:8px;">
+        <span class="button primary" id="new-route">New route</span>
+        <span class="button" id="undo-waypoint" title="Undo last waypoint (Ctrl+Z)">Undo</span>
+        <span class="button" id="clear-sel">Clear all</span>
       </div>
+      <div id="routes-list"></div>
       <div id="path-info"></div>
     </div>
 

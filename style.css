@@ -167,6 +167,77 @@ canvas {
 .swatch.Lake      { background: #6db7e0; }
 .swatch.Ocean     { background: #2a5b9c; }
 
+/* Routes list ------------------------------------------------------------ */
+#routes-list { display: flex; flex-direction: column; gap: 6px; }
+.empty-routes { color: var(--muted); font-size: 12px; padding: 6px 2px; }
+.route-card {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.route-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.route-header {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12.5px;
+}
+.route-color {
+  width: 12px; height: 12px; border-radius: 3px;
+  border: 1px solid rgba(255,255,255,0.2);
+  cursor: pointer; flex: 0 0 auto;
+}
+.route-name { flex: 1; cursor: pointer; font-weight: 600; user-select: none; }
+.route-name:hover { color: var(--accent); }
+.route-meta { color: var(--muted); font-size: 11px; }
+.route-del, .wp-del {
+  cursor: pointer; color: var(--muted); padding: 0 4px;
+  font-size: 14px; line-height: 1; user-select: none;
+}
+.route-del:hover, .wp-del:hover { color: var(--end); }
+
+.wp-list {
+  margin-top: 6px;
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 180px; overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+.wp-row {
+  display: flex; align-items: center; gap: 6px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+.wp-row:hover { background: rgba(255,255,255,0.04); }
+.wp-idx {
+  flex: 0 0 18px; text-align: right; color: var(--muted);
+  font-size: 10.5px;
+}
+.wp-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.route-stats {
+  margin-top: 6px;
+  background: rgba(0,0,0,0.18); border-radius: 4px;
+  padding: 5px 8px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+}
+.route-stats .row { display: flex; justify-content: space-between; padding: 1px 0; }
+.route-stats .row span:first-child { color: var(--muted); }
+.route-stats .row.reach span:last-child { color: var(--end); }
+
+.path-totals { border: 1px solid var(--border); }
+.path-totals .totals-head span:first-child {
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10.5px;
+}
+
 .editable-val {
   flex: 0 0 56px;
   width: 56px;

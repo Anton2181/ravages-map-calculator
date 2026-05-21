@@ -1,6 +1,5 @@
 "use strict";
-
-// =================== Config ===================
+// =================== Config =====================
 const LAYERS = [
   { id: "sea",         file: "sea.png",                 label: "Sea fill",               on: true,  opacity: 1.00, hidden: true },
   { id: "continent",   file: "Continent Meat.png",      label: "Outline",                on: true,  opacity: 1.00 },
@@ -71,7 +70,7 @@ const hlCanvas    = document.getElementById("hl-canvas");
 const mapCtx      = mapCanvas.getContext("2d");
 const hlCtx       = hlCanvas.getContext("2d");
 const layersEl    = document.getElementById("layers");
-const endpointsEl = document.getElementById("endpoints");
+// (legacy "endpoints" element removed in favor of #routes-list)
 const pathInfoEl  = document.getElementById("path-info");
 const weightsEl   = document.getElementById("weights");
 const colorsEl    = document.getElementById("colors");
@@ -125,15 +124,53 @@ let HEX_RIVER_PIXELS = null;
 // keeps From->To reachable, the exclusion sticks; otherwise the hex's water
 // pixels are restored and the hex is added to skipHexes.
 let LAND_HEX_WATER_PIXELS = null;
+// ---- Multi-route state -----------------------------------------------------
+// ROUTES is an ordered list of route objects. Each map click APPENDS a waypoint
+// to the *active route* (the most recently created or selected one). The
+// "New route" button creates a fresh empty route and makes it active so
+// subsequent clicks land in it instead of extending the previous one.
+//
+// Route shape:
+//   id          — unique number (for sidebar keys / Map keys)
+//   color       — [r,g,b] route line + marker color (auto from palette, editable)
+//   waypoints   — ordered [{ subhexId, hexId, px:{x,y} }]
+//                 Two consecutive waypoints CAN share the same hex; that segment
+//                 is treated as free same-hex movement (no cost, no hex added),
+//                 with the line drawn as a straight segment between the click pts.
+//   segments    — segments[i] = computed path from waypoints[i] -> waypoints[i+1]:
+//                   { hexIds:[..], subhexIds:Set, cost, embarks,
+//                     sameHex:bool, reachable:bool, linePts:[{x,y}..]|null,
+//                     debugMask: { mask, mw, mh, bx0, by0 } | null }
+//   totals      — aggregate route stats:
+//                   { hexes, subhexes, miles, km, cost, embarks,
+//                     byTerrain:{}, strongholds, rivers, roads, reachable }
+let ROUTES = [];
+let ACTIVE_ROUTE_ID = -1;
+let NEXT_ROUTE_ID = 1;
+// Distinct palette for auto-assigning route colors. Indexed by (routes-created
+// count) mod palette length, so the Nth route always gets a predictable color.
+const ROUTE_PALETTE = [
+  [220,  64,  64], // red
+  [ 70, 150, 240], // blue
+  [ 70, 200, 110], // green
+  [240, 175,  40], // orange
+  [200, 110, 230], // violet
+  [ 60, 210, 210], // teal
+  [240, 130, 200], // pink
+  [220, 220,  90], // yellow
+  [170, 120,  70], // brown
+  [120, 200, 240], // sky
+];
+// ---- Legacy aliases --------------------------------------------------------
+// A handful of subsystems (debug mask overlay, drawHexOutlines, etc.) still
+// look at "is there an active path to draw?". These reflect whatever the
+// active route currently contains and are refreshed by syncActiveProjection().
+// They are NOT the source of truth — ROUTES is.
 let fromId = null, toId = null;
-// Exact click pixels for From / To. These are what the path line actually
-// starts / ends at — the subhex id is still tracked because it controls cost,
-// the route mask, and the From/To highlight, but the visual road runs to the
-// pixel the user actually clicked rather than the subhex centroid.
 let fromPx = null, toPx = null;
 let pathIds = null, pathSet = null;
-let pathHexIds = null;          // ordered hex ids on the path
-let pathSubhexIds = null;        // Set of subhex ids included in the drawing mask
+let pathHexIds = null;
+let pathSubhexIds = null;
 let HEX_TERRAIN = null;          // Map<hex_id, terrain_string>
 let HEX_STRONGHOLD = null;       // Map<hex_id, bool>
 let HEX_RIVER = null;            // Map<hex_id, bool>
@@ -491,15 +528,13 @@ function computeIsochrone() {
   isochroneSubhexIds = subSet;
 }
 
-// =================== Pathfinding wrapper ===================
-function recomputePath() {
-  pathIds = null; pathSet = null;
-  pathHexIds = null; pathSubhexIds = null;
-  if (fromId == null || toId == null) return;
-  const fromSub = SUBHEX_INDEX.get(fromId), toSub = SUBHEX_INDEX.get(toId);
-  if (!fromSub || !toSub) return;
-  // Dijkstra on the hex graph using the sheet's terrain per hex.
-  const srcHex = fromSub.hex, dstHex = toSub.hex;
+// =================== Pathfinding (per-segment) ===================
+// One hex-graph Dijkstra, factored out so each route segment between two
+// adjacent waypoints can be computed independently. Returns the ordered
+// hex-id list, or null if dstHex is unreachable from srcHex under the
+// current terrain weights. srcHex === dstHex is treated as a trivial path.
+function dijkstraHexPath(srcHex, dstHex) {
+  if (srcHex === dstHex) return [srcHex];
   const dist = new Map();
   const prev = new Map();
   const heap = new MinHeap();
@@ -532,8 +567,7 @@ function recomputePath() {
       }
     }
   }
-  if (!dist.has(dstHex)) return;
-  // Reconstruct hex path.
+  if (!dist.has(dstHex)) return null;
   const hexPath = [];
   let cur = dstHex;
   while (cur != null) {
@@ -542,11 +576,16 @@ function recomputePath() {
     cur = prev.get(cur);
   }
   hexPath.reverse();
-  pathHexIds = hexPath;
-  // Drawing mask: for each path hex, include every subhex whose CLASS weight
-  // is <= the hex's main-terrain weight. Always include start and end subhexes
-  // so the user's clicked endpoints are visible / reachable.
-  const subSet = new Set([fromId, toId]);
+  return hexPath;
+}
+
+// Drawing mask for one hex path: for each path hex, include every subhex
+// whose CLASS weight is <= the hex's main-terrain weight. Endpoints are
+// always included so the user's clicked subhexes stay reachable in the mask.
+function buildSubhexMaskForHexPath(hexPath, fromSubId, toSubId) {
+  const subSet = new Set();
+  if (fromSubId != null) subSet.add(fromSubId);
+  if (toSubId   != null) subSet.add(toSubId);
   for (const hid of hexPath) {
     const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null;
     const hexW = terrain ? +weights[terrain] : NaN;
@@ -557,10 +596,238 @@ function recomputePath() {
       if (isFinite(sw) && sw <= hexW) subSet.add(sub.id);
     }
   }
-  pathSubhexIds = subSet;
-  pathIds = Array.from(subSet);   // legacy alias
-  pathSet = subSet;
+  return subSet;
 }
+
+// Compute one segment between adjacent waypoints wa -> wb. Same-hex segments
+// are FREE (no cost, no hex added) — movement inside a hex doesn't accumulate
+// traversal cost in our model, so two waypoints in the same hex just produce
+// a visible straight-line marker that the user can use to mark sub-hex points
+// of interest. Cross-hex segments run Dijkstra and aggregate the same edge
+// cost terms updatePathInfo's old loop used (embark counts and all).
+function computeSegment(wa, wb) {
+  if (wa.hexId === wb.hexId) {
+    return {
+      hexIds: [wa.hexId],
+      subhexIds: new Set([wa.subhexId, wb.subhexId]),
+      cost: 0, embarks: 0, sameHex: true, reachable: true,
+      // Same subhex: trivial straight line. Different subhex within the same
+      // hex: leave linePts null so computeSegmentLinePoints routes via mask
+      // and the line follows the subhex boundaries instead of cutting through.
+      linePts: (wa.subhexId === wb.subhexId)
+        ? [{ x: wa.px.x, y: wa.px.y }, { x: wb.px.x, y: wb.px.y }]
+        : null,
+      debugMask: null,
+    };
+  }
+  const fromSub = SUBHEX_INDEX.get(wa.subhexId);
+  const toSub   = SUBHEX_INDEX.get(wb.subhexId);
+  if (!fromSub || !toSub) {
+    return { hexIds: [], subhexIds: new Set(), cost: 0, embarks: 0,
+             sameHex: false, reachable: false, linePts: null, debugMask: null };
+  }
+  const hexPath = dijkstraHexPath(fromSub.hex, toSub.hex);
+  if (!hexPath) {
+    return { hexIds: [], subhexIds: new Set(), cost: 0, embarks: 0,
+             sameHex: false, reachable: false, linePts: null, debugMask: null };
+  }
+  const subSet = buildSubhexMaskForHexPath(hexPath, wa.subhexId, wb.subhexId);
+  // Per-segment cost + embark count. Same formula as the old pathStats loop.
+  let cost = 0, embarks = 0;
+  for (let i = 1; i < hexPath.length; i++) {
+    const hid = hexPath[i];
+    const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null;
+    if (!terrain) continue;
+    const prevTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(hexPath[i - 1]) : null;
+    const prevIsWater = prevTerrain ? WATER_TERRAINS.has(prevTerrain) : false;
+    const curIsWater  = WATER_TERRAINS.has(terrain);
+    const curHasRoad  = HEX_ROAD && HEX_ROAD.get(hid);
+    let w;
+    if (prevIsWater !== curIsWater) { w = +weights["Embark"]; embarks++; }
+    else                             { w = +(curHasRoad ? roadWeights : weights)[terrain]; }
+    if (isFinite(w)) cost += w;
+  }
+  return { hexIds: hexPath, subhexIds: subSet, cost, embarks,
+           sameHex: false, reachable: true, linePts: null, debugMask: null };
+}
+
+// Lazy line-points builder for one segment. Stored back into the segment so
+// renders don't re-run A*+stringpull every frame. Uses the refactored
+// routeThroughMask with a per-segment ctx so each segment is routed through
+// its own mask + path-hex set, independently of any other segments.
+function computeSegmentLinePoints(segment, wa, wb) {
+  if (segment.linePts) return segment.linePts;
+  if (!segment.reachable) return null;
+  const debugSink = {};
+  const ctx = {
+    fromId: wa.subhexId, toId: wb.subhexId,
+    fromPx: wa.px,       toPx: wb.px,
+    pathHexIds: segment.hexIds,
+    debugSink,
+  };
+  let pts = routeThroughMask(segment.subhexIds, ctx);
+  if ((!pts || pts.length === 0) && segment.hexIds.length > 0) {
+    // The filtered mask was non-contiguous from wa->wb — fall back to ALL
+    // subhexes of every path hex so the line still renders.
+    const fallback = new Set([wa.subhexId, wb.subhexId]);
+    for (const hid of segment.hexIds) {
+      for (const sub of (SUBHEXES_BY_HEX.get(hid) || [])) fallback.add(sub.id);
+    }
+    pts = routeThroughMask(fallback, ctx);
+  }
+  segment.linePts   = (pts && pts.length > 0) ? pts : null;
+  segment.debugMask = debugSink.mask ? debugSink : null;
+  return segment.linePts;
+}
+
+// Rebuild every segment of one route (after a waypoint changes, or weights/
+// road flags shift). Line points stay null until the renderer asks for them.
+function rebuildRoute(route) {
+  route.segments = [];
+  for (let i = 1; i < route.waypoints.length; i++) {
+    route.segments.push(computeSegment(route.waypoints[i - 1], route.waypoints[i]));
+  }
+  route.totals = computeRouteTotals(route);
+}
+function rebuildAllRoutes() {
+  for (const r of ROUTES) rebuildRoute(r);
+  syncActiveProjection();
+}
+
+// Aggregate stats for one route. Hex count dedupes consecutive duplicates so
+// the shared-endpoint hex between segments isn't counted twice. Distance is
+// 30 miles per hex transition (hexes - 1), matching the single-segment model.
+function computeRouteTotals(route) {
+  const totals = {
+    hexes: 0, subhexes: 0, miles: 0, km: 0,
+    cost: 0, embarks: 0, byTerrain: {},
+    strongholds: 0, rivers: 0, roads: 0,
+    reachable: route.waypoints.length >= 2,   // 0/1 waypoint = trivially "reachable"
+  };
+  if (route.waypoints.length === 0) { totals.reachable = true; return totals; }
+  const fullHexSeq = [];
+  for (const seg of route.segments) {
+    if (!seg.reachable) totals.reachable = false;
+    for (const hid of seg.hexIds) {
+      if (fullHexSeq.length === 0 || fullHexSeq[fullHexSeq.length - 1] !== hid) {
+        fullHexSeq.push(hid);
+      }
+    }
+    totals.cost    += seg.cost;
+    totals.embarks += seg.embarks;
+  }
+  // Single-waypoint route: just count the waypoint's own hex.
+  if (fullHexSeq.length === 0) fullHexSeq.push(route.waypoints[0].hexId);
+  totals.hexes = fullHexSeq.length;
+  totals.miles = Math.max(0, fullHexSeq.length - 1) * 30;
+  totals.km    = totals.miles * 1.609344;
+  const allSubhexes = new Set();
+  for (const seg of route.segments) for (const sid of seg.subhexIds) allSubhexes.add(sid);
+  totals.subhexes = allSubhexes.size;
+  for (const hid of fullHexSeq) {
+    const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null;
+    if (terrain) totals.byTerrain[terrain] = (totals.byTerrain[terrain] || 0) + 1;
+    if (HEX_STRONGHOLD && HEX_STRONGHOLD.get(hid)) totals.strongholds++;
+    if (HEX_RIVER      && HEX_RIVER.get(hid))      totals.rivers++;
+    if (HEX_ROAD       && HEX_ROAD.get(hid))       totals.roads++;
+  }
+  return totals;
+}
+
+// ---- Route lifecycle -------------------------------------------------------
+function findRoute(id) { return ROUTES.find(r => r.id === id) || null; }
+function getActiveRoute() { return ACTIVE_ROUTE_ID >= 0 ? findRoute(ACTIVE_ROUTE_ID) : null; }
+function newRoute() {
+  const route = {
+    id: NEXT_ROUTE_ID++,
+    color: ROUTE_PALETTE[(ROUTES.length) % ROUTE_PALETTE.length].slice(),
+    waypoints: [], segments: [], totals: null,
+  };
+  ROUTES.push(route);
+  ACTIVE_ROUTE_ID = route.id;
+  rebuildRoute(route);
+  return route;
+}
+function addWaypointToActive(subhexId, px) {
+  let route = getActiveRoute();
+  if (!route) route = newRoute();
+  const sub = SUBHEX_INDEX.get(subhexId);
+  if (!sub) return;
+  route.waypoints.push({ subhexId, hexId: sub.hex, px: { x: px.x, y: px.y } });
+  rebuildRoute(route);
+  syncActiveProjection();
+}
+function removeWaypoint(routeId, idx) {
+  const route = findRoute(routeId);
+  if (!route || idx < 0 || idx >= route.waypoints.length) return;
+  route.waypoints.splice(idx, 1);
+  rebuildRoute(route);
+  syncActiveProjection();
+}
+function popActiveWaypoint() {
+  const route = getActiveRoute();
+  if (!route || route.waypoints.length === 0) return false;
+  route.waypoints.pop();
+  // If this empties the route, drop the empty shell entirely so the sidebar
+  // doesn't accumulate ghost rows. The previous route (if any) becomes active.
+  if (route.waypoints.length === 0) {
+    removeRoute(route.id);
+  } else {
+    rebuildRoute(route);
+    syncActiveProjection();
+  }
+  return true;
+}
+function removeRoute(routeId) {
+  const idx = ROUTES.findIndex(r => r.id === routeId);
+  if (idx < 0) return;
+  ROUTES.splice(idx, 1);
+  if (ACTIVE_ROUTE_ID === routeId) {
+    ACTIVE_ROUTE_ID = ROUTES.length > 0 ? ROUTES[ROUTES.length - 1].id : -1;
+  }
+  syncActiveProjection();
+}
+function setActiveRoute(routeId) {
+  if (findRoute(routeId)) ACTIVE_ROUTE_ID = routeId;
+  syncActiveProjection();
+}
+function clearAllRoutes() {
+  ROUTES = []; ACTIVE_ROUTE_ID = -1;
+  syncActiveProjection();
+}
+
+// Keep the deprecated single-route globals in sync with the active route so
+// the few consumers that still read them (debug mask overlay, route-line draw
+// fallbacks) keep behaving sensibly without each needing its own per-route
+// loop. ROUTES is the source of truth; these are convenience views.
+function syncActiveProjection() {
+  const a = getActiveRoute();
+  if (!a || a.waypoints.length === 0) {
+    fromId = toId = null; fromPx = toPx = null;
+    pathIds = pathSet = null; pathHexIds = pathSubhexIds = null;
+    return;
+  }
+  const first = a.waypoints[0];
+  const last  = a.waypoints[a.waypoints.length - 1];
+  fromId = first.subhexId; fromPx = first.px;
+  toId   = last.subhexId;  toPx   = last.px;
+  const hexSeq = [];
+  const subUnion = new Set();
+  for (const seg of a.segments) {
+    for (const hid of seg.hexIds) {
+      if (hexSeq.length === 0 || hexSeq[hexSeq.length - 1] !== hid) hexSeq.push(hid);
+    }
+    for (const sid of seg.subhexIds) subUnion.add(sid);
+  }
+  pathHexIds   = hexSeq.length   > 0 ? hexSeq   : null;
+  pathSubhexIds = subUnion.size > 0 ? subUnion : null;
+  pathIds = pathSubhexIds ? Array.from(pathSubhexIds) : null;
+  pathSet = pathSubhexIds;
+}
+
+// Backwards-compat thin wrapper: callers in ui.js still invoke recomputePath()
+// after weight edits — that now re-routes EVERY route.
+function recomputePath() { rebuildAllRoutes(); }
 
 // =================== Border midpoint between two adjacent subhexes ===================
 // Scans the bbox intersection (+1 px margin) of the two subhexes for pixels of
@@ -617,23 +884,10 @@ function findBorderMidpoint(idA, idB) {
   return { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
 }
 
-function buildPathLinePoints() {
-  if (!pathSubhexIds || pathSubhexIds.size === 0) return [];
-  // First attempt: route through the user-requested filtered mask.
-  let pts = routeThroughMask(pathSubhexIds);
-  if (pts.length === 0 && pathHexIds && pathHexIds.length > 0) {
-    // Fallback: the filtered mask is non-contiguous from from->to. Include
-    // ALL subhexes of every path hex so the road can still be drawn.
-    const fallback = new Set();
-    if (fromId != null) fallback.add(fromId);
-    if (toId   != null) fallback.add(toId);
-    for (const hid of pathHexIds) {
-      for (const sub of (SUBHEXES_BY_HEX.get(hid) || [])) fallback.add(sub.id);
-    }
-    pts = routeThroughMask(fallback);
-  }
-  return pts;
-}
+// NOTE: the old buildPathLinePoints() / single-segment routing wrapper is
+// gone — segment.linePts is now built per-segment via computeSegmentLinePoints
+// so a multi-waypoint route can stitch independent segment lines together
+// rather than running A* across the whole union mask in one go.
 
 // Build the union mask of the given subhex id set, then A* + string-pull from
 // the From pixel to the To pixel through it. Each Road-flagged hex on the
@@ -643,11 +897,29 @@ function buildPathLinePoints() {
 // A bad/disconnected road hex falls back to its full mask while the other
 // road hexes still snap to the road — so the rendered path follows the
 // painted road wherever the road is contiguous from edge to edge.
-function routeThroughMask(subSet) {
+//
+// ctx (required for multi-segment routes) = {
+//   fromId, toId,           — endpoint subhex ids (cost / mask / highlight)
+//   fromPx, toPx,           — endpoint click pixels (line actually runs to these)
+//   pathHexIds,             — ordered hex ids of THIS segment's path
+//   debugSink (optional)    — { mask, mw, mh, bx0, by0 } target for the debug
+//                             overlay. If omitted, _lastRouteMask is updated.
+// }
+function routeThroughMask(subSet, ctx) {
+  const fromId      = ctx.fromId;
+  const toId        = ctx.toId;
+  const fromPx      = ctx.fromPx;
+  const toPx        = ctx.toPx;
+  const pathHexIds  = ctx.pathHexIds;
+
   const sStart = SUBHEX_INDEX.get(fromId), sEnd = SUBHEX_INDEX.get(toId);
   if (!sStart || !sEnd) return [];
   if (fromId === toId) {
-    const p = fromPx || { x: sStart.centroid[0], y: sStart.centroid[1] };
+    // Same-subhex case: there's no Dijkstra path. If both endpoints have
+    // explicit click pixels, draw a straight in-subhex segment between them
+    // (so two clicks in the same subhex still produce a visible line).
+    if (fromPx && toPx) return [{ x: fromPx.x, y: fromPx.y }, { x: toPx.x, y: toPx.y }];
+    const p = fromPx || toPx || { x: sStart.centroid[0], y: sStart.centroid[1] };
     return [{ x: p.x, y: p.y }];
   }
   // Road hexes on the path, PLUS *every* hex directly adjacent to a path
@@ -905,9 +1177,13 @@ function routeThroughMask(subSet) {
   for (const hid of adjAnyHexes)       { if (!skipHexes.has(hid)) restrict(hid); }
   for (const hid of restrictPathHexes) { if (!skipHexes.has(hid)) restrict(hid); }
 
-  // Stash the final mask for the debug overlay so the next render can paint
-  // exactly what A* saw.
-  _lastRouteMask = { mask, mw, mh, bx0, by0 };
+  // Stash the final mask. Callers that pass a debugSink get it written into
+  // their own slot (used by per-segment route computation so each segment can
+  // remember its mask); callers that don't fall back to the legacy global so
+  // the existing debug overlay path still works.
+  const stash = { mask, mw, mh, bx0, by0 };
+  if (ctx.debugSink) Object.assign(ctx.debugSink, stash);
+  else               _lastRouteMask = stash;
   return routeInBinaryMask(mask, mw, mh, bx0, by0, startPt, endPt) || [];
 }
 
@@ -993,10 +1269,14 @@ function routeInBinaryMask(mask, mw, mh, bx0, by0, startPt, endPt) {
   return cleaned;
 }
 
-function drawPathLine(pts) {
-  pts = pts || buildPathLinePoints();
+// Render one polyline in a given color. Callers pass the route color so each
+// route can be visually distinguished; falls back to the legacy PATH_LINE_COLOR
+// only when no color is supplied (no live caller does, but keeps the contract
+// safe). Same line-width / AA / point-size settings apply to every route.
+function drawPathLine(pts, color) {
   if (!pts || pts.length < 2) return;
-  const rgba = `rgba(${PATH_LINE_COLOR.join(",")},${LINE_ALPHA/255})`;
+  const rgb = color || PATH_LINE_COLOR;
+  const rgba = `rgba(${rgb.join(",")},${LINE_ALPHA/255})`;
   if (LINE_AA) {
     hlCtx.strokeStyle = rgba;
     hlCtx.lineWidth = LINE_WIDTH;
@@ -1113,31 +1393,33 @@ const _isoCtx = _isoCanvas.getContext("2d");
 const _dbgMaskCanvas = document.createElement("canvas");
 const _dbgMaskCtx = _dbgMaskCanvas.getContext("2d");
 
-// Paint the binary mask the routing actually used onto hl-canvas, in
-// translucent magenta. No-op when DEBUG_SHOW_MASK is off, no mask exists,
-// or there is no active route to display — the mask should appear and
-// disappear together with the path line, so it can't outlive the route.
+// Paint the per-segment routing masks onto hl-canvas in translucent magenta.
+// Iterates every segment of every route so a multi-waypoint route shows the
+// composite of all its segment masks; off when DEBUG_SHOW_MASK is false.
 function drawDebugMask() {
-  if (!DEBUG_SHOW_MASK || !_lastRouteMask) return;
-  if (!pathIds || pathIds.length < 2) return;
-  const { mask, mw, mh, bx0, by0 } = _lastRouteMask;
-  if (_dbgMaskCanvas.width !== mw || _dbgMaskCanvas.height !== mh) {
-    _dbgMaskCanvas.width = mw; _dbgMaskCanvas.height = mh;
-  } else {
-    _dbgMaskCtx.clearRect(0, 0, mw, mh);
+  if (!DEBUG_SHOW_MASK) return;
+  for (const route of ROUTES) {
+    for (const seg of route.segments) {
+      if (!seg.debugMask) continue;
+      const { mask, mw, mh, bx0, by0 } = seg.debugMask;
+      if (_dbgMaskCanvas.width !== mw || _dbgMaskCanvas.height !== mh) {
+        _dbgMaskCanvas.width = mw; _dbgMaskCanvas.height = mh;
+      } else {
+        _dbgMaskCtx.clearRect(0, 0, mw, mh);
+      }
+      const img = _dbgMaskCtx.createImageData(mw, mh);
+      for (let i = 0; i < mask.length; i++) {
+        if (!mask[i]) continue;
+        const p = i * 4;
+        img.data[p]     = 255;
+        img.data[p + 1] = 0;
+        img.data[p + 2] = 255;
+        img.data[p + 3] = 115;
+      }
+      _dbgMaskCtx.putImageData(img, 0, 0);
+      hlCtx.drawImage(_dbgMaskCanvas, bx0, by0);
+    }
   }
-  const img = _dbgMaskCtx.createImageData(mw, mh);
-  // Bright magenta @ ~45% alpha — distinct from path/iso/terrain colors.
-  for (let i = 0; i < mask.length; i++) {
-    if (!mask[i]) continue;
-    const p = i * 4;
-    img.data[p]     = 255;
-    img.data[p + 1] = 0;
-    img.data[p + 2] = 255;
-    img.data[p + 3] = 115;
-  }
-  _dbgMaskCtx.putImageData(img, 0, 0);
-  hlCtx.drawImage(_dbgMaskCanvas, bx0, by0);
 }
 
 function fillSubhexSet(subSet, rgb, alpha) {
@@ -1193,54 +1475,54 @@ function fillSubhex(sub, rgb, alpha) {
 }
 
 
-// Hex-graph path statistics for display. Cost = sum of weights[HEX_TERRAIN[h]]
-// over hexes the path enters (excludes the starting hex).
+// Active-route stats (kept for the legacy ui.js status bar). Returns the
+// totals object of the active route, or a zeroed shape when nothing is
+// selected. For multi-route aggregate stats use allRoutesStats().
 function pathStats() {
-  if (!pathHexIds || pathHexIds.length === 0) {
-    return { hexes: 0, subhexes: 0, cost: 0, byTerrain: {}, strongholds: 0, rivers: 0, roads: 0 };
+  const a = getActiveRoute();
+  if (!a || !a.totals) {
+    return { hexes: 0, subhexes: 0, cost: 0, embarks: 0,
+             byTerrain: {}, strongholds: 0, rivers: 0, roads: 0,
+             miles: 0, km: 0 };
   }
-  let cost = 0;
-  const byTerrain = {};
-  let embarks = 0;
-  let strongholds = 0, rivers = 0, roads = 0;
-  for (let i = 0; i < pathHexIds.length; i++) {
-    const hid = pathHexIds[i];
-    const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null;
-    if (terrain) byTerrain[terrain] = (byTerrain[terrain] || 0) + 1;
-    if (HEX_STRONGHOLD && HEX_STRONGHOLD.get(hid)) strongholds++;
-    if (HEX_RIVER      && HEX_RIVER.get(hid))      rivers++;
-    if (HEX_ROAD       && HEX_ROAD.get(hid))       roads++;
-    if (i > 0 && terrain) {
-      const prevTerrain = HEX_TERRAIN ? HEX_TERRAIN.get(pathHexIds[i - 1]) : null;
-      const prevIsWater = prevTerrain ? WATER_TERRAINS.has(prevTerrain) : false;
-      const curIsWater  = WATER_TERRAINS.has(terrain);
-      const curHasRoad  = HEX_ROAD && HEX_ROAD.get(hid);
-      let w;
-      if (prevIsWater !== curIsWater) { w = +weights["Embark"]; embarks++; }
-      else                             { w = +(curHasRoad ? roadWeights : weights)[terrain]; }
-      if (isFinite(w)) cost += w;
-    }
-  }
-  // One hex of movement = 30 miles. Distance is the count of inter-hex
-  // transitions (hexes - 1), since the starting hex is where you begin.
-  const miles = Math.max(0, pathHexIds.length - 1) * 30;
-  const km    = miles * 1.609344;
-  return {
-    hexes: pathHexIds.length,
-    subhexes: pathSubhexIds ? pathSubhexIds.size : 0,
-    cost, byTerrain, embarks,
-    strongholds, rivers, roads,
-    miles, km,
-  };
+  return a.totals;
 }
-function drawHexOutlines() {
-  if (!SHOW_HEX_OUTLINE || !pathIds || pathIds.length === 0) return;
-  if (!pathHexIds || pathHexIds.length === 0) return;
-  const hexIds = new Set(pathHexIds);
+
+// Aggregate totals across every route in ROUTES. Hex count sums the per-route
+// hex counts (so routes that share a hex DO count it twice — they're separate
+// trips). Used by the sidebar's grand-total row.
+function allRoutesStats() {
+  const out = { routes: ROUTES.length, hexes: 0, miles: 0, km: 0,
+                cost: 0, embarks: 0, waypoints: 0,
+                strongholds: 0, rivers: 0, roads: 0 };
+  for (const r of ROUTES) {
+    const t = r.totals;
+    if (!t) continue;
+    out.hexes       += t.hexes;
+    out.miles       += t.miles;
+    out.km          += t.km;
+    out.cost        += t.cost;
+    out.embarks     += t.embarks;
+    out.waypoints   += r.waypoints.length;
+    out.strongholds += t.strongholds;
+    out.rivers      += t.rivers;
+    out.roads       += t.roads;
+  }
+  return out;
+}
+// Draw the perimeter outline for a set of hex ids. hexIdSet is required
+// (callers pass per-route hex sets). Color defaults to HEX_OUTLINE_COLOR
+// when not supplied, so the legacy global-outline setting still applies if
+// a caller wants the same color for everything.
+function drawHexOutlines(hexIdSet, color) {
+  if (!SHOW_HEX_OUTLINE) return;
+  if (!hexIdSet || hexIdSet.size === 0) return;
+  const hexIds = hexIdSet;
   const g = HEX_DATA.geometry;
   const s = g.hex_size, hw = g.hex_width / 2;
   const cpr = HEX_DATA.cols_per_row;
-  const rgba = `rgba(${HEX_OUTLINE_COLOR.join(",")},${HEX_OUTLINE_ALPHA/255})`;
+  const rgb = color || HEX_OUTLINE_COLOR;
+  const rgba = `rgba(${rgb.join(",")},${HEX_OUTLINE_ALPHA/255})`;
   const thick = Math.max(1, Math.round(HEX_OUTLINE_WIDTH));
   const half  = Math.floor(thick / 2);
   if (HEX_OUTLINE_AA) {
@@ -1325,24 +1607,87 @@ function renderSelection() {
   // commanderies and rivers in the layer stack), drawn by renderLayers via
   // drawIsoOnMap. Any code path that mutates iso state must call renderLayers
   // after renderSelection so the map-canvas overlay is kept in sync.
-  if (pathIds && pathIds.length > 0) {
-    for (const sid of pathIds) {
-      if (sid === fromId || sid === toId) continue;
-      fillSubhex(SUBHEX_INDEX.get(sid), PATH_COLOR, PATH_ALPHA);
+  //
+  // Multi-route rendering pass:
+  //   1. Path-mask fills (PATH_COLOR/ALPHA) for every route, with each route's
+  //      first/last waypoint subhex separated out so the START/END fills can
+  //      override them. (PATH_ALPHA defaults to 0 so this is a no-op unless
+  //      the Settings panel has been opened and the alpha bumped up.)
+  //   2. Per-segment line points (built lazily here so segment.debugMask is
+  //      populated before drawDebugMask reads it).
+  //   3. Hex outlines per route — opt-in via the Path-line panel; uses the
+  //      global outline color since the route line already carries identity.
+  //   4. Waypoint dots in the route's own color at every click point, so two
+  //      waypoints in the same hex still appear as distinct visible points
+  //      along the line and the user can edit them individually.
+  //   5. Debug mask overlay LAST so magenta sits on top of everything else.
+
+  if (PATH_ALPHA > 0) {
+    const allSubhexes = new Set();
+    const endpointSubhexes = new Set();
+    for (const route of ROUTES) {
+      if (route.waypoints.length > 0) {
+        endpointSubhexes.add(route.waypoints[0].subhexId);
+        endpointSubhexes.add(route.waypoints[route.waypoints.length - 1].subhexId);
+      }
+      for (const seg of route.segments) {
+        for (const sid of seg.subhexIds) allSubhexes.add(sid);
+      }
+    }
+    for (const sid of endpointSubhexes) allSubhexes.delete(sid);
+    if (allSubhexes.size > 0) fillSubhexSet(allSubhexes, PATH_COLOR, PATH_ALPHA);
+  }
+
+  for (const route of ROUTES) {
+    if (route.waypoints.length === 0) continue;
+    const first = route.waypoints[0];
+    const last  = route.waypoints[route.waypoints.length - 1];
+    if (START_ALPHA > 0) fillSubhex(SUBHEX_INDEX.get(first.subhexId), START_COLOR, START_ALPHA);
+    if (END_ALPHA   > 0 && last.subhexId !== first.subhexId)
+                          fillSubhex(SUBHEX_INDEX.get(last.subhexId),  END_COLOR,   END_ALPHA);
+    for (let i = 0; i < route.segments.length; i++) {
+      const seg = route.segments[i];
+      const wa  = route.waypoints[i];
+      const wb  = route.waypoints[i + 1];
+      const pts = computeSegmentLinePoints(seg, wa, wb);
+      if (pts && pts.length >= 2) drawPathLine(pts, route.color);
     }
   }
-  if (fromId != null) fillSubhex(SUBHEX_INDEX.get(fromId), START_COLOR, START_ALPHA);
-  if (toId   != null) fillSubhex(SUBHEX_INDEX.get(toId),   END_COLOR,   END_ALPHA);
-  // Build the line points first so _lastRouteMask is refreshed before the
-  // debug overlay reads it; without that we'd paint the mask from the
-  // previous render and the route line from the current one.
-  const linePts = (pathIds && pathIds.length > 1) ? buildPathLinePoints() : null;
-  if (linePts) drawPathLine(linePts);
-  drawHexOutlines();
-  // Debug overlay goes LAST so the magenta sits on top of everything else
-  // on hl-canvas (path line + hex outlines) and you can see exactly what
-  // pixels A* could traverse for the route currently displayed.
+
+  if (SHOW_HEX_OUTLINE) {
+    for (const route of ROUTES) {
+      const hexSet = new Set();
+      for (const seg of route.segments) for (const hid of seg.hexIds) hexSet.add(hid);
+      if (hexSet.size > 0) drawHexOutlines(hexSet, HEX_OUTLINE_COLOR);
+    }
+  }
+
+  for (const route of ROUTES) drawWaypointMarkers(route);
+
   drawDebugMask();
+}
+
+// Filled circle at every waypoint of the route, with an outline so the marker
+// reads against the route's own line color. First and last waypoints are
+// slightly larger; the active route's waypoints get a white outline so it's
+// obvious which route the next click will extend.
+function drawWaypointMarkers(route) {
+  if (route.waypoints.length === 0) return;
+  const rgba = `rgba(${route.color.join(",")},1)`;
+  const isActive = route.id === ACTIVE_ROUTE_ID;
+  const base = Math.max(3, Math.round(LINE_WIDTH) + 2);
+  hlCtx.lineWidth = 1.5;
+  for (let i = 0; i < route.waypoints.length; i++) {
+    const wp = route.waypoints[i];
+    const isEnd = (i === 0 || i === route.waypoints.length - 1);
+    const r = isEnd ? base + 1.5 : base;
+    hlCtx.beginPath();
+    hlCtx.fillStyle = rgba;
+    hlCtx.strokeStyle = isActive ? "rgba(255,255,255,0.9)" : "rgba(0,0,0,0.7)";
+    hlCtx.arc(wp.px.x, wp.px.y, r, 0, Math.PI * 2);
+    hlCtx.fill();
+    hlCtx.stroke();
+  }
 }
 
 // =================== Pan/Zoom ===================
@@ -1453,23 +1798,15 @@ function handleClick(e) {
     renderLayers(); renderSelection(); updateStatus();
     return;
   }
-  const clickPx = { x: ipt.x, y: ipt.y };
-  if (fromId == null) {
-    fromId = sid; fromPx = clickPx;
-    toId = null;  toPx   = null;
-    pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
-  } else if (toId == null && sid !== fromId) {
-    toId = sid; toPx = clickPx;
-    recomputePath();
-  } else {
-    fromId = sid; fromPx = clickPx;
-    toId = null;  toPx   = null;
-    pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
-  }
+  // Multi-route click: every click appends a waypoint to the active route.
+  // The active route is created on demand for the first click (and by the
+  // "New route" sidebar button thereafter). Multiple in-hex clicks are
+  // allowed by design — segments inside a single hex are free movement.
+  addWaypointToActive(sid, { x: ipt.x, y: ipt.y });
   renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
 }
 
-// =================== Init ===================
+// =================== Init ====================================================
 (async () => {
   buildLayerControls();
   buildWeightControls();
@@ -1486,217 +1823,3 @@ function handleClick(e) {
   renderLayers();
   resetView();
 })();
-
-// === GARBAGE BELOW — DEAD CODE, IGNORE ===
-/*
-    // Neighbor (row, col) per edge index. Edge i = verts[i] -> verts[(i+1)%6].
-    // Edge 0 = NE, 1 = E, 2 = SE, 3 = SW, 4 = W, 5 = NW. Offset row offsets RIGHT.
-    let nbrs;
-    if (row % 2 === 0) {
-      nbrs = [
-        [row - 1, col    ], // NE
-        [row,     col + 1], // E
-        [row + 1, col    ], // SE
-        [row + 1, col - 1], // SW
-        [row,     col - 1], // W
-        [row - 1, col - 1], // NW
-      ];
-    } else {
-      nbrs = [
-        [row - 1, col + 1], // NE
-        [row,     col + 1], // E
-        [row + 1, col + 1], // SE
-        [row + 1, col    ], // SW
-        [row,     col - 1], // W
-        [row - 1, col    ], // NW
-      ];
-    }
-    if (HEX_OUTLINE_AA) {
-      hlCtx.beginPath();
-      for (let i = 0; i < 6; i++) {
-        const [nr, nc] = nbrs[i];
-        if (hasHex(nr, nc)) continue;          // internal border — skip
-        const a = verts[i], b = verts[(i + 1) % 6];
-        hlCtx.moveTo(a[0], a[1]);
-        hlCtx.lineTo(b[0], b[1]);
-      }
-      hlCtx.stroke();
-    } else {
-      for (let i = 0; i < 6; i++) {
-        const [nr, nc] = nbrs[i];
-        if (hasHex(nr, nc)) continue;
-        const a = verts[i], b = verts[(i + 1) % 6];
-        drawLineBresenham(a[0], a[1], b[0], b[1], thick, half);
-      }
-    }
-  }
-}
-
-function renderSelection() {
-  hlCtx.clearRect(0, 0, hlCanvas.width, hlCanvas.height);
-  // NOTE: the reachability fill now lives on map-canvas (sandwiched between
-  // commanderies and rivers in the layer stack), drawn by renderLayers via
-  // drawIsoOnMap. Any code path that mutates iso state must call renderLayers
-  // after renderSelection so the map-canvas overlay is kept in sync.
-  if (pathIds && pathIds.length > 0) {
-    for (const sid of pathIds) {
-      if (sid === fromId || sid === toId) continue;
-      fillSubhex(SUBHEX_INDEX.get(sid), PATH_COLOR, PATH_ALPHA);
-    }
-  }
-  if (fromId != null) fillSubhex(SUBHEX_INDEX.get(fromId), START_COLOR, START_ALPHA);
-  if (toId   != null) fillSubhex(SUBHEX_INDEX.get(toId),   END_COLOR,   END_ALPHA);
-  // Build the line points first so _lastRouteMask is refreshed before the
-  // debug overlay reads it; without that we'd paint the mask from the
-  // previous render and the route line from the current one.
-  const linePts = (pathIds && pathIds.length > 1) ? buildPathLinePoints() : null;
-  if (linePts) drawPathLine(linePts);
-  drawHexOutlines();
-  // Debug overlay goes LAST so the magenta sits on top of everything else
-  // on hl-canvas (path line + hex outlines) and you can see exactly what
-  // pixels A* could traverse for the route currently displayed.
-  drawDebugMask();
-}
-
-// =================== Pan/Zoom ===================
-function applyView() {
-  const t = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
-  mapCanvas.style.transform = t;
-  hlCanvas.style.transform = t;
-  updateStatus();
-}
-function resetView() {
-  const r = stage.getBoundingClientRect();
-  const sx = r.width / HEX_DATA.image_width;
-  const sy = r.height / HEX_DATA.image_height;
-  view.scale = Math.min(sx, sy);
-  view.x = (r.width - HEX_DATA.image_width * view.scale) / 2;
-  view.y = (r.height - HEX_DATA.image_height * view.scale) / 2;
-  applyView();
-}
-function zoomAt(clientX, clientY, factor) {
-  const r = stage.getBoundingClientRect();
-  const lx = clientX - r.left, ly = clientY - r.top;
-  const ix = (lx - view.x) / view.scale;
-  const iy = (ly - view.y) / view.scale;
-  view.scale = Math.max(0.05, Math.min(8, view.scale * factor));
-  view.x = lx - ix * view.scale;
-  view.y = ly - iy * view.scale;
-  applyView();
-}
-function stageToImage(clientX, clientY) {
-  const r = stage.getBoundingClientRect();
-  const ix = (clientX - r.left - view.x) / view.scale;
-  const iy = (clientY - r.top  - view.y) / view.scale;
-  if (ix < 0 || iy < 0 || ix >= HEX_DATA.image_width || iy >= HEX_DATA.image_height) return null;
-  return { x: ix, y: iy };
-}
-function lookupSubhex(px, py) {
-  if (!SUBHEX_ID_IMG_DATA) return 0;
-  const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
-  if (px < 0 || py < 0 || px >= W || py >= H) return 0;
-  const i = (py * W + px) * 4;
-  const d = SUBHEX_ID_IMG_DATA.data;
-  return d[i] | (d[i+1] << 8) | (d[i+2] << 16);
-}
-
-// =================== Interaction ===================
-let panning = false, panStart = null, mouseDownPos = null;
-stage.addEventListener("mousedown", (e) => {
-  if (e.button !== 0) return;
-  panning = true;
-  panStart = { x: e.clientX - view.x, y: e.clientY - view.y };
-  mouseDownPos = { x: e.clientX, y: e.clientY };
-  stage.classList.add("panning");
-});
-window.addEventListener("mousemove", (e) => {
-  if (panning) {
-    view.x = e.clientX - panStart.x;
-    view.y = e.clientY - panStart.y;
-    applyView();
-  }
-});
-window.addEventListener("mouseup", (e) => {
-  if (!panning) return;
-  panning = false;
-  stage.classList.remove("panning");
-  const moved = Math.hypot(e.clientX - mouseDownPos.x, e.clientY - mouseDownPos.y);
-  if (moved < 4) handleClick(e);
-});
-stage.addEventListener("mousemove", (e) => {
-  const ipt = stageToImage(e.clientX, e.clientY);
-  if (ipt) {
-    const hx = pointToHex(ipt.x, ipt.y);
-    if (hx) {
-      const sid = lookupSubhex(ipt.x | 0, ipt.y | 0);
-      const sname = sid ? SUBHEX_INDEX.get(sid)?.name : null;
-      const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hx.id) : null;
-      const tw = (terrain && weights[terrain] != null) ? +weights[terrain] : null;
-      const terrainStr = terrain ? `  ·  ${terrain}${isFinite(tw) ? ` (w ${tw})` : ""}` : "";
-      // Per-hex yes/no flags from the spreadsheet.
-      const flags = [];
-      if (HEX_ROAD && HEX_ROAD.get(hx.id)) flags.push("Road");
-      if (HEX_RIVER && HEX_RIVER.get(hx.id)) flags.push("River");
-      if (HEX_STRONGHOLD && HEX_STRONGHOLD.get(hx.id)) flags.push("Stronghold");
-      const flagsStr = flags.length ? `  ·  ${flags.join(", ")}` : "";
-      tooltipEl.textContent = `${pad4(hx.id)}${terrainStr}${flagsStr}${sname ? `  ·  ${sname}` : ""}`;
-      const r = stage.getBoundingClientRect();
-      tooltipEl.style.left = (e.clientX - r.left) + "px";
-      tooltipEl.style.top  = (e.clientY - r.top)  + "px";
-      tooltipEl.classList.remove("hidden");
-      return;
-    }
-  }
-  tooltipEl.classList.add("hidden");
-});
-stage.addEventListener("mouseleave", () => tooltipEl.classList.add("hidden"));
-stage.addEventListener("wheel", (e) => {
-  e.preventDefault();
-  zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
-}, { passive: false });
-
-function handleClick(e) {
-  const ipt = stageToImage(e.clientX, e.clientY);
-  if (!ipt) return;
-  const sid = lookupSubhex(ipt.x | 0, ipt.y | 0);
-  if (!sid) return;
-  if (ISOCHRONE_MODE) {
-    isochroneSourceId = sid;
-    computeIsochrone();
-    renderLayers(); renderSelection(); updateStatus();
-    return;
-  }
-  const clickPx = { x: ipt.x, y: ipt.y };
-  if (fromId == null) {
-    fromId = sid; fromPx = clickPx;
-    toId = null;  toPx   = null;
-    pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
-  } else if (toId == null && sid !== fromId) {
-    toId = sid; toPx = clickPx;
-    recomputePath();
-  } else {
-    fromId = sid; fromPx = clickPx;
-    toId = null;  toPx   = null;
-    pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null;
-  }
-  renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
-}
-
-// =================== Init ===================
-(async () => {
-  buildLayerControls();
-  buildWeightControls();
-  buildColorControls();
-  buildLineControls();
-  buildIsochroneControls();
-  updateEndpoints();
-  try { await loadAll(); }
-  catch (e) {
-    loadingEl.textContent = "Failed to load: " + (e?.message || e);
-    console.error(e);
-    return;
-  }
-  renderLayers();
-  resetView();
-})();
-*/

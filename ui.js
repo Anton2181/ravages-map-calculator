@@ -1,8 +1,9 @@
 "use strict";
 
-// Sidebar UI: layer toggles, weight inputs, endpoint badges, path stats.
-// All functions read globals from app.js (LAYERS, CLASSES, weights, fromId,
-// toId, pathIds, etc.) and call back into rendering/pathfinding.
+// Sidebar UI: layer toggles, weight inputs, multi-route list (waypoint badges,
+// per-route stats, totals). Reads globals from app.js (LAYERS, CLASSES,
+// weights, ROUTES, ACTIVE_ROUTE_ID, ...) and calls back into rendering /
+// route lifecycle (newRoute, addWaypointToActive, removeWaypoint, ...).
 
 function pad4(n) { return String(n).padStart(4, "0"); }
 function escapeHtml(s) {
@@ -92,8 +93,8 @@ function buildWeightControls() {
       + `<input type="number" min="0" step="0.5" value="${roadWeights[cls]}" data-col="road" />`;
     const inputs = row.querySelectorAll("input");
     const reroute = () => {
-      if (fromId != null && toId != null) {
-        recomputePath(); renderSelection(); updatePathInfo(); updateStatus();
+      if (ROUTES.length > 0) {
+        recomputePath(); renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
       }
       if (ISOCHRONE_MODE && isochroneSourceId != null) {
         computeIsochrone(); renderLayers(); renderSelection(); updateStatus();
@@ -115,64 +116,130 @@ function buildWeightControls() {
   }
 }
 
-function updateEndpoints() {
-  const fromS = fromId ? SUBHEX_INDEX.get(fromId) : null;
-  const toS   = toId   ? SUBHEX_INDEX.get(toId)   : null;
-  const fromHtml = fromS
-    ? `<span class="swatch ${fromS.class}"></span>${escapeHtml(fromS.name)}`
-    : "—";
-  const toHtml = toS
-    ? `<span class="swatch ${toS.class}"></span>${escapeHtml(toS.name)}`
-    : "—";
-  endpointsEl.innerHTML =
-      `<div class="endpoint from ${fromS ? "" : "empty"}">`
-    +   `<span class="label">From</span><span class="name">${fromHtml}</span>`
-    + `</div>`
-    + `<div class="endpoint to ${toS ? "" : "empty"}">`
-    +   `<span class="label">To</span><span class="name">${toHtml}</span>`
-    + `</div>`;
+// Render the routes-list (per-route header + waypoint chips + per-route stats).
+// Click on the route header to make it active (next map click extends it).
+// Each waypoint chip has an "x" to delete just that waypoint; each route
+// header has an "x" to delete the whole route.
+const routesListEl = document.getElementById("routes-list");
+function rgbCss(c) { return `rgb(${c[0]},${c[1]},${c[2]})`; }
+function fmtMiKm(miles, km) {
+  return `${Math.round(miles).toLocaleString()} mi / ${Math.round(km).toLocaleString()} km`;
 }
-
-function updatePathInfo() {
-  if (!pathHexIds || pathHexIds.length === 0) {
-    pathInfoEl.innerHTML = (fromId && toId)
-      ? `<div class="path-stats"><div class="row"><span>Path</span><span>unreachable</span></div></div>`
-      : "";
+function updateEndpoints() {
+  if (!routesListEl) return;
+  if (ROUTES.length === 0) {
+    routesListEl.innerHTML = `<div class="empty-routes">No routes yet. Click the map to drop a waypoint.</div>`;
     return;
   }
-  const st = pathStats();
-  let html = `<div class="path-stats">`
-    + `<div class="row"><span>Hexes</span><span>${st.hexes}</span></div>`
-    + `<div class="row"><span>Distance</span><span>${st.miles.toLocaleString()} mi / ${st.km.toLocaleString(undefined, { maximumFractionDigits: 0 })} km</span></div>`
-    + `<div class="row"><span>Subhexes in mask</span><span>${st.subhexes}</span></div>`
-    + `<div class="row"><span>Cost</span><span>${st.cost.toFixed(1)}</span></div>`
-    + (st.embarks     ? `<div class="row"><span>Embarks</span><span>${st.embarks}</span></div>`         : "")
-    + (st.roads       ? `<div class="row"><span>Road hexes</span><span>${st.roads}</span></div>`         : "")
-    + (st.rivers      ? `<div class="row"><span>River hexes</span><span>${st.rivers}</span></div>`       : "")
-    + (st.strongholds ? `<div class="row"><span>Strongholds</span><span>${st.strongholds}</span></div>` : "");
-  const terrains = Object.keys(st.byTerrain).sort();
-  for (const t of terrains) {
-    html += `<div class="row"><span>${escapeHtml(t)}</span><span>${st.byTerrain[t]}</span></div>`;
-  }
-  html += `</div>`;
-  pathInfoEl.innerHTML = html;
+  const frag = document.createDocumentFragment();
+  ROUTES.forEach((route, rIdx) => {
+    const card = document.createElement("div");
+    card.className = "route-card" + (route.id === ACTIVE_ROUTE_ID ? " active" : "");
+    card.style.borderLeftColor = rgbCss(route.color);
+
+    // Header: swatch, label, "make active" click target, delete button.
+    const header = document.createElement("div");
+    header.className = "route-header";
+    header.innerHTML =
+        `<span class="route-color" style="background:${rgbCss(route.color)}"></span>`
+      + `<span class="route-name">Route ${rIdx + 1}</span>`
+      + `<span class="route-meta">${route.waypoints.length} pt${route.waypoints.length===1?"":"s"}</span>`
+      + `<span class="route-del" title="Delete route">×</span>`;
+    header.querySelector(".route-name").addEventListener("click", () => {
+      setActiveRoute(route.id);
+      updateEndpoints(); updatePathInfo(); updateStatus(); renderSelection();
+    });
+    header.querySelector(".route-color").addEventListener("click", () => {
+      // Quick color reroll: cycle to the next palette slot. Keeps editing
+      // light-touch — full color picker can be added later if needed.
+      const cur = ROUTE_PALETTE.findIndex(c => c[0]===route.color[0] && c[1]===route.color[1] && c[2]===route.color[2]);
+      const next = ROUTE_PALETTE[(cur + 1 + ROUTE_PALETTE.length) % ROUTE_PALETTE.length];
+      route.color = next.slice();
+      updateEndpoints(); renderSelection();
+    });
+    header.querySelector(".route-del").addEventListener("click", (e) => {
+      e.stopPropagation();
+      removeRoute(route.id);
+      updateEndpoints(); updatePathInfo(); updateStatus(); renderSelection();
+    });
+    card.appendChild(header);
+
+    // Waypoint list
+    if (route.waypoints.length > 0) {
+      const wpList = document.createElement("div");
+      wpList.className = "wp-list";
+      route.waypoints.forEach((wp, i) => {
+        const sub = SUBHEX_INDEX.get(wp.subhexId);
+        const wpRow = document.createElement("div");
+        wpRow.className = "wp-row";
+        const label = sub ? `${i+1}. ${escapeHtml(sub.name)}` : `${i+1}. (unknown)`;
+        wpRow.innerHTML =
+            `<span class="wp-idx">${i + 1}</span>`
+          + (sub ? `<span class="swatch ${sub.class}"></span>` : `<span class="swatch"></span>`)
+          + `<span class="wp-name">${sub ? escapeHtml(sub.name) : "(unknown)"}</span>`
+          + `<span class="wp-del" title="Remove this waypoint">×</span>`;
+        wpRow.querySelector(".wp-del").addEventListener("click", () => {
+          removeWaypoint(route.id, i);
+          updateEndpoints(); updatePathInfo(); updateStatus(); renderSelection();
+        });
+        wpList.appendChild(wpRow);
+      });
+      card.appendChild(wpList);
+    }
+
+    // Per-route stats (only meaningful with >=1 waypoint).
+    if (route.totals && route.waypoints.length > 0) {
+      const t = route.totals;
+      const stats = document.createElement("div");
+      stats.className = "route-stats";
+      const dist = fmtMiKm(t.miles, t.km);
+      let h = `<div class="row"><span>Hexes</span><span>${t.hexes}</span></div>`
+            + `<div class="row"><span>Distance</span><span>${dist}</span></div>`
+            + `<div class="row"><span>Cost</span><span>${t.cost.toFixed(1)}</span></div>`;
+      if (t.embarks)     h += `<div class="row"><span>Embarks</span><span>${t.embarks}</span></div>`;
+      if (!t.reachable)  h += `<div class="row reach"><span>Path</span><span>unreachable</span></div>`;
+      stats.innerHTML = h;
+      card.appendChild(stats);
+    }
+    frag.appendChild(card);
+  });
+  routesListEl.innerHTML = "";
+  routesListEl.appendChild(frag);
+}
+
+// Grand-total panel under the route list (only shown when there's >1 route or
+// the single route has more than 2 waypoints — otherwise the per-route stats
+// in the card already say everything).
+function updatePathInfo() {
+  if (ROUTES.length === 0) { pathInfoEl.innerHTML = ""; return; }
+  const showTotals = ROUTES.length > 1
+    || (ROUTES.length === 1 && ROUTES[0].waypoints.length > 2);
+  if (!showTotals) { pathInfoEl.innerHTML = ""; return; }
+  const t = allRoutesStats();
+  const dist = fmtMiKm(t.miles, t.km);
+  let h = `<div class="path-stats path-totals">`
+        + `<div class="row totals-head"><span>Total across ${t.routes} route${t.routes===1?"":"s"}</span><span></span></div>`
+        + `<div class="row"><span>Waypoints</span><span>${t.waypoints}</span></div>`
+        + `<div class="row"><span>Hexes</span><span>${t.hexes}</span></div>`
+        + `<div class="row"><span>Distance</span><span>${dist}</span></div>`
+        + `<div class="row"><span>Cost</span><span>${t.cost.toFixed(1)}</span></div>`;
+  if (t.embarks) h += `<div class="row"><span>Embarks</span><span>${t.embarks}</span></div>`;
+  h += `</div>`;
+  pathInfoEl.innerHTML = h;
 }
 
 function updateStatus() {
   let s = `zoom ${(view.scale * 100).toFixed(0)}%`;
-  if (fromId) s += `  ·  From: ${SUBHEX_INDEX.get(fromId).name}`;
-  if (toId)   s += `  ·  To: ${SUBHEX_INDEX.get(toId).name}`;
-  if (pathHexIds && pathHexIds.length > 0) {
-    const st = pathStats();
-    s += `  ·  ${st.hexes} hexes (${st.miles} mi / ${Math.round(st.km)} km), cost ${st.cost.toFixed(1)}`;
+  const t = allRoutesStats();
+  if (t.routes > 0) {
+    s += `  ·  ${t.routes} route${t.routes===1?"":"s"}, ${t.waypoints} waypoint${t.waypoints===1?"":"s"}`;
+    if (t.hexes > 0) s += `  ·  ${t.hexes} hexes (${Math.round(t.miles)} mi / ${Math.round(t.km)} km), cost ${t.cost.toFixed(1)}`;
   }
   statusEl.textContent = s;
 }
 
 function clearSelection() {
-  fromId = toId = null; pathIds = null; pathSet = null;
-  pathHexIds = null; pathSubhexIds = null;
-  fromPx = toPx = null;
+  clearAllRoutes();
   _lastRouteMask = null;
   renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
 }
@@ -183,16 +250,29 @@ document.getElementById("reset-layers").addEventListener("click", () => {
   for (const l of LAYERS) { l.on = onIds.has(l.id); l.opacity = 1.0; }
   buildLayerControls(); renderLayers();
 });
-document.getElementById("swap").addEventListener("click", () => {
-  const t = fromId; fromId = toId; toId = t;
-  const tp = fromPx; fromPx = toPx; toPx = tp;
-  if (fromId != null && toId != null) recomputePath();
-  else { pathIds = null; pathSet = null; pathHexIds = null; pathSubhexIds = null; }
-  renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
+document.getElementById("new-route").addEventListener("click", () => {
+  newRoute();
+  updateEndpoints(); updatePathInfo(); updateStatus(); renderSelection();
+});
+document.getElementById("undo-waypoint").addEventListener("click", () => {
+  if (popActiveWaypoint()) {
+    updateEndpoints(); updatePathInfo(); updateStatus(); renderSelection();
+  }
 });
 document.getElementById("clear-sel").addEventListener("click", clearSelection);
 window.addEventListener("keydown", (e) => {
+  // Escape clears everything; Ctrl/Cmd-Z pops the last waypoint of the active
+  // route (with full route-drop on the last waypoint). Ignored when focus is
+  // inside an editable input so the number inputs keep their normal undo.
+  const tag = (e.target && e.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea") return;
   if (e.key === "Escape") clearSelection();
+  else if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) {
+    e.preventDefault();
+    if (popActiveWaypoint()) {
+      updateEndpoints(); updatePathInfo(); updateStatus(); renderSelection();
+    }
+  }
 });
 
 // ----- Colors panel -----
@@ -428,8 +508,7 @@ function buildIsochroneControls() {
     () => Math.round((ISOCHRONE_ALPHA / 255) * 100) + "%");
   isoEl.appendChild(cRow);
 }
-
-// Reachability section show/hide toggle (mirrors the Settings panel pattern:
+// Reachability section show/hide toggle (mirrors the Settings panel pattern:
 // the heading + body live in a sibling panel-section that gets hidden, so the
 // whole section vanishes when collapsed and only the toggle button remains).
 {
