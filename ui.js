@@ -197,9 +197,92 @@ function updateEndpoints() {
             + `<div class="row"><span>Distance</span><span>${dist}</span></div>`
             + `<div class="row"><span>Cost</span><span>${t.cost.toFixed(1)}</span></div>`;
       if (t.embarks)     h += `<div class="row"><span>Embarks</span><span>${t.embarks}</span></div>`;
+      if (t.ferries)     h += `<div class="row"><span>Ferries</span><span>${t.ferries}</span></div>`;
       if (!t.reachable)  h += `<div class="row reach"><span>Path</span><span>unreachable</span></div>`;
       stats.innerHTML = h;
       card.appendChild(stats);
+
+      // Expandable per-hex breakdown — every hex on the route in order,
+      // with that hex's per-hex contribution to the cost (max effective
+      // weight of the components dijkstra chose inside it). Ferry hexes
+      // get a "+ ferry" annotation; start hex shows "start" since it's
+      // free. Collapsed by default to keep the sidebar tidy.
+      if (route.segments.some(s => (s.hexIds && s.hexIds.length > 0))) {
+        const det = document.createElement("details");
+        det.className = "hex-breakdown";
+        det.innerHTML = `<summary>Hex breakdown</summary>`;
+        const tbl = document.createElement("div");
+        tbl.className = "hex-rows";
+        // Build the deduped hex sequence across all segments so a hex
+        // that's the endpoint of segment N and start of segment N+1
+        // shows once.
+        const flat = [];
+        for (let si = 0; si < route.segments.length; si++) {
+          const seg = route.segments[si];
+          if (!seg.hexIds) continue;
+          for (let i = 0; i < seg.hexIds.length; i++) {
+            const hid = seg.hexIds[i];
+            if (flat.length === 0 || flat[flat.length - 1].hid !== hid) {
+              flat.push({ hid, seg, idxInSeg: i });
+            }
+          }
+        }
+        // First hex of the whole route is the "start" (free).
+        for (let k = 0; k < flat.length; k++) {
+          const { hid, seg } = flat[k];
+          const terrain = (typeof HEX_TERRAIN !== "undefined" && HEX_TERRAIN) ? HEX_TERRAIN.get(hid) : null;
+          const w = seg.hexWeights ? seg.hexWeights.get(hid) : null;
+          // Determine which subhex class(es) dijkstra actually traversed
+          // in THIS hex. Cost is per-subhex-component, so the hex's sheet
+          // terrain alone doesn't explain why two routes through the same
+          // hex can have different costs — they may have visited
+          // different subhexes within it. canonicalSubhexClass maps Plains
+          // → Flatlands (etc.) so the displayed class lines up with the
+          // weight column it's billed under.
+          const visitedClasses = [];
+          if (seg.subhexPath && typeof SUBHEX_INDEX !== "undefined") {
+            const seen = new Set();
+            for (const sid of seg.subhexPath) {
+              const sub = SUBHEX_INDEX.get(sid);
+              if (!sub || sub.hex !== hid) continue;
+              const cls = (typeof canonicalSubhexClass === "function") ? canonicalSubhexClass(sub) : sub.class;
+              if (cls && !seen.has(cls)) { seen.add(cls); visitedClasses.push(cls); }
+            }
+          }
+          const visitedStr = visitedClasses.length > 0 ? visitedClasses.join("+") : (terrain || "?");
+          const sheetSuffix = (terrain && visitedClasses.length > 0 && visitedClasses[0] !== terrain)
+            ? `<span class="hex-sheet" title="Sheet terrain: ${escapeHtml(terrain)}"> · ${escapeHtml(terrain)}</span>`
+            : "";
+
+          // Start of the whole route is free; otherwise show this hex's
+          // per-hex cost contribution.
+          let costStr;
+          if (k === 0) {
+            costStr = `<span class="cost free">start</span>`;
+          } else if (isFinite(w)) {
+            costStr = `<span class="cost">${(+w).toFixed(2)}</span>`;
+          } else {
+            costStr = `<span class="cost muted">—</span>`;
+          }
+          // Annotations: ferry crossing tag.
+          const tags = [];
+          if (seg.usedFerryHexes && seg.usedFerryHexes.has(hid)) {
+            const fw = (typeof weights !== "undefined" && weights["Ferry"] != null) ? +weights["Ferry"] : null;
+            tags.push(`<span class="tag ferry" title="Ferry crossing">⛴${isFinite(fw) ? ` +${fw}` : ""}</span>`);
+          }
+          const row = document.createElement("div");
+          row.className = "hex-row" + (k === 0 ? " is-start" : "") + (k === flat.length - 1 ? " is-end" : "");
+          row.innerHTML =
+              `<span class="hex-num">${k + 1}</span>`
+            + `<span class="hex-id">${hid}</span>`
+            + `<span class="hex-terrain">${escapeHtml(visitedStr)}${sheetSuffix}</span>`
+            + tags.join("")
+            + costStr;
+          tbl.appendChild(row);
+        }
+        det.appendChild(tbl);
+        card.appendChild(det);
+      }
     }
     frag.appendChild(card);
   });
@@ -224,6 +307,7 @@ function updatePathInfo() {
         + `<div class="row"><span>Distance</span><span>${dist}</span></div>`
         + `<div class="row"><span>Cost</span><span>${t.cost.toFixed(1)}</span></div>`;
   if (t.embarks) h += `<div class="row"><span>Embarks</span><span>${t.embarks}</span></div>`;
+  if (t.ferries) h += `<div class="row"><span>Ferries</span><span>${t.ferries}</span></div>`;
   h += `</div>`;
   pathInfoEl.innerHTML = h;
 }
@@ -345,6 +429,35 @@ function buildLineControls() {
     () => LINE_WIDTH + "px");
   lineEl.appendChild(lwRow);
 
+  // Minimum centerline pixels a hex needs along the rendered line before
+  // it counts toward the route's hex count and cost. Lets the user tune
+  // out brief detours where the line dips into an adjacent hex for a few
+  // road pixels (and back) — those would otherwise inflate "Hexes" and
+  // distance even though the user never really left the main hex. Changing
+  // this rebuilds all routes so the totals reflect the new threshold.
+  const mpRow = document.createElement("div");
+  mpRow.className = "weight-row";
+  mpRow.innerHTML = `<span class="name">Min line px / hex</span>`
+    + `<input type="range" min="0" max="500" step="1" value="${MIN_PIXELS_PER_PATH_HEX}" />`
+    + `<span class="alpha-val">${MIN_PIXELS_PER_PATH_HEX}px</span>`;
+  const mpSlider = mpRow.querySelector("input");
+  const mpLabel  = mpRow.querySelector(".alpha-val");
+  const applyMp = () => {
+    mpLabel.textContent = MIN_PIXELS_PER_PATH_HEX + "px";
+    if (ROUTES.length > 0) {
+      recomputePath(); renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
+    }
+  };
+  mpSlider.addEventListener("input", (e) => {
+    MIN_PIXELS_PER_PATH_HEX = +e.target.value;
+    applyMp();
+  });
+  makeEditable(mpLabel,
+    (t) => { const n = parseInt(t, 10); return isFinite(n) ? Math.max(0, Math.min(5000, n)) : null; },
+    (v) => { MIN_PIXELS_PER_PATH_HEX = v; mpSlider.value = v; applyMp(); },
+    () => MIN_PIXELS_PER_PATH_HEX + "px");
+  lineEl.appendChild(mpRow);
+
   const psRow = document.createElement("div");
   psRow.className = "weight-row";
   psRow.innerHTML = `<span class="name">Point size</span>`
@@ -424,6 +537,58 @@ function buildLineControls() {
     renderSelection();
   });
   lineEl.appendChild(dbgRow);
+
+  // [debug] River-type overlay — paints river pixels by classification:
+  //   green  = thin (1-px wide, fordable)
+  //   red    = thick core (≥3 4-connected river neighbors)
+  //   orange = 1-px halo around thick river (AA / bank, also impassable)
+  // Helps verify why a route does or doesn't go through a given river.
+  const dbgRiverRow = document.createElement("div");
+  dbgRiverRow.className = "layer-row";
+  dbgRiverRow.innerHTML = `<input type="checkbox" id="debug-river" ${DEBUG_SHOW_RIVER_TYPES ? "checked" : ""} />`
+    + `<label for="debug-river">[debug] River types</label>`;
+  dbgRiverRow.querySelector("input").addEventListener("change", (e) => {
+    DEBUG_SHOW_RIVER_TYPES = e.target.checked;
+    renderSelection();
+  });
+  lineEl.appendChild(dbgRiverRow);
+
+  // [debug] Ferry hexes — translucent yellow tint over every hex whose
+  // artwork has road pixels overlaid on thick-river pixels. Quick visual
+  // check that the ferry detector picked up a crossing you can see in the
+  // art.
+  const dbgFerryRow = document.createElement("div");
+  dbgFerryRow.className = "layer-row";
+  dbgFerryRow.innerHTML = `<input type="checkbox" id="debug-ferry" ${DEBUG_SHOW_FERRY_HEXES ? "checked" : ""} />`
+    + `<label for="debug-ferry">[debug] Ferry hexes</label>`;
+  dbgFerryRow.querySelector("input").addEventListener("change", (e) => {
+    DEBUG_SHOW_FERRY_HEXES = e.target.checked;
+    renderSelection();
+  });
+  lineEl.appendChild(dbgFerryRow);
+
+  // [debug] Subhex types — paints every pixel by its routing CATEGORY:
+  //   blue   = Naval (Sea / Lake / Ocean class)
+  //   orange = Infrastructure (road or city pixel)
+  //   green  = Land that passes the assigned-weight check (subhex class
+  //            weight ≤ parent hex's terrain weight, so dijkstra can
+  //            enter it). Heavier land is left untinted.
+  // Useful for verifying that the three-category split matches what
+  // routeThroughMask actually treats as passable.
+  const dbgSubhexTypesRow = document.createElement("div");
+  dbgSubhexTypesRow.className = "layer-row";
+  dbgSubhexTypesRow.innerHTML = `<input type="checkbox" id="debug-subhex-types" ${DEBUG_SHOW_SUBHEX_TYPES ? "checked" : ""} />`
+    + `<label for="debug-subhex-types">[debug] Subhex types (Land / Infra / Naval)</label>`;
+  dbgSubhexTypesRow.querySelector("input").addEventListener("change", (e) => {
+    DEBUG_SHOW_SUBHEX_TYPES = e.target.checked;
+    // Assigned-weight classification depends on the per-class weights
+    // table; if those change, the overlay's land-vs-heavy decisions
+    // shift too. Invalidate the cached canvas on every toggle so the
+    // classification reflects the current weights.
+    invalidateDebugSubhexTypes();
+    renderSelection();
+  });
+  lineEl.appendChild(dbgSubhexTypesRow);
 }
 
 // Settings panel show/hide toggle.
@@ -523,7 +688,6 @@ function buildIsochroneControls() {
         // From/To clicking comes back. Keeps state in case you re-open it.
         ISOCHRONE_MODE = false;
         renderLayers(); renderSelection();
-        // Refresh the checkbox in the panel so it matches state next time.
         buildIsochroneControls();
       }
     });

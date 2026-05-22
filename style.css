@@ -7,10 +7,14 @@
   --accent: #61d0ff;
   --border: #3a3f48;
   --sea:        #5aa8ff;
-  --plains:     #8cdf6a;
+  --lake:       #7ec0ff;
+  --ocean:      #3a86d8;
+  --flatlands:  #8cdf6a;
+  --plains:     #8cdf6a;   /* legacy subhex-name swatch — same color as Flatlands */
+  --woodland:   #f0db7e;   /* legacy sheet-name swatch — aliased to Hills color */
   --hills:      #f0db7e;
   --mountains:  #f0a050;
-  --peaks:      #d05a44;
+  --peaks:      #d05a44;   /* legacy subhex-name swatch */
   --start:      #62e0c0;
   --end:        #ff6c8c;
   --path:       #ffd060;
@@ -77,7 +81,11 @@ canvas {
   display: inline-block; vertical-align: middle; margin-right: 6px;
 }
 .swatch.Sea       { background: var(--sea); }
+.swatch.Lake      { background: var(--lake); }
+.swatch.Ocean     { background: var(--ocean); }
+.swatch.Flatlands { background: var(--flatlands); }
 .swatch.Plains    { background: var(--plains); }
+.swatch.Woodland  { background: var(--woodland); }
 .swatch.Hills     { background: var(--hills); }
 .swatch.Mountains { background: var(--mountains); }
 .swatch.Peaks     { background: var(--peaks); }
@@ -121,7 +129,9 @@ canvas {
   z-index: 10; white-space: nowrap;
   transform: translate(12px, 12px);
   border: 1px solid var(--border);
+  max-width: 320px;
 }
+#hover-tooltip br + * { white-space: normal; }
 #hover-tooltip.hidden { display: none; }
 
 #status {
@@ -229,6 +239,62 @@ canvas {
 .route-stats .row { display: flex; justify-content: space-between; padding: 1px 0; }
 .route-stats .row span:first-child { color: var(--muted); }
 .route-stats .row.reach span:last-child { color: var(--end); }
+
+/* Expandable per-hex breakdown inside a route card.
+   <details><summary>Hex breakdown</summary> ... </details>
+   collapsed by default; expands to a monospace table of every hex on
+   the route with that hex's per-hex cost contribution (from dijkstra's
+   hexWeights). Start hex shows "start" (free); ferry crossings get a
+   small ⛴ tag. */
+.route-card .hex-breakdown {
+  margin-top: 6px;
+  background: rgba(0,0,0,0.18); border-radius: 4px;
+  padding: 4px 6px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+}
+.route-card .hex-breakdown > summary {
+  cursor: pointer;
+  color: var(--muted);
+  list-style: none;
+  user-select: none;
+  padding: 2px 0;
+  display: flex; align-items: center; gap: 6px;
+}
+.route-card .hex-breakdown > summary::-webkit-details-marker { display: none; }
+.route-card .hex-breakdown > summary::before {
+  content: "▸"; color: var(--muted); font-size: 10px; transition: transform 120ms;
+  display: inline-block; width: 10px;
+}
+.route-card .hex-breakdown[open] > summary::before { transform: rotate(90deg); }
+.route-card .hex-breakdown .hex-rows {
+  margin-top: 4px;
+  border-top: 1px solid rgba(255,255,255,0.05);
+  padding-top: 4px;
+}
+.route-card .hex-breakdown .hex-row {
+  display: grid;
+  grid-template-columns: 18px 1fr auto auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 1px 0;
+}
+.route-card .hex-breakdown .hex-row.is-start .hex-num,
+.route-card .hex-breakdown .hex-row.is-end   .hex-num { color: var(--accent); }
+.route-card .hex-breakdown .hex-num { color: var(--muted); text-align: right; }
+.route-card .hex-breakdown .hex-id  { color: var(--text); }
+.route-card .hex-breakdown .hex-terrain { color: var(--muted); font-size: 10.5px; }
+.route-card .hex-breakdown .hex-sheet   { color: rgba(255,255,255,0.28); font-size: 10px; }
+.route-card .hex-breakdown .cost      { color: var(--text); min-width: 36px; text-align: right; }
+.route-card .hex-breakdown .cost.free { color: var(--muted); font-style: italic; }
+.route-card .hex-breakdown .cost.muted{ color: var(--muted); }
+.route-card .hex-breakdown .tag {
+  font-size: 10px; padding: 0 4px; border-radius: 3px;
+  background: rgba(255,255,255,0.06); color: var(--muted);
+}
+.route-card .hex-breakdown .tag.ferry {
+  background: rgba(80, 230, 220, 0.18); color: rgb(140, 230, 220);
+}
 
 .path-totals { border: 1px solid var(--border); }
 .path-totals .totals-head span:first-child {

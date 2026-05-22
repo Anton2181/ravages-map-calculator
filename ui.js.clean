@@ -1,0 +1,499 @@
+"use strict";
+
+// Sidebar UI: layer toggles, weight inputs, endpoint badges, path stats.
+// All functions read globals from app.js (LAYERS, CLASSES, weights, fromId,
+// toId, pathIds, etc.) and call back into rendering/pathfinding.
+
+function pad4(n) { return String(n).padStart(4, "0"); }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// Make a small read-only value span editable on double-click.
+// onParse(text) -> parsed value or null on invalid.
+// onApply(value) -> store + propagate; should also update the matching slider.
+// reformat() -> string to display after committing (read from current state).
+function makeEditable(span, onParse, onApply, reformat) {
+  span.style.cursor = "text";
+  span.title = "Double-click to edit";
+  span.addEventListener("dblclick", () => {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = span.textContent;
+    input.size = 4;
+    input.className = "editable-val";
+    // Inline style as a belt-and-braces guard against flex parents (.weight-row)
+    // that have no constraints on their other children — without this the input
+    // can balloon to its UA default ~150px width and push the row off the panel.
+    input.style.flex = "0 0 56px";
+    input.style.width = "56px";
+    input.style.maxWidth = "56px";
+    input.style.minWidth = "0";
+    input.style.boxSizing = "border-box";
+    span.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    function commit(save) {
+      if (done) return; done = true;
+      if (save) {
+        const v = onParse(input.value);
+        if (v != null) onApply(v);
+      }
+      span.textContent = reformat();
+      input.replaceWith(span);
+    }
+    input.addEventListener("blur", () => commit(true));
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commit(true); }
+      else if (e.key === "Escape") { e.preventDefault(); commit(false); }
+    });
+  });
+}
+
+
+function buildLayerControls() {
+  layersEl.innerHTML = "";
+  for (const l of LAYERS) {
+    if (l.hidden) continue;
+    const row = document.createElement("div");
+    row.className = "layer-row";
+    row.innerHTML = `<input type="checkbox" id="layer-${l.id}" ${l.on ? "checked" : ""} />`
+      + `<label for="layer-${l.id}">${escapeHtml(l.label)}</label>`
+      + `<div class="opacity"><input type="range" min="0" max="100" value="${(l.opacity*100)|0}" /></div>`;
+    row.querySelector("input[type=checkbox]").addEventListener("change", (e) => {
+      l.on = e.target.checked; renderLayers();
+    });
+    row.querySelector("input[type=range]").addEventListener("input", (e) => {
+      l.opacity = (+e.target.value) / 100; renderLayers();
+    });
+    layersEl.appendChild(row);
+  }
+}
+
+const WEIGHT_LABELS = { "Embark": "Embark / disembark" };
+function buildWeightControls() {
+  weightsEl.innerHTML = "";
+  // Header row above the two input columns.
+  const head = document.createElement("div");
+  head.className = "weight-row";
+  const headStyle = "width:70px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.08em;text-align:center;";
+  head.innerHTML = `<span class="swatch" style="visibility:hidden"></span>`
+    + `<span class="name"></span>`
+    + `<span style="${headStyle}">Default</span>`
+    + `<span style="${headStyle}">Road</span>`;
+  weightsEl.appendChild(head);
+  for (const cls of CLASSES) {
+    const row = document.createElement("div");
+    row.className = "weight-row";
+    const label = WEIGHT_LABELS[cls] || cls;
+    row.innerHTML = `<span class="swatch ${cls}"></span><span class="name">${escapeHtml(label)}</span>`
+      + `<input type="number" min="0" step="0.5" value="${weights[cls]}" data-col="default" />`
+      + `<input type="number" min="0" step="0.5" value="${roadWeights[cls]}" data-col="road" />`;
+    const inputs = row.querySelectorAll("input");
+    const reroute = () => {
+      // Recompute every route's legs so a weight change ripples through all
+      // displayed routes at once. Cheap relative to the click latency budget
+      // (each route is just Dijkstra + A* per leg).
+      if (routes.length > 0) {
+        recomputeAllRoutes();
+        renderSelection(); updateRoutesList(); updateStatus();
+      }
+      if (ISOCHRONE_MODE && isochroneSourceId != null) {
+        computeIsochrone(); renderLayers(); renderSelection(); updateStatus();
+      }
+    };
+    inputs[0].addEventListener("change", (e) => {
+      const v = parseFloat(e.target.value);
+      weights[cls] = (isFinite(v) && v > 0) ? v : DEFAULT_WEIGHTS[cls];
+      e.target.value = weights[cls];
+      reroute();
+    });
+    inputs[1].addEventListener("change", (e) => {
+      const v = parseFloat(e.target.value);
+      roadWeights[cls] = (isFinite(v) && v > 0) ? v : DEFAULT_ROAD_WEIGHTS[cls];
+      e.target.value = roadWeights[cls];
+      reroute();
+    });
+    weightsEl.appendChild(row);
+  }
+}
+
+// Render the routes list: one card per route, with assigned color swatch,
+// waypoint names, total cost + hex count, and a delete button. The active
+// route's card gets a highlighted border (clicking another card makes it
+// active, so subsequent clicks on the map extend that route instead).
+function updateRoutesList() {
+  const el = document.getElementById("routes-list");
+  if (!el) return;
+  if (routes.length === 0) {
+    el.innerHTML = `<div class="placeholder">No routes yet. Click the map to add the first waypoint.</div>`;
+    return;
+  }
+  const parts = [];
+  for (let ri = 0; ri < routes.length; ri++) {
+    const route = routes[ri];
+    const totals = routeTotals(route);
+    const isActive = route.id === activeRouteId;
+    const colorStr = `rgb(${route.color.join(",")})`;
+    const wpRows = [];
+    for (let i = 0; i < route.waypoints.length; i++) {
+      const sub = SUBHEX_INDEX ? SUBHEX_INDEX.get(route.waypoints[i].sid) : null;
+      const name = sub ? sub.name : `subhex ${route.waypoints[i].sid}`;
+      const marker = (i === 0) ? "&#9679;"                                // start dot
+                    : (i === route.waypoints.length - 1 && route.legs.length > 0)
+                      ? "&#9632;"                                          // end square
+                      : "&#9656;";                                         // intermediate triangle
+      wpRows.push(`<div class="wp"><span class="marker">${marker}</span> ${escapeHtml(name)}</div>`);
+    }
+    const wpHtml = route.waypoints.length === 0
+      ? `<div class="empty">no waypoints yet</div>`
+      : `<div class="wp-list">${wpRows.join("")}</div>`;
+    const totalsHtml = route.waypoints.length < 2
+      ? `<div class="totals"><span>${route.waypoints.length} waypoint${route.waypoints.length === 1 ? "" : "s"}</span></div>`
+      : `<div class="totals">`
+        + `<span><b>${totals.hexes}</b> hex${totals.hexes === 1 ? "" : "es"}</span>`
+        + `<span>cost <b>${totals.cost.toFixed(1)}</b></span>`
+        + `<span>${Math.round(totals.miles).toLocaleString()} mi</span>`
+        + `</div>`;
+    const unreach = totals.hasUnreachable
+      ? `<div class="unreachable">&#9888; one or more legs are unreachable</div>` : "";
+    parts.push(
+      `<div class="route-card ${isActive ? "active" : ""}" data-route-id="${route.id}" `
+      + `style="border-left-color:${colorStr};">`
+      +   `<div class="head">`
+      +     `<span class="swatch" style="background:${colorStr};"></span>`
+      +     `<span class="title">Route ${ri + 1}${isActive ? ` <span class="badge">active</span>` : ""}</span>`
+      +     `<span class="del" data-del-route="${route.id}" title="Delete route">&#x2715;</span>`
+      +   `</div>`
+      +   totalsHtml
+      +   unreach
+      +   wpHtml
+      + `</div>`
+    );
+  }
+  el.innerHTML = parts.join("");
+  // Wire click handlers AFTER innerHTML is set.
+  for (const card of el.querySelectorAll(".route-card")) {
+    card.addEventListener("click", (e) => {
+      // Ignore clicks that landed on the delete X — those have their own handler.
+      if (e.target.matches(".del")) return;
+      const id = +card.getAttribute("data-route-id");
+      if (id !== activeRouteId) {
+        activeRouteId = id;
+        renderSelection(); updateRoutesList(); updateStatus();
+      }
+    });
+  }
+  for (const x of el.querySelectorAll(".del")) {
+    x.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = +x.getAttribute("data-del-route");
+      deleteRoute(id);
+      renderSelection(); updateRoutesList(); updateStatus();
+    });
+  }
+}
+
+function updateStatus() {
+  let s = `zoom ${(view.scale * 100).toFixed(0)}%`;
+  const ar = activeRoute();
+  if (ar) {
+    s += `  ·  Active: Route ${routes.indexOf(ar) + 1} (${ar.waypoints.length} wp)`;
+    if (ar.legs.length > 0) {
+      const t = routeTotals(ar);
+      s += `  ·  ${t.hexes} hexes, cost ${t.cost.toFixed(1)}, ${Math.round(t.miles)} mi`;
+      if (t.hasUnreachable) s += `  ·  some legs unreachable`;
+    }
+  }
+  if (routes.length > 1) s += `  ·  ${routes.length} routes total`;
+  statusEl.textContent = s;
+}
+
+function clearAllSelections() {
+  clearAllRoutes();
+  renderSelection(); updateRoutesList(); updateStatus();
+}
+
+document.getElementById("reset-view").addEventListener("click", () => resetView());
+document.getElementById("reset-layers").addEventListener("click", () => {
+  const onIds = new Set(["sea", "continent", "terrain", "rivers", "roads", "ctf"]);
+  for (const l of LAYERS) { l.on = onIds.has(l.id); l.opacity = 1.0; }
+  buildLayerControls(); renderLayers();
+});
+document.getElementById("new-route").addEventListener("click", () => {
+  // Only spawn a new route if the active one already has a waypoint, otherwise
+  // we'd leave an empty route stranded above it.
+  const ar = activeRoute();
+  if (ar && ar.waypoints.length === 0) return;
+  newRoute();
+  renderSelection(); updateRoutesList(); updateStatus();
+});
+document.getElementById("undo-waypoint").addEventListener("click", () => {
+  undoLastWaypoint();
+  renderSelection(); updateRoutesList(); updateStatus();
+});
+document.getElementById("swap").addEventListener("click", () => {
+  reverseActiveRoute();
+  renderSelection(); updateRoutesList(); updateStatus();
+});
+document.getElementById("clear-sel").addEventListener("click", clearAllSelections);
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") clearAllSelections();
+});
+
+// ----- Colors panel -----
+const COLOR_CONTROLS = [
+  { label: "Start",     get: () => START_COLOR,     set: (v) => { START_COLOR = v; },     getA: () => START_ALPHA, setA: (v) => { START_ALPHA = v; } },
+  { label: "End",       get: () => END_COLOR,       set: (v) => { END_COLOR = v; },       getA: () => END_ALPHA,   setA: (v) => { END_ALPHA = v; } },
+  { label: "Path fill", get: () => PATH_COLOR,      set: (v) => { PATH_COLOR = v; },      getA: () => PATH_ALPHA,  setA: (v) => { PATH_ALPHA = v; } },
+  { label: "Path line", get: () => PATH_LINE_COLOR, set: (v) => { PATH_LINE_COLOR = v; }, getA: () => LINE_ALPHA,  setA: (v) => { LINE_ALPHA = v; } },
+  { label: "Hex outline", get: () => HEX_OUTLINE_COLOR, set: (v) => { HEX_OUTLINE_COLOR = v; }, getA: () => HEX_OUTLINE_ALPHA, setA: (v) => { HEX_OUTLINE_ALPHA = v; } },
+];
+
+function rgbToHex(rgb) {
+  return "#" + rgb.map(v => Math.max(0, Math.min(255, v|0)).toString(16).padStart(2, "0")).join("");
+}
+function hexToRgb(hex) {
+  return [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)];
+}
+
+function buildColorControls() {
+  colorsEl.innerHTML = "";
+  for (const c of COLOR_CONTROLS) {
+    const hex = rgbToHex(c.get());
+    const aPct = Math.round((c.getA() / 255) * 100);
+    const row = document.createElement("div");
+    row.className = "color-row";
+    row.innerHTML =
+        `<span class="name">${c.label}</span>`
+      + `<input type="color" value="${hex}" />`
+      + `<input type="range" class="alpha" min="0" max="100" value="${aPct}" title="opacity" />`
+      + `<span class="alpha-val">${aPct}%</span>`;
+    const colorInput = row.querySelector("input[type=color]");
+    const alphaInput = row.querySelector("input[type=range]");
+    const alphaVal   = row.querySelector(".alpha-val");
+    colorInput.addEventListener("input", (e) => {
+      c.set(hexToRgb(e.target.value));
+      renderSelection();
+    });
+    alphaInput.addEventListener("input", (e) => {
+      const pct = +e.target.value;
+      c.setA(Math.round((pct / 100) * 255));
+      alphaVal.textContent = pct + "%";
+      renderSelection();
+    });
+    makeEditable(alphaVal,
+      (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(0, Math.min(100, n)) : null; },
+      (v) => { c.setA(Math.round((v / 100) * 255)); alphaInput.value = v; renderSelection(); },
+      () => Math.round((c.getA() / 255) * 100) + "%");
+    colorsEl.appendChild(row);
+  }
+}
+
+// ----- Path line style panel -----
+function buildLineControls() {
+  lineEl.innerHTML = "";
+  const lwRow = document.createElement("div");
+  lwRow.className = "weight-row";
+  lwRow.innerHTML = `<span class="name">Line width</span>`
+    + `<input type="range" min="1" max="10" step="0.5" value="${LINE_WIDTH}" />`
+    + `<span class="alpha-val">${LINE_WIDTH}px</span>`;
+  const lwSlider = lwRow.querySelector("input");
+  const lwLabel  = lwRow.querySelector(".alpha-val");
+  lwSlider.addEventListener("input", (e) => {
+    LINE_WIDTH = +e.target.value;
+    lwLabel.textContent = LINE_WIDTH + "px";
+    renderSelection();
+  });
+  makeEditable(lwLabel,
+    (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(1, Math.min(10, n)) : null; },
+    (v) => { LINE_WIDTH = v; lwSlider.value = v; renderSelection(); },
+    () => LINE_WIDTH + "px");
+  lineEl.appendChild(lwRow);
+
+  const psRow = document.createElement("div");
+  psRow.className = "weight-row";
+  psRow.innerHTML = `<span class="name">Point size</span>`
+    + `<input type="range" min="0" max="10" step="0.5" value="${POINT_SIZE}" />`
+    + `<span class="alpha-val">${POINT_SIZE}px</span>`;
+  const psSlider = psRow.querySelector("input");
+  const psLabel  = psRow.querySelector(".alpha-val");
+  psSlider.addEventListener("input", (e) => {
+    POINT_SIZE = +e.target.value;
+    psLabel.textContent = POINT_SIZE + "px";
+    renderSelection();
+  });
+  makeEditable(psLabel,
+    (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(0, Math.min(10, n)) : null; },
+    (v) => { POINT_SIZE = v; psSlider.value = v; renderSelection(); },
+    () => POINT_SIZE + "px");
+  lineEl.appendChild(psRow);
+
+  const aaRow = document.createElement("div");
+  aaRow.className = "layer-row";
+  aaRow.innerHTML = `<input type="checkbox" id="line-aa" ${LINE_AA ? "checked" : ""} />`
+    + `<label for="line-aa">Anti-aliasing</label>`;
+  aaRow.querySelector("input").addEventListener("change", (e) => {
+    LINE_AA = e.target.checked;
+    renderSelection();
+  });
+  lineEl.appendChild(aaRow);
+
+  const hoRow = document.createElement("div");
+  hoRow.className = "layer-row";
+  hoRow.innerHTML = `<input type="checkbox" id="show-hex-outline" ${SHOW_HEX_OUTLINE ? "checked" : ""} />`
+    + `<label for="show-hex-outline">Hex outlines</label>`;
+  hoRow.querySelector("input").addEventListener("change", (e) => {
+    SHOW_HEX_OUTLINE = e.target.checked;
+    renderSelection();
+  });
+  lineEl.appendChild(hoRow);
+
+  const owRow = document.createElement("div");
+  owRow.className = "weight-row";
+  owRow.innerHTML = `<span class="name">Outline width</span>`
+    + `<input type="range" min="1" max="10" step="0.5" value="${HEX_OUTLINE_WIDTH}" />`
+    + `<span class="alpha-val">${HEX_OUTLINE_WIDTH}px</span>`;
+  const owSlider = owRow.querySelector("input");
+  const owLabel  = owRow.querySelector(".alpha-val");
+  owSlider.addEventListener("input", (e) => {
+    HEX_OUTLINE_WIDTH = +e.target.value;
+    owLabel.textContent = HEX_OUTLINE_WIDTH + "px";
+    renderSelection();
+  });
+  makeEditable(owLabel,
+    (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(1, Math.min(10, n)) : null; },
+    (v) => { HEX_OUTLINE_WIDTH = v; owSlider.value = v; renderSelection(); },
+    () => HEX_OUTLINE_WIDTH + "px");
+  lineEl.appendChild(owRow);
+
+  const oaaRow = document.createElement("div");
+  oaaRow.className = "layer-row";
+  oaaRow.innerHTML = `<input type="checkbox" id="outline-aa" ${HEX_OUTLINE_AA ? "checked" : ""} />`
+    + `<label for="outline-aa">Outline anti-aliasing</label>`;
+  oaaRow.querySelector("input").addEventListener("change", (e) => {
+    HEX_OUTLINE_AA = e.target.checked;
+    renderSelection();
+  });
+  lineEl.appendChild(oaaRow);
+
+  // [debug] Route-mask overlay — paints the binary mask routeThroughMask
+  // actually fed to A* as a translucent magenta layer over hl-canvas. Useful
+  // for confirming which pixels are restricted to road and which subhexes
+  // are passable in a given route.
+  const dbgRow = document.createElement("div");
+  dbgRow.className = "layer-row";
+  dbgRow.innerHTML = `<input type="checkbox" id="debug-mask" ${DEBUG_SHOW_MASK ? "checked" : ""} />`
+    + `<label for="debug-mask">[debug] Route mask</label>`;
+  dbgRow.querySelector("input").addEventListener("change", (e) => {
+    DEBUG_SHOW_MASK = e.target.checked;
+    renderSelection();
+  });
+  lineEl.appendChild(dbgRow);
+}
+
+// Settings panel show/hide toggle.
+{
+  const tbtn = document.getElementById("settings-toggle");
+  const tpanels = document.getElementById("settings-panels");
+  tbtn.addEventListener("click", () => {
+    const isHidden = tpanels.classList.toggle("hidden");
+    tbtn.textContent = isHidden ? "Show settings" : "Hide settings";
+  });
+}
+
+// ----- Reachability (isochrone) panel -----
+function buildIsochroneControls() {
+  isoEl.innerHTML = "";
+
+  const onRow = document.createElement("div");
+  onRow.className = "layer-row";
+  onRow.innerHTML = `<input type="checkbox" id="iso-on" ${ISOCHRONE_MODE ? "checked" : ""} />`
+    + `<label for="iso-on">Enable (click to set origin)</label>`;
+  onRow.querySelector("input").addEventListener("change", (e) => {
+    ISOCHRONE_MODE = e.target.checked;
+    if (!ISOCHRONE_MODE) {
+      isochroneSourceId = null;
+      isochroneHexIds = null;
+      isochroneSubhexIds = null;
+    } else if (isochroneSourceId != null) {
+      computeIsochrone();
+    }
+    renderLayers(); renderSelection(); updateStatus();
+  });
+  isoEl.appendChild(onRow);
+
+  const bRow = document.createElement("div");
+  bRow.className = "weight-row";
+  bRow.innerHTML = `<span class="name">Budget</span>`
+    + `<input type="range" min="1" max="200" step="1" value="${ISOCHRONE_BUDGET}" />`
+    + `<span class="alpha-val">${ISOCHRONE_BUDGET}</span>`;
+  const bSlider = bRow.querySelector("input");
+  const bLabel  = bRow.querySelector(".alpha-val");
+  bSlider.addEventListener("input", (e) => {
+    ISOCHRONE_BUDGET = +e.target.value;
+    bLabel.textContent = ISOCHRONE_BUDGET;
+    if (ISOCHRONE_MODE && isochroneSourceId != null) {
+      computeIsochrone();
+      renderLayers(); renderSelection(); updateStatus();
+    }
+  });
+  makeEditable(bLabel,
+    (t) => { const n = parseFloat(t); return isFinite(n) && n > 0 ? n : null; },
+    (v) => {
+      ISOCHRONE_BUDGET = v; bSlider.value = v;
+      if (ISOCHRONE_MODE && isochroneSourceId != null) { computeIsochrone(); renderLayers(); renderSelection(); updateStatus(); }
+    },
+    () => String(ISOCHRONE_BUDGET));
+  isoEl.appendChild(bRow);
+
+  const cRow = document.createElement("div");
+  cRow.className = "color-row";
+  const hex = rgbToHex(ISOCHRONE_COLOR);
+  const aPct = Math.round((ISOCHRONE_ALPHA / 255) * 100);
+  cRow.innerHTML = `<span class="name">Color</span>`
+    + `<input type="color" value="${hex}" />`
+    + `<input type="range" class="alpha" min="0" max="100" value="${aPct}" title="opacity" />`
+    + `<span class="alpha-val">${aPct}%</span>`;
+  const colorInput = cRow.querySelector("input[type=color]");
+  const alphaInput = cRow.querySelector("input[type=range]");
+  const alphaVal   = cRow.querySelector(".alpha-val");
+  colorInput.addEventListener("input", (e) => {
+    ISOCHRONE_COLOR = hexToRgb(e.target.value);
+    renderLayers();
+  });
+  alphaInput.addEventListener("input", (e) => {
+    const pct = +e.target.value;
+    ISOCHRONE_ALPHA = Math.round((pct / 100) * 255);
+    alphaVal.textContent = pct + "%";
+    renderLayers();
+  });
+  makeEditable(alphaVal,
+    (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(0, Math.min(100, n)) : null; },
+    (v) => { ISOCHRONE_ALPHA = Math.round((v / 100) * 255); alphaInput.value = v; renderLayers(); },
+    () => Math.round((ISOCHRONE_ALPHA / 255) * 100) + "%");
+  isoEl.appendChild(cRow);
+}
+
+// Reachability section show/hide toggle (mirrors the Settings panel pattern:
+// the heading + body live in a sibling panel-section that gets hidden, so the
+// whole section vanishes when collapsed and only the toggle button remains).
+{
+  const tbtn = document.getElementById("reach-toggle");
+  const tpanels = document.getElementById("reach-panels");
+  if (tbtn && tpanels) {
+    tbtn.addEventListener("click", () => {
+      const isHidden = tpanels.classList.toggle("hidden");
+      tbtn.textContent = isHidden ? "Show reachability" : "Hide reachability";
+      if (isHidden && ISOCHRONE_MODE) {
+        // Collapse the panel -> also turn off the click-capture mode so normal
+        // From/To clicking comes back. Keeps state in case you re-open it.
+        ISOCHRONE_MODE = false;
+        renderLayers(); renderSelection();
+        // Refresh the checkbox in the panel so it matches state next time.
+        buildIsochroneControls();
+      }
+    });
+  }
+}
