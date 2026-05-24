@@ -54,11 +54,37 @@ const DEFAULT_WEIGHTS = {
 // use the default column (a road doesn't help you load a ship or sail
 // faster).
 const DEFAULT_ROAD_WEIGHTS = {
-  // Roads flatten the per-terrain cost to a single value (15) regardless of
-  // the underlying Flatlands/Hills/Mountains class — a paved imperial road
-  // moves a party at the same pace whether it runs through valley or pass.
-  "Flatlands": 15, "Hills": 15, "Mountains": 15,
+  // Roads flatten the per-terrain cost on Flatlands/Hills to a single
+  // value (15), regardless of the underlying class — a paved imperial road
+  // moves a party at the same pace through valley or gentle uplands.
+  // Mountain roads still cost more (30) because the road is rougher /
+  // climbs more, even paved.
+  "Flatlands": 15, "Hills": 15, "Mountains": 30,
   // Water and embark/disembark mirror the default column.
+  "Lake": 2.5, "Sea": 2.5, "Ocean": 2.5,
+  "Embark": 7,
+  "Disembark": 0,
+  "Ferry": 0,
+  "Fording": 5,
+};
+
+// FORCED MARCH weight matrix — parallel to DEFAULT_WEIGHTS, used when a
+// route segment is flagged "forced march". Lower per-hex IRL-hour cost
+// reflects the party moving faster (covering ground in fewer hours).
+// Surcharges (Embark / Ferry / Fording / Disembark) and water-traversal
+// weights are unchanged — only the land-terrain row changes, since
+// "forced march" is a marching-pace concept.
+const DEFAULT_FORCED_WEIGHTS = {
+  "Flatlands": 24, "Hills": 24, "Mountains": 48,
+  "Lake": 2.5, "Sea": 2.5, "Ocean": 2.5,
+  "Embark": 7,
+  "Disembark": 0,
+  "Ferry": 0,
+  "Fording": 5,
+};
+// FORCED MARCH road column — mirrors the layout of DEFAULT_ROAD_WEIGHTS.
+const DEFAULT_FORCED_ROAD_WEIGHTS = {
+  "Flatlands": 12, "Hills": 12, "Mountains": 24,
   "Lake": 2.5, "Sea": 2.5, "Ocean": 2.5,
   "Embark": 7,
   "Disembark": 0,
@@ -156,6 +182,15 @@ let IMAGES = {};
 let view = { x: 0, y: 0, scale: 1.0 };
 let weights = Object.assign({}, DEFAULT_WEIGHTS);
 let roadWeights = Object.assign({}, DEFAULT_ROAD_WEIGHTS);
+// Forced-march weight tables. Per-segment forced flag swaps these in
+// for the dijkstra cost computation (see rebuildRoute).
+let forcedWeights = Object.assign({}, DEFAULT_FORCED_WEIGHTS);
+let forcedRoadWeights = Object.assign({}, DEFAULT_FORCED_ROAD_WEIGHTS);
+// Parallel hex-mode graph baked with forced-march costs. Built alongside
+// HEX_MODES in recomputeHexModeGraph; swapped in temporarily when
+// computing a forced-march route segment. Neighbors / pixel topology
+// are identical, so HEX_MODE_NEIGHBORS is shared.
+let HEX_MODES_FORCED = null;
 // Binary masks over the full map image. Built once after layers load.
 // ROAD_PIXEL_MASK  = roads.png ∪ citiestownsforts.png — used for the per-hex
 //                    road restriction.
@@ -1317,9 +1352,12 @@ async function loadAll() {
     // from HEX_RIVER_PIXELS (cheap; iterates only river pixels).
     if (!RIVER_SUBHEXES) precomputeRiverSubhexes();
     loadingEl.textContent = "Building mode graph…";
-    precomputeHexModes();
-    precomputeHexModeNeighbors();
-    addComboModeNeighbors();
+    // recomputeHexModeGraph builds BOTH the default-weight HEX_MODES and
+    // the parallel HEX_MODES_FORCED used by forced-march route segments.
+    // Calling precomputeHexModes directly here would skip the forced
+    // build and leave HEX_MODES_FORCED null, silently disabling the
+    // per-segment forced toggle until the user touches a weight input.
+    recomputeHexModeGraph();
     loadingEl.classList.add("hidden");
     console.log("Loaded graph state from graph_cache.bin — heavy precomputes skipped.");
     return;
@@ -1342,9 +1380,9 @@ async function loadAll() {
   precomputeSubhexComponents();
   precomputeBlockedSubhexEdges();
   precomputeSubhexComponentNeighbors();
-  precomputeHexModes();
-  precomputeHexModeNeighbors();
-  addComboModeNeighbors();
+  // recomputeHexModeGraph builds BOTH the default-weight HEX_MODES and
+  // the parallel HEX_MODES_FORCED used by forced-march route segments.
+  recomputeHexModeGraph();
   loadingEl.classList.add("hidden");
 }
 
@@ -1353,9 +1391,29 @@ async function loadAll() {
 // on the assigned-weight rule, and cost values are weight-derived for
 // every mode. Routes need a rebuild after this to pick up changes.
 function recomputeHexModeGraph() {
+  // Default-weights pass — drives HEX_MODES, the per-pixel mode lookup
+  // arrays, and the neighbor graph used for everything except forced
+  // march segments.
   precomputeHexModes();
   precomputeHexModeNeighbors();
   addComboModeNeighbors();
+  const defaultModes   = HEX_MODES;
+  const defaultPixKind = PIX_MODE_KIND;
+  const defaultPixComp = PIX_MODE_COMP;
+  // Forced-weights pass — swap the weight globals, re-run the per-hex
+  // mode catalog only (neighbors and pixel topology don't change because
+  // mode kinds + their pixel sets are weight-independent). Store the
+  // resulting HEX_MODES under HEX_MODES_FORCED so dijkstra can use it
+  // when a route segment is flagged forced. Restore defaults afterwards.
+  const _w = weights, _rw = roadWeights;
+  weights = forcedWeights;
+  roadWeights = forcedRoadWeights;
+  precomputeHexModes();
+  HEX_MODES_FORCED = HEX_MODES;
+  weights = _w; roadWeights = _rw;
+  HEX_MODES     = defaultModes;
+  PIX_MODE_KIND = defaultPixKind;
+  PIX_MODE_COMP = defaultPixComp;
   // Prune overrides whose pinned mode no longer exists after the rebuild
   // (e.g., a weight change removed a kind from this hex). Without this,
   // dijkstra would silently fail to find a path through the hex.
@@ -4002,8 +4060,35 @@ function computeSegmentLinePoints(segment, /* wa, wb unused */) {
 // road flags shift). Line points stay null until the renderer asks for them.
 function rebuildRoute(route) {
   route.segments = [];
+  // forcedSegments is a parallel boolean array — one entry per gap
+  // between adjacent waypoints. Keep its length in sync as waypoints are
+  // added/removed; preserve existing flags for surviving segments.
+  if (!Array.isArray(route.forcedSegments)) route.forcedSegments = [];
+  const wantLen = Math.max(0, route.waypoints.length - 1);
+  while (route.forcedSegments.length < wantLen) route.forcedSegments.push(false);
+  while (route.forcedSegments.length > wantLen) route.forcedSegments.pop();
   for (let i = 1; i < route.waypoints.length; i++) {
-    route.segments.push(computeSegment(route.waypoints[i - 1], route.waypoints[i]));
+    const forced = !!route.forcedSegments[i - 1];
+    let seg;
+    if (forced) {
+      // Swap to the forced-march weight context for this segment only.
+      // Same-hex segments use weights["Embark"]/["Ferry"] directly, and
+      // dijkstraHexModePath reads HEX_MODES + weights["Embark"|"Disembark"]
+      // at runtime — covering both via globals keeps the swap local.
+      const _w = weights, _rw = roadWeights, _hm = HEX_MODES;
+      weights = forcedWeights;
+      roadWeights = forcedRoadWeights;
+      if (HEX_MODES_FORCED) HEX_MODES = HEX_MODES_FORCED;
+      try {
+        seg = computeSegment(route.waypoints[i - 1], route.waypoints[i]);
+      } finally {
+        weights = _w; roadWeights = _rw; HEX_MODES = _hm;
+      }
+    } else {
+      seg = computeSegment(route.waypoints[i - 1], route.waypoints[i]);
+    }
+    seg.forced = forced;
+    route.segments.push(seg);
   }
   route.totals = computeRouteTotals(route);
 }
@@ -4061,6 +4146,9 @@ function newRoute() {
     id: NEXT_ROUTE_ID++,
     color: ROUTE_PALETTE[(ROUTES.length) % ROUTE_PALETTE.length].slice(),
     waypoints: [], segments: [], totals: null,
+    // Per-gap forced-march flags. forcedSegments[i] applies to the
+    // segment between waypoints[i] and waypoints[i+1].
+    forcedSegments: [],
   };
   ROUTES.push(route);
   ACTIVE_ROUTE_ID = route.id;
@@ -4080,6 +4168,14 @@ function removeWaypoint(routeId, idx) {
   const route = findRoute(routeId);
   if (!route || idx < 0 || idx >= route.waypoints.length) return;
   route.waypoints.splice(idx, 1);
+  // Keep forcedSegments aligned: removing waypoint `idx` deletes either
+  // the outgoing segment (idx → idx+1) at the same index, or the last
+  // segment when idx is the tail. The remaining flags then map onto the
+  // surviving segment positions correctly.
+  if (Array.isArray(route.forcedSegments) && route.forcedSegments.length > 0) {
+    const removeAt = Math.min(idx, route.forcedSegments.length - 1);
+    route.forcedSegments.splice(removeAt, 1);
+  }
   rebuildRoute(route);
   syncActiveProjection();
 }
@@ -4168,6 +4264,10 @@ function serializeRoutes() {
         hexId:    wp.hexId,
         px:       { x: wp.px.x, y: wp.px.y },
       })),
+      // Per-gap forced-march flags (one entry per segment between
+      // adjacent waypoints). Older save files without this field load
+      // with every segment at normal march.
+      forcedSegments: Array.isArray(r.forcedSegments) ? r.forcedSegments.slice() : [],
     })),
   };
   return JSON.stringify(payload, null, 2);
@@ -4221,6 +4321,11 @@ function loadRoutesFromObject(payload) {
         ? { x: +wp.px.x, y: +wp.px.y }
         : { x: sub.centroid[0], y: sub.centroid[1] };
       route.waypoints.push({ subhexId: sid, hexId, px });
+    }
+    // Restore per-gap forced-march flags if the save file includes them.
+    // rebuildRoute will pad/trim to the right length.
+    if (Array.isArray(sr.forcedSegments)) {
+      route.forcedSegments = sr.forcedSegments.map(v => !!v);
     }
     rebuildRoute(route);
   }
@@ -6273,6 +6378,19 @@ function showModePicker(clientX, clientY, hexId) {
   modePickerEl.style.top  = ly + "px";
 }
 stage.addEventListener("contextmenu", (e) => {
+  // Mode picker is a debug tool — it explains which hex-mode dijkstra
+  // would pick and lets you pin overrides. Only useful when a [debug]
+  // overlay is showing the raw graph state. When no debug overlay is
+  // active, swallow the event silently so right-click doesn't pop the
+  // picker in normal use; the picker would otherwise distract from
+  // ordinary route-planning.
+  const anyDebugOn = DEBUG_SHOW_MASK || DEBUG_SHOW_RIVER_TYPES
+                  || DEBUG_SHOW_FERRY_HEXES || DEBUG_SHOW_SUBHEX_TYPES;
+  if (!anyDebugOn) {
+    e.preventDefault();
+    hideModePicker();
+    return;
+  }
   e.preventDefault();
   const ipt = stageToImage(e.clientX, e.clientY);
   if (!ipt) { hideModePicker(); return; }

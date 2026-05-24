@@ -79,14 +79,20 @@ const WEIGHT_LABELS = {
 };
 function buildWeightControls() {
   weightsEl.innerHTML = "";
-  // Header row above the two input columns.
+  // Header row above the four input columns: Norm (default march),
+  // Road (default march on a road hex), Forc (forced march), F.Rd
+  // (forced march on a road hex). The two Forc columns only apply
+  // when a route segment is flagged forced via the foot toggle in
+  // the route list — normal pathfinding cost is unchanged otherwise.
   const head = document.createElement("div");
   head.className = "weight-row";
-  const headStyle = "width:70px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.08em;text-align:center;";
+  const headStyle = "width:46px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:0.04em;text-align:center;";
   head.innerHTML = `<span class="swatch" style="visibility:hidden"></span>`
     + `<span class="name"></span>`
-    + `<span style="${headStyle}">Default</span>`
-    + `<span style="${headStyle}">Road</span>`;
+    + `<span style="${headStyle}" title="Default-march weight">Norm</span>`
+    + `<span style="${headStyle}" title="Default-march weight on a road hex">Road</span>`
+    + `<span style="${headStyle};color:var(--accent);" title="Forced-march weight">Forc</span>`
+    + `<span style="${headStyle};color:var(--accent);" title="Forced-march weight on a road hex">F.Rd</span>`;
   weightsEl.appendChild(head);
   for (const cls of CLASSES) {
     const row = document.createElement("div");
@@ -94,11 +100,14 @@ function buildWeightControls() {
     const label = WEIGHT_LABELS[cls] || cls;
     row.innerHTML = `<span class="swatch ${cls}"></span><span class="name">${escapeHtml(label)}</span>`
       + `<input type="number" min="0" step="any" value="${weights[cls]}" data-col="default" />`
-      + `<input type="number" min="0" step="any" value="${roadWeights[cls]}" data-col="road" />`;
+      + `<input type="number" min="0" step="any" value="${roadWeights[cls]}" data-col="road" />`
+      + `<input type="number" min="0" step="any" value="${forcedWeights[cls]}" data-col="forced" class="forced-input" />`
+      + `<input type="number" min="0" step="any" value="${forcedRoadWeights[cls]}" data-col="forced-road" class="forced-input" />`;
     const inputs = row.querySelectorAll("input");
     const reroute = () => {
       // Weight changes affect the hex-mode graph (LAND passability rule
-      // + per-mode costs), so rebuild that layer before rerouting.
+      // + per-mode costs), so rebuild that layer before rerouting. The
+      // rebuild also re-bakes HEX_MODES_FORCED off the forced tables.
       if (typeof recomputeHexModeGraph === "function") recomputeHexModeGraph();
       if (ROUTES.length > 0) {
         recomputePath(); renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
@@ -119,6 +128,20 @@ function buildWeightControls() {
       e.target.value = roadWeights[cls];
       reroute();
     });
+    inputs[2].addEventListener("change", (e) => {
+      const v = parseFloat(e.target.value);
+      // Allow v >= 0 for forced columns so surcharge rows (Ferry,
+      // Disembark) accept 0 as a meaningful value.
+      forcedWeights[cls] = (isFinite(v) && v >= 0) ? v : DEFAULT_FORCED_WEIGHTS[cls];
+      e.target.value = forcedWeights[cls];
+      reroute();
+    });
+    inputs[3].addEventListener("change", (e) => {
+      const v = parseFloat(e.target.value);
+      forcedRoadWeights[cls] = (isFinite(v) && v >= 0) ? v : DEFAULT_FORCED_ROAD_WEIGHTS[cls];
+      e.target.value = forcedRoadWeights[cls];
+      reroute();
+    });
     weightsEl.appendChild(row);
   }
 }
@@ -131,6 +154,25 @@ const routesListEl = document.getElementById("routes-list");
 function rgbCss(c) { return `rgb(${c[0]},${c[1]},${c[2]})`; }
 function fmtMiKm(miles, km) {
   return `${Math.round(miles).toLocaleString()} mi / ${Math.round(km).toLocaleString()} km`;
+}
+
+// Format a raw IRL-hour count as "Y days Z hours". Sub-day values stay
+// in hours (with one decimal). Whole-day values omit the trailing
+// "0 hours" suffix. Plural/singular agree with the actual value so a
+// 1.0 / 24.0 reads naturally ("1 hour", "1 day").
+function fmtIRLTime(hours) {
+  if (!isFinite(hours)) return "—";
+  if (hours < 0) hours = 0;
+  if (hours < 24) {
+    const h = Math.round(hours * 10) / 10;
+    return `${h.toFixed(1)} hr${h === 1 ? "" : "s"}`;
+  }
+  const days = Math.floor(hours / 24);
+  const rem  = Math.round((hours - days * 24) * 10) / 10;
+  const dStr = `${days} day${days === 1 ? "" : "s"}`;
+  if (rem < 0.05) return dStr;
+  const remStr = (rem % 1 === 0) ? `${rem}` : rem.toFixed(1);
+  return `${dStr} ${remStr} hr${rem === 1 ? "" : "s"}`;
 }
 function updateEndpoints() {
   if (!routesListEl) return;
@@ -160,6 +202,8 @@ function updateEndpoints() {
       if (cls && (cls.contains("editable-val") ||
                   cls.contains("route-del") ||
                   cls.contains("wp-del") ||
+                  cls.contains("wp-foot") ||
+                  cls.contains("wp-foot-glyph") ||
                   cls.contains("route-color"))) return;
       if (typeof fitCameraToRoute === "function") fitCameraToRoute(route);
     });
@@ -191,15 +235,21 @@ function updateEndpoints() {
     });
     card.appendChild(header);
 
-    // Waypoint list
+    // Waypoint list — between every adjacent pair of waypoints we also
+    // render a small foot-toggle row. Click the foot to flip that
+    // segment between normal and forced march, which routes the segment
+    // through the forced-march weight tables instead of the default ones.
     if (route.waypoints.length > 0) {
       const wpList = document.createElement("div");
       wpList.className = "wp-list";
       route.waypoints.forEach((wp, i) => {
         const sub = SUBHEX_INDEX.get(wp.subhexId);
         const wpRow = document.createElement("div");
-        wpRow.className = "wp-row";
-        const label = sub ? `${i+1}. ${escapeHtml(sub.name)}` : `${i+1}. (unknown)`;
+        // The segment between waypoint i-1 and i is forcedSegments[i-1];
+        // tint the destination row of a forced segment so the visual
+        // flow reads "foot toggle -> tinted destination".
+        const incomingForced = i > 0 && Array.isArray(route.forcedSegments) && !!route.forcedSegments[i - 1];
+        wpRow.className = "wp-row" + (incomingForced ? " forced" : "");
         wpRow.innerHTML =
             `<span class="wp-idx">${i + 1}</span>`
           + (sub ? `<span class="swatch ${sub.class}"></span>` : `<span class="swatch"></span>`)
@@ -210,6 +260,42 @@ function updateEndpoints() {
           updateEndpoints(); updatePathInfo(); updateStatus(); renderSelection();
         });
         wpList.appendChild(wpRow);
+
+        // Foot-toggle between this waypoint and the next, except after
+        // the last waypoint (no segment follows). forcedSegments[i] is
+        // the flag for the segment from waypoints[i] -> waypoints[i+1].
+        if (i < route.waypoints.length - 1) {
+          const gapIdx = i;
+          const isForced = Array.isArray(route.forcedSegments) && !!route.forcedSegments[gapIdx];
+          const seg = route.segments && route.segments[gapIdx];
+          const footRow = document.createElement("div");
+          footRow.className = "wp-foot-row";
+          const costStr = (seg && isFinite(seg.cost)) ? ` (${fmtIRLTime(seg.cost)})` : "";
+          const title = isForced
+            ? `Forced march on this segment${costStr}. Click to switch back to normal march.`
+            : `Normal march on this segment${costStr}. Click to set forced march (faster, fewer hours).`;
+          footRow.innerHTML = `<span class="wp-foot${isForced ? " on" : ""}" title="${escapeHtml(title)}">`
+            + (isForced ? "forced march" : "normal march")
+            + `</span>`;
+          const footBtn = footRow.querySelector(".wp-foot");
+          // Swallow dblclick on the button itself so rapid toggling
+          // can't bubble up to the route card's "fit camera to route"
+          // dblclick handler. The card-level handler also excludes
+          // wp-foot via its target.classList check, but stopping the
+          // event here is the belt-and-braces guard.
+          footBtn.addEventListener("dblclick", (e) => e.stopPropagation());
+          footBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (!Array.isArray(route.forcedSegments)) route.forcedSegments = [];
+            while (route.forcedSegments.length <= gapIdx) route.forcedSegments.push(false);
+            route.forcedSegments[gapIdx] = !route.forcedSegments[gapIdx];
+            // Recompute just this route so the affected segment's cost
+            // re-bakes off the forced weights.
+            if (typeof rebuildRoute === "function") rebuildRoute(route);
+            updateEndpoints(); updatePathInfo(); updateStatus(); renderSelection();
+          });
+          wpList.appendChild(footRow);
+        }
       });
       card.appendChild(wpList);
     }
@@ -222,7 +308,7 @@ function updateEndpoints() {
       const dist = fmtMiKm(t.miles, t.km);
       let h = `<div class="row"><span>Hexes</span><span>${t.hexes}</span></div>`
             + `<div class="row"><span>Distance</span><span>${dist}</span></div>`
-            + `<div class="row"><span>IRL Hours</span><span>${t.cost.toFixed(1)}</span></div>`;
+            + `<div class="row"><span>IRL Time</span><span title="${t.cost.toFixed(2)} hours total">${escapeHtml(fmtIRLTime(t.cost))}</span></div>`;
       if (t.embarks)     h += `<div class="row"><span>Embarks</span><span>${t.embarks}</span></div>`;
       if (t.ferries)     h += `<div class="row"><span>Ferries</span><span>${t.ferries}</span></div>`;
       if (!t.reachable)  h += `<div class="row reach"><span>Path</span><span>unreachable</span></div>`;
@@ -340,7 +426,7 @@ function updatePathInfo() {
         + `<div class="row"><span>Waypoints</span><span>${t.waypoints}</span></div>`
         + `<div class="row"><span>Hexes</span><span>${t.hexes}</span></div>`
         + `<div class="row"><span>Distance</span><span>${dist}</span></div>`
-        + `<div class="row"><span>IRL Hours</span><span>${t.cost.toFixed(1)}</span></div>`;
+        + `<div class="row"><span>IRL Time</span><span title="${t.cost.toFixed(2)} hours total">${escapeHtml(fmtIRLTime(t.cost))}</span></div>`;
   if (t.embarks) h += `<div class="row"><span>Embarks</span><span>${t.embarks}</span></div>`;
   if (t.ferries) h += `<div class="row"><span>Ferries</span><span>${t.ferries}</span></div>`;
   h += `</div>`;
