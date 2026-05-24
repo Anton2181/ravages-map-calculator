@@ -219,6 +219,20 @@ canvas {
 #reach-toggle { flex: 1; text-align: center; }
 #reach-panels.hidden { display: none; }
 
+/* Toggleable army group — full-width toggle button, hidden body until
+   expanded. Without the .hidden rule the panel content (army heading +
+   description + controls) would render unconditionally. */
+#army-toggle-row { display: flex; }
+#army-toggle { flex: 1; text-align: center; }
+#army-panels.hidden { display: none; }
+
+/* Toggleable layers group — same pattern. Reset view / reset layers
+   buttons live inside layers-panels so they hide with the rest of the
+   layers UI when the section is collapsed. */
+#layers-toggle-row { display: flex; }
+#layers-toggle { flex: 1; text-align: center; }
+#layers-panels.hidden { display: none; }
+
 .swatch.Flatlands { background: #b9d775; }
 .swatch.Woodland  { background: #4a8d4a; }
 .swatch.Lake      { background: #6db7e0; }

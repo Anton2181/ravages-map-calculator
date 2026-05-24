@@ -14,15 +14,6 @@
     </div>
 
     <div class="panel-section">
-      <h3>Layers</h3>
-      <div id="layers"></div>
-      <div class="button-row" style="margin-top:6px;">
-        <span class="button" id="reset-view">Reset view</span>
-        <span class="button" id="reset-layers">Reset layers</span>
-      </div>
-    </div>
-
-    <div class="panel-section">
       <h3>Routes</h3>
       <div class="button-row" style="margin-bottom:8px;">
         <span class="button primary" id="new-route">New route</span>
@@ -36,6 +27,33 @@
       </div>
       <div id="routes-list"></div>
       <div id="path-info"></div>
+    </div>
+
+    <div id="army-toggle-row" class="panel-section">
+      <span class="button" id="army-toggle">Show army</span>
+    </div>
+
+    <div id="army-panels" class="hidden">
+    <div class="panel-section">
+      <h3>Army</h3>
+      <div id="army"></div>
+      <div class="help" style="margin-top:6px;">Army length affects march cost. <b>Length &gt; 6 mi</b> doubles all land weights (the column drags). <b>Fording</b> a thin river costs <code>length &times; 2.4</code> IRL hours per crossing (overrides the Fording weight when length &gt; 0). <b>Can ford</b> off blocks thin-river crossings entirely; <b>Can embark</b> off blocks boarding ships.</div>
+    </div>
+    </div>
+
+    <div id="layers-toggle-row" class="panel-section">
+      <span class="button" id="layers-toggle">Show layers</span>
+    </div>
+
+    <div id="layers-panels" class="hidden">
+    <div class="panel-section">
+      <h3>Layers</h3>
+      <div id="layers"></div>
+      <div class="button-row" style="margin-top:6px;">
+        <span class="button" id="reset-view">Reset view</span>
+        <span class="button" id="reset-layers">Reset layers</span>
+      </div>
+    </div>
     </div>
 
     <div id="reach-toggle-row" class="panel-section">

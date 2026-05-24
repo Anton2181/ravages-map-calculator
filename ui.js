@@ -94,7 +94,14 @@ function buildWeightControls() {
     + `<span style="${headStyle};color:var(--accent);" title="Forced-march weight">Forc</span>`
     + `<span style="${headStyle};color:var(--accent);" title="Forced-march weight on a road hex">F.Rd</span>`;
   weightsEl.appendChild(head);
+  // Hide Fording / Disembark / Ferry from the settings UI — those
+  // surcharges are either fully driven by other systems (Fording cost
+  // comes from the Army panel's length × 2.4 equation now) or rarely
+  // tuned (Disembark default is 0; Ferry default is 0). They still
+  // exist in the weights tables so dijkstra can read them.
+  const HIDDEN_WEIGHT_CLASSES = new Set(["Fording", "Disembark", "Ferry"]);
   for (const cls of CLASSES) {
+    if (HIDDEN_WEIGHT_CLASSES.has(cls)) continue;
     const row = document.createElement("div");
     row.className = "weight-row";
     const label = WEIGHT_LABELS[cls] || cls;
@@ -744,6 +751,76 @@ function buildLineControls() {
   });
 }
 
+// ----- Army panel — column length + can-ford/embark toggles -----
+// Changes here always require recomputeHexModeGraph + a route rebuild
+// because LAND/ROAD costs, FORD-mode emission, and NAVAL-mode emission
+// all depend on the current army state.
+function buildArmyControls() {
+  if (!armyEl) return;
+  armyEl.innerHTML = "";
+
+  // Two reroute helpers — heavy and cheap. Length changes alter LAND/
+  // ROAD mode costs (and may cross the >6mi doubling threshold), so the
+  // mode-graph variants must be rebuilt. Toggling Can ford / Can embark
+  // is a permission flip only: every variant already exists pre-baked,
+  // selectActiveHexModes is a single Map.get — no precompute needed.
+  const armyRerouteHeavy = () => {
+    if (typeof recomputeHexModeGraph === "function") recomputeHexModeGraph();
+    if (typeof rebuildAllRoutes === "function") rebuildAllRoutes();
+    renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
+    if (ISOCHRONE_MODE && isochroneSourceId != null) {
+      computeIsochrone(); renderLayers();
+    }
+  };
+  const armyRerouteLight = () => {
+    if (typeof selectActiveHexModes === "function") selectActiveHexModes();
+    if (typeof rebuildAllRoutes === "function") rebuildAllRoutes();
+    renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
+    if (ISOCHRONE_MODE && isochroneSourceId != null) {
+      computeIsochrone(); renderLayers();
+    }
+  };
+
+  // Army length (miles). Number input, free-form. Above 6 mi the
+  // long-column doubling kicks in (visible in the sidebar tooltip).
+  const lenRow = document.createElement("div");
+  lenRow.className = "weight-row";
+  lenRow.innerHTML = `<span class="name" title="Length of the marching column in miles">Length (mi)</span>`
+    + `<input type="number" min="0" step="0.5" value="${ARMY_LENGTH_MI}" />`;
+  const lenInput = lenRow.querySelector("input");
+  lenInput.addEventListener("change", (e) => {
+    const v = parseFloat(e.target.value);
+    ARMY_LENGTH_MI = (isFinite(v) && v >= 0) ? v : 0;
+    e.target.value = ARMY_LENGTH_MI;
+    armyRerouteHeavy();
+  });
+  armyEl.appendChild(lenRow);
+
+  // Can-ford checkbox — gates FORD-mode emission entirely. Variants
+  // for both states are pre-baked, so this is the cheap path.
+  const fordRow = document.createElement("div");
+  fordRow.className = "layer-row";
+  fordRow.innerHTML = `<input type="checkbox" id="army-can-ford" ${ARMY_CAN_FORD ? "checked" : ""} />`
+    + `<label for="army-can-ford" title="When off, thin-river crossings are blocked entirely">Can ford</label>`;
+  fordRow.querySelector("input").addEventListener("change", (e) => {
+    ARMY_CAN_FORD = e.target.checked;
+    armyRerouteLight();
+  });
+  armyEl.appendChild(fordRow);
+
+  // Can-embark checkbox — gates NAVAL-mode emission entirely. Same
+  // cheap-path rationale as Can ford.
+  const embRow = document.createElement("div");
+  embRow.className = "layer-row";
+  embRow.innerHTML = `<input type="checkbox" id="army-can-embark" ${ARMY_CAN_EMBARK ? "checked" : ""} />`
+    + `<label for="army-can-embark" title="When off, boarding ships is blocked entirely">Can embark</label>`;
+  embRow.querySelector("input").addEventListener("change", (e) => {
+    ARMY_CAN_EMBARK = e.target.checked;
+    armyRerouteLight();
+  });
+  armyEl.appendChild(embRow);
+}
+
 // ----- Reachability (isochrone) panel -----
 function buildIsochroneControls() {
   isoEl.innerHTML = "";
@@ -848,6 +925,30 @@ function buildIsochroneControls() {
         renderLayers(); renderSelection();
         buildIsochroneControls();
       }
+    });
+  }
+}
+
+// Layers panel show/hide toggle.
+{
+  const tbtn = document.getElementById("layers-toggle");
+  const tpanels = document.getElementById("layers-panels");
+  if (tbtn && tpanels) {
+    tbtn.addEventListener("click", () => {
+      const isHidden = tpanels.classList.toggle("hidden");
+      tbtn.textContent = isHidden ? "Show layers" : "Hide layers";
+    });
+  }
+}
+
+// Army panel show/hide toggle.
+{
+  const tbtn = document.getElementById("army-toggle");
+  const tpanels = document.getElementById("army-panels");
+  if (tbtn && tpanels) {
+    tbtn.addEventListener("click", () => {
+      const isHidden = tpanels.classList.toggle("hidden");
+      tbtn.textContent = isHidden ? "Show army" : "Hide army";
     });
   }
 }

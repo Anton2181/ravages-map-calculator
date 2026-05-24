@@ -171,6 +171,7 @@ const layersEl    = document.getElementById("layers");
 // (legacy "endpoints" element removed in favor of #routes-list)
 const pathInfoEl  = document.getElementById("path-info");
 const weightsEl   = document.getElementById("weights");
+const armyEl      = document.getElementById("army");
 const colorsEl    = document.getElementById("colors");
 const lineEl      = document.getElementById("line-style");
 const isoEl       = document.getElementById("isochrone");
@@ -196,13 +197,58 @@ let forcedRoadWeights = Object.assign({}, DEFAULT_FORCED_ROAD_WEIGHTS);
 // computing a forced-march route segment. Neighbors / pixel topology
 // are identical, so HEX_MODE_NEIGHBORS is shared.
 let HEX_MODES_FORCED = null;
+// Pre-baked HEX_MODES catalogs for every army-permission combination
+// (can-ford × can-embark, 4 combos). Built once at weight-change time
+// alongside the default + forced graphs; toggling Can ford / Can embark
+// just swaps the active variant via selectActiveHexModes() — no
+// precompute, no dijkstra rebuild beyond what the route refresh needs.
+// Keys are 2-char strings: "F"|"_" for can-ford, "E"|"_" for can-embark
+// (e.g., "FE" = both on, "__" = both off, "F_" = ford only, "_E" = embark only).
+let HEX_MODES_VARIANTS = null;        // default-march variants
+let HEX_MODES_FORCED_VARIANTS = null; // forced-march variants
+
+// ── Army state ───────────────────────────────────────────────────────
+// Length of the marching column in miles. > 6 doubles all LAND weights
+// (the column drags through every hex twice — once for the head, once
+// for the tail). Default 5 = a baseline column; below the doubling
+// threshold but above zero so fording cost = length × 2.4 hours
+// instead of falling back to the static Fording weight.
+let ARMY_LENGTH_MI = 5;
+// Whether the army can ford a thin (green) river. When false, FORD
+// modes are not emitted into HEX_MODES, so dijkstra simply can't cross
+// thin rivers (it has to detour around them via a bridge or ferry).
+let ARMY_CAN_FORD = true;
+// Whether the army can board a ship. When false, NAVAL modes are not
+// emitted and dijkstra cannot leave land for water. Independent of
+// can-ford because boarding a ship and fording a river are different
+// real-world activities.
+let ARMY_CAN_EMBARK = true;
+// Land-cost multiplier driven by army length. 2 for long columns
+// (> 6 mi), 1 otherwise. Applied to LAND/ROAD mode costs at HEX_MODES
+// build time and to the per-edge cost in computeIsochrone.
+function armyLandMul() { return (ARMY_LENGTH_MI > 6) ? 2 : 1; }
+// Effective FORD-mode cost per crossing in IRL hours. When the user has
+// configured an army length, fording cost is column-length × 2.4 (the
+// time it takes for the whole column to cross). With no army (length=0)
+// we fall back to the static Fording weight from the weights table.
+function armyFordCost() {
+  if (ARMY_LENGTH_MI > 0) return ARMY_LENGTH_MI * 2.4;
+  return +weights["Fording"] || 0;
+}
 // Binary masks over the full map image. Built once after layers load.
-// ROAD_PIXEL_MASK  = roads.png ∪ citiestownsforts.png — used for the per-hex
-//                    road restriction.
-// RIVER_PIXEL_MASK = rivers.png alone — merged in with the road mask for
-//                    hexes flagged as BOTH road AND river, so the restriction
-//                    in a road+river hex follows either the road or the river.
+// ROAD_PIXEL_MASK       = roads.png ∪ citiestownsforts.png — used for the
+//                         per-hex road restriction (a city street counts as a
+//                         road for traversal purposes).
+// ROAD_ONLY_PIXEL_MASK  = roads.png alone, NO ctf. Used exclusively for
+//                         ferry detection: a hex is only a "ferry" if a
+//                         literal road (not a city) overlaps thick river
+//                         pixels. Cities sitting on rivers are not ferries.
+// RIVER_PIXEL_MASK      = rivers.png alone — merged in with the road mask for
+//                         hexes flagged as BOTH road AND river, so the
+//                         restriction in a road+river hex follows either
+//                         the road or the river.
 let ROAD_PIXEL_MASK = null;
+let ROAD_ONLY_PIXEL_MASK = null;
 let RIVER_PIXEL_MASK = null;
 // Per-pixel mask of river pixels that are TOO WIDE to ford — set by
 // buildThickRiverMask in buildPixelMasks. The route mask in routeThroughMask
@@ -868,7 +914,7 @@ function hexNeighbors(hid) {
 //   4. Save the downloaded `graph_cache.bin` next to neighbors.json.
 //   5. Subsequent loads skip the heavy precomputes.
 // ============================================================================
-const CACHE_VERSION = 11;
+const CACHE_VERSION = 13;
 const CACHE_MAGIC = "RVGCACHE";
 
 // ---- low-level writers ----
@@ -1167,6 +1213,7 @@ function _cacheManifest() {
     { name: "SUBHEX_ID_PX",                 type: "u32",         get: () => SUBHEX_ID_PX,                 set: v => { SUBHEX_ID_PX = v; } },
     { name: "HEX_PIXELS",                   type: "map_i_u32",   get: () => HEX_PIXELS,                   set: v => { HEX_PIXELS = v; } },
     { name: "ROAD_PIXEL_MASK",              type: "u8",          get: () => ROAD_PIXEL_MASK,              set: v => { ROAD_PIXEL_MASK = v; } },
+    { name: "ROAD_ONLY_PIXEL_MASK",         type: "u8",          get: () => ROAD_ONLY_PIXEL_MASK,         set: v => { ROAD_ONLY_PIXEL_MASK = v; } },
     { name: "RIVER_PIXEL_MASK",             type: "u8",          get: () => RIVER_PIXEL_MASK,             set: v => { RIVER_PIXEL_MASK = v; } },
     { name: "STRICT_RIVER_PIXEL_MASK",      type: "u8",          get: () => STRICT_RIVER_PIXEL_MASK,      set: v => { STRICT_RIVER_PIXEL_MASK = v; } },
     { name: "THICK_RIVER_PIXEL_MASK",       type: "u8",          get: () => THICK_RIVER_PIXEL_MASK,       set: v => { THICK_RIVER_PIXEL_MASK = v; } },
@@ -1494,37 +1541,79 @@ async function loadAll() {
 // on the assigned-weight rule, and cost values are weight-derived for
 // every mode. Routes need a rebuild after this to pick up changes.
 function recomputeHexModeGraph() {
-  // Default-weights pass — drives HEX_MODES, the per-pixel mode lookup
-  // arrays, and the neighbor graph used for everything except forced
-  // march segments.
-  precomputeHexModes();
-  precomputeHexModeNeighbors();
-  addComboModeNeighbors();
-  const defaultModes   = HEX_MODES;
-  const defaultPixKind = PIX_MODE_KIND;
-  const defaultPixComp = PIX_MODE_COMP;
-  // Forced-weights pass — swap the weight globals, re-run the per-hex
-  // mode catalog only (neighbors and pixel topology don't change because
-  // mode kinds + their pixel sets are weight-independent). Store the
-  // resulting HEX_MODES under HEX_MODES_FORCED so dijkstra can use it
-  // when a route segment is flagged forced. Restore defaults afterwards.
-  const _w = weights, _rw = roadWeights;
+  // Build 8 HEX_MODES variants — 4 army-permission combos
+  // (canFord × canEmbark) × 2 march modes (default / forced weights).
+  // Toggling Can ford / Can embark in the army panel then just swaps
+  // which variant HEX_MODES / HEX_MODES_FORCED point at, no recompute.
+  //
+  // The neighbor graph and the per-pixel PIX_MODE_KIND/PIX_MODE_COMP
+  // lookups are built once, on the most permissive variant ("FE" on
+  // default weights). Less permissive variants are strict subsets of
+  // that mode set, so dijkstra walking the neighbor graph harmlessly
+  // skips edges whose target mode isn't in the active variant
+  // (caught by the existing `if (!vInfo) continue` guard).
+  const _w  = weights, _rw = roadWeights;
+  const _cf = ARMY_CAN_FORD, _ce = ARMY_CAN_EMBARK;
+  // Build order ends on "FE" so PIX_MODE_KIND/COMP land in the most-
+  // permissive state.
+  const buildOrder = ["F_", "_E", "__", "FE"];
+  const permFlags  = { "FE": [true,  true],  "F_": [true,  false],
+                       "_E": [false, true],  "__": [false, false] };
+
+  // Forced-march variants first — we want default-FE to be the LAST
+  // call so the global pixel-lookup arrays + the neighbor graph reflect
+  // the default-weights / all-permissions catalog.
+  HEX_MODES_FORCED_VARIANTS = new Map();
   weights = forcedWeights;
   roadWeights = forcedRoadWeights;
-  precomputeHexModes();
-  HEX_MODES_FORCED = HEX_MODES;
+  for (const key of buildOrder) {
+    [ARMY_CAN_FORD, ARMY_CAN_EMBARK] = permFlags[key];
+    precomputeHexModes();
+    HEX_MODES_FORCED_VARIANTS.set(key, HEX_MODES);
+  }
+
+  // Default-march variants.
+  HEX_MODES_VARIANTS = new Map();
   weights = _w; roadWeights = _rw;
-  HEX_MODES     = defaultModes;
-  PIX_MODE_KIND = defaultPixKind;
-  PIX_MODE_COMP = defaultPixComp;
-  // Prune overrides whose pinned mode no longer exists after the rebuild
-  // (e.g., a weight change removed a kind from this hex). Without this,
-  // dijkstra would silently fail to find a path through the hex.
+  for (const key of buildOrder) {
+    [ARMY_CAN_FORD, ARMY_CAN_EMBARK] = permFlags[key];
+    precomputeHexModes();
+    HEX_MODES_VARIANTS.set(key, HEX_MODES);
+  }
+  // PIX_MODE_KIND / PIX_MODE_COMP now reflect the default-FE variant
+  // (last call). Build neighbors on top — every possible mode key is
+  // present here, so the resulting graph covers every variant.
+  precomputeHexModeNeighbors();
+  addComboModeNeighbors();
+
+  // Restore army permissions and activate the variant matching them.
+  ARMY_CAN_FORD = _cf;
+  ARMY_CAN_EMBARK = _ce;
+  selectActiveHexModes();
+
+  // Prune mode overrides whose pinned mode no longer exists in the
+  // ACTIVE variant. The override mode might exist in some other variant
+  // — keep it only if the user's currently-active permissions admit it.
   if (HEX_MODE_OVERRIDES && HEX_MODES) {
     for (const [hid, mode] of Array.from(HEX_MODE_OVERRIDES.entries())) {
       const modes = HEX_MODES.get(hid);
       if (!modes || !modes.has(mode)) HEX_MODE_OVERRIDES.delete(hid);
     }
+  }
+}
+
+// Swap HEX_MODES / HEX_MODES_FORCED to point at the variant matching
+// the current ARMY_CAN_FORD / ARMY_CAN_EMBARK flags. Cheap (a Map.get)
+// — call after toggling either army-permission checkbox instead of
+// rebuilding the mode graphs.
+function selectActiveHexModes() {
+  if (!HEX_MODES_VARIANTS) return;
+  const key = `${ARMY_CAN_FORD ? "F" : "_"}${ARMY_CAN_EMBARK ? "E" : "_"}`;
+  const v = HEX_MODES_VARIANTS.get(key);
+  if (v) HEX_MODES = v;
+  if (HEX_MODES_FORCED_VARIANTS) {
+    const vf = HEX_MODES_FORCED_VARIANTS.get(key);
+    if (vf) HEX_MODES_FORCED = vf;
   }
 }
 
@@ -1538,11 +1627,15 @@ function recomputeHexModeGraph() {
 // thin river) stay strict.
 function precomputeFerryHexes() {
   FERRY_HEXES = new Set();
-  if (!ROAD_PIXEL_MASK || !THICK_RIVER_PIXEL_MASK || !HEX_PIXELS) return;
+  // ROAD_ONLY_PIXEL_MASK (roads.png, no ctf) so a city or fort that
+  // happens to sit on a thick river isn't promoted to a ferry — only
+  // genuine road overlays mean the artwork drew a crossing.
+  const roadMask = ROAD_ONLY_PIXEL_MASK || ROAD_PIXEL_MASK;
+  if (!roadMask || !THICK_RIVER_PIXEL_MASK || !HEX_PIXELS) return;
   for (const [hid, pixels] of HEX_PIXELS.entries()) {
     for (let i = 0; i < pixels.length; i++) {
       const idx = pixels[i];
-      if (ROAD_PIXEL_MASK[idx] && THICK_RIVER_PIXEL_MASK[idx]) {
+      if (roadMask[idx] && THICK_RIVER_PIXEL_MASK[idx]) {
         FERRY_HEXES.add(hid);
         break;
       }
@@ -1960,8 +2053,14 @@ function precomputeHexModes() {
 
   for (const [hid, subs] of SUBHEXES_BY_HEX) {
     const hexT = canonicalHexTerrain(HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null);
-    const hexW = hexT ? +weights[hexT] : NaN;
-    const roadW = hexT ? +roadWeights[hexT] : NaN;
+    // Long-column penalty: when ARMY_LENGTH_MI > 6, double LAND/ROAD
+    // weights so the army's drag through each hex is paid for twice.
+    // Water terrains aren't affected — column length doesn't slow a
+    // fleet the way it slows a marching column.
+    const hexIsLand = hexT && !WATER_TERRAINS.has(hexT);
+    const landMul   = hexIsLand ? armyLandMul() : 1;
+    const hexW  = hexT ? (+weights[hexT]    * landMul) : NaN;
+    const roadW = hexT ? (+roadWeights[hexT] * landMul) : NaN;
 
     // Ferry hexes: the road segment in this hex is intentionally short
     // (just the run-up to a river crossing), so applying the usual
@@ -2003,6 +2102,10 @@ function precomputeHexModes() {
         // and road-pixel index list — those drive the ROAD / ROAD_FERRY
         // buckets — then walk again to do the per-pixel bucket assignment.
         const roadMask  = ROAD_PIXEL_MASK;
+        // Ferry-mark detection uses the road-only mask: a thick-river
+        // pixel must be overlaid with a genuine road (not a city) to
+        // count as a crossing.
+        const roadOnlyMask = ROAD_ONLY_PIXEL_MASK || ROAD_PIXEL_MASK;
         const thickMask = THICK_RIVER_PIXEL_MASK;
         let roadPixCount = 0;
         if (roadMask) {
@@ -2036,15 +2139,37 @@ function precomputeHexModes() {
             // crossable, going into ferrySet. Unmarked thick-river
             // pixels are blocked — left out of every bucket so they
             // contribute no graph node.
-            if (isRoadPix) ferrySet.add(p);
+            // The ferry overlay must be a real road (roads.png), not a
+            // city/town/fort pixel — those don't draw crossings.
+            const isRoadOnlyPix = !!(roadOnlyMask && roadOnlyMask[p]);
+            if (isRoadOnlyPix) ferrySet.add(p);
             continue;
           }
           if (isThinPix) {
-            // Thin (green) river pixel — its own FORD kind. Pulled out
-            // of LAND and ROAD entirely (the earlier "merge thin river
-            // into roadSet for bridging" hack is gone). Crossings are
-            // expressed via LAND+FORD / ROAD+FORD combos with the
-            // separate Fording surcharge.
+            // ── Bridge detection ─────────────────────────────────────
+            // A road that physically crosses a thin river is a bridge:
+            // a real road pixel (not a city) overlaying the river's
+            // strict (1-px) core lets the column cross at road cost,
+            // no fording surcharge.
+            //
+            // STRICT_RIVER_PIXEL_MASK is the alpha>230 mask — only the
+            // painted river core, no AA halo. Using it here (instead
+            // of the expanded thin mask) keeps a road running parallel
+            // to a river along the bank from accidentally registering
+            // as a continuous bridge via AA-pixel overlap.
+            //
+            // Road-only (no ctf) for the same reason ferries are: a
+            // city sitting on a river isn't a bridge, only a road
+            // overlay drawn by the artist counts.
+            const isRoadOnlyPix = !!(roadOnlyMask && roadOnlyMask[p]);
+            const isStrictRiverCore = !!(STRICT_RIVER_PIXEL_MASK && STRICT_RIVER_PIXEL_MASK[p]);
+            if (isRoadOnlyPix && isStrictRiverCore) {
+              landSet.add(p);
+              if (roadAccepted) roadSet.add(p);
+              continue;
+            }
+            // Otherwise it's a normal thin-river pixel — goes into the
+            // FORD bucket so crossings need the Fording surcharge.
             fordSet.add(p);
             continue;
           }
@@ -2121,14 +2246,19 @@ function precomputeHexModes() {
     emitComponents("ROAD", roadSet, roadW, false);
     const isHexNaval = hexT && WATER_TERRAINS.has(hexT);
     const navalW = isHexNaval ? hexW : +weights["Sea"];
-    if (navalSet.size > 0) {
+    // Naval modes are gated on ARMY_CAN_EMBARK — when off, the army
+    // cannot board a ship, so naval pixels become dead-ends and no
+    // route through them is possible.
+    if (navalSet.size > 0 && ARMY_CAN_EMBARK) {
       // Naval cost: if the hex's sheet terrain is itself naval, use that
       // weight (sailing). Otherwise this is a stranded naval subhex
       // inside a land hex; bill it at "Sea" weight.
       emitComponents("NAVAL", navalSet, navalW, false);
     }
     const ferrySurcharge = +weights["Ferry"]   || 0;
-    const fordSurcharge  = +weights["Fording"] || 0;
+    // Fording cost flips to length-driven when an army is configured;
+    // otherwise the static Fording weight is used.
+    const fordSurcharge  = armyFordCost();
     if (ferrySet.size > 0 && isFinite(ferrySurcharge) && ferrySurcharge >= 0) {
       // ROAD_FERRY = the painted ferry-mark pixels of this hex (road
       // overlaid on thick river). Single-mode cost = the ferry
@@ -2136,7 +2266,9 @@ function precomputeHexModes() {
       // the road/land bank still pays its own cost via combo).
       emitComponents("ROAD_FERRY", ferrySet, ferrySurcharge, true);
     }
-    if (fordSet.size > 0 && isFinite(fordSurcharge) && fordSurcharge >= 0) {
+    // FORD is similarly gated on ARMY_CAN_FORD; off means no thin-river
+    // crossings exist in the graph at all.
+    if (fordSet.size > 0 && isFinite(fordSurcharge) && fordSurcharge >= 0 && ARMY_CAN_FORD) {
       // FORD = thin (green) river pixels of this hex. Separate kind
       // from ROAD_FERRY, separate weight ("Fording").
       emitComponents("FORD", fordSet, fordSurcharge, false);
@@ -2181,8 +2313,18 @@ function precomputeHexModes() {
     // — e.g., Ferry surcharge defaulting to 0 — still participate in
     // combos. Without this ROAD_FERRY would silently vanish from every
     // combo when Ferry weight is 0.
-    const presentKinds = kindList.filter(k =>
-      kindSets[k].size > 0 && isFinite(baseCosts[k]) && baseCosts[k] >= 0);
+    // Army-permission gates: when the army can't ford / embark, drop
+    // FORD / NAVAL from the constituent set so no combo (LAND+FORD,
+    // ROAD+FORD, NAVAL+anything…) carries the forbidden traversal.
+    // Without this, dijkstra would still pick a LAND+FORD combo and
+    // cross the river even though the standalone FORD mode was gated.
+    const presentKinds = kindList.filter(k => {
+      if (kindSets[k].size === 0) return false;
+      if (!isFinite(baseCosts[k]) || baseCosts[k] < 0) return false;
+      if (k === "FORD"  && !ARMY_CAN_FORD)   return false;
+      if (k === "NAVAL" && !ARMY_CAN_EMBARK) return false;
+      return true;
+    });
     const nKinds = presentKinds.length;
     if (nKinds >= 2) {
       for (let mask = 1; mask < (1 << nKinds); mask++) {
@@ -2562,6 +2704,9 @@ function buildBinaryMaskFromLayers(layerIds, alphaThreshold) {
 // hexes flagged as BOTH road AND river.
 function buildPixelMasks() {
   ROAD_PIXEL_MASK  = buildBinaryMaskFromLayers(["roads", "ctf"]);
+  // Roads-only variant for ferry detection — cities/towns/forts
+  // sitting on a thick river should NOT promote that hex to a ferry.
+  ROAD_ONLY_PIXEL_MASK = buildBinaryMaskFromLayers(["roads"]);
   RIVER_PIXEL_MASK = buildBinaryMaskFromLayers(["rivers"]);
   // Thickness is computed from a STRICTER river mask that only counts strongly
   // opaque pixels. The rivers.png artwork uses anti-aliasing, so a line drawn
@@ -2780,6 +2925,44 @@ function buildThinRiverExpandedMask(strictMask, thickMask) {
         else if (xR && yU && src[i - W + 1]) touches = true;
         else if (xL && yU && src[i - W - 1]) touches = true;
         if (touches) out[i] = 1;
+      }
+    }
+  }
+  // ── Diagonal-gap closing ─────────────────────────────────────────────
+  // The artwork frequently draws a thin river as a 1-pixel staircase:
+  // a sequence of pixels that step diagonally with no orthogonal river
+  // connection. The flood-fill corner-cut rule in precomputeHexModes
+  // blocks land paths from cutting THROUGH such a pair (because either
+  // orthogonal corner of the diagonal step is itself a river pixel),
+  // but if the river has a one-pixel BREAK in the middle of the
+  // staircase, the gap pixel has no river data at all and the
+  // corner-cut check sees nothing — land flood-fill happily steps
+  // across the river.
+  //
+  // Close those gaps: any non-thin pixel that has thin-river 8-neighbors
+  // in opposite positions (N+S, E+W, NW+SE, NE+SW) gets promoted to
+  // thin-river. Two iterations so a 2-px gap also closes. Bounded by
+  // not-thick / not-strict invariants. Doesn't touch the rendered
+  // overlay since strict/thick masks aren't mutated.
+  for (let iter = 0; iter < 2; iter++) {
+    const src = new Uint8Array(out);
+    for (let y = 1; y < H - 1; y++) {
+      const row = y * W;
+      for (let x = 1; x < W - 1; x++) {
+        const i = row + x;
+        if (out[i]) continue;
+        if (thickMask && thickMask[i]) continue;
+        const n  = src[i - W];
+        const s  = src[i + W];
+        const e  = src[i + 1];
+        const wp = src[i - 1];
+        const ne = src[i - W + 1];
+        const nw = src[i - W - 1];
+        const se = src[i + W + 1];
+        const sw = src[i + W - 1];
+        if ((n && s) || (e && wp) || (ne && sw) || (nw && se)) {
+          out[i] = 1;
+        }
       }
     }
   }
@@ -3073,9 +3256,21 @@ function computeIsochrone() {
       if (!vTerrain) continue;
       const vIsWater = WATER_TERRAINS.has(vTerrain);
       const vHasRoad = HEX_ROAD && HEX_ROAD.get(v);
-      const w = (uIsWater !== vIsWater)
-        ? (+weights["Embark"])
-        : (+(vHasRoad ? roadWeights : weights)[vTerrain]);
+      let w;
+      if (uIsWater !== vIsWater) {
+        // Land↔water crossing — costs an Embark (or Disembark, which is
+        // free under the default cost model). Blocked entirely when the
+        // army can't board ships.
+        if (!ARMY_CAN_EMBARK) continue;
+        w = +weights["Embark"];
+      } else {
+        const baseW = +(vHasRoad ? roadWeights : weights)[vTerrain];
+        // Long-column penalty doubles the per-hex traversal weight on
+        // land. Water doesn't drag — fleet length doesn't slow a
+        // crossing the way column length slows a march.
+        const isLand = !vIsWater;
+        w = baseW * (isLand ? armyLandMul() : 1);
+      }
       if (!isFinite(w) || w <= 0) continue;
       const nd = d + w;
       if (nd > ISOCHRONE_BUDGET) continue;
@@ -4757,7 +4952,8 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
   // intermediate waypoint and running A* segment-by-segment achieves
   // that without restricting the mask itself.
   const markWaypoints = [];
-  if (HEX_PIXELS && ROAD_PIXEL_MASK && THICK_RIVER_PIXEL_MASK) {
+  const ferryRoadMask = ROAD_ONLY_PIXEL_MASK || ROAD_PIXEL_MASK;
+  if (HEX_PIXELS && ferryRoadMask && THICK_RIVER_PIXEL_MASK) {
     for (const [hex, mode] of modePath) {
       const info = HEX_MODES.get(hex)?.get(mode);
       if (!info) continue;
@@ -4766,11 +4962,13 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
       if (!isFerryMode) continue;
       const hexAllPx = HEX_PIXELS.get(hex);
       if (!hexAllPx) continue;
-      // Find road+thick (ferry-mark) pixels of this hex and average.
+      // Find road-only + thick (ferry-mark) pixels of this hex and average.
+      // Road-only mask (not the road+ctf mask) is the correct definition
+      // of a ferry mark — a city sitting on a river doesn't draw one.
       let sumX = 0, sumY = 0, count = 0;
       for (let i = 0; i < hexAllPx.length; i++) {
         const p = hexAllPx[i];
-        if (ROAD_PIXEL_MASK[p] && THICK_RIVER_PIXEL_MASK[p]) {
+        if (ferryRoadMask[p] && THICK_RIVER_PIXEL_MASK[p]) {
           const py = (p / W) | 0;
           sumX += p - py * W; sumY += py; count++;
         }
@@ -6828,6 +7026,7 @@ function handleClick(e) {
 (async () => {
   buildLayerControls();
   buildWeightControls();
+  buildArmyControls();
   buildColorControls();
   buildLineControls();
   buildIsochroneControls();
