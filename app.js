@@ -2394,6 +2394,13 @@ function precomputeHexModes() {
         // any combo that contains BOTH so dijkstra can't use a river
         // mouth as a free river→sea (or sea→river) transition.
         if (kinds.indexOf("FORD") >= 0 && kinds.indexOf("NAVAL") >= 0) continue;
+        // ── ROAD_FERRY↔NAVAL GUARD ───────────────────────────────────
+        // A ferry IS already a naval crossing of a thick river; combining
+        // ROAD_FERRY with NAVAL in the same combo just produces a
+        // redundant node whose pixel union is the ferry blob plus any
+        // sea pixels, at sum-cost ferry+naval — never the right way to
+        // model anything. Drop any combo that contains BOTH.
+        if (kinds.indexOf("ROAD_FERRY") >= 0 && kinds.indexOf("NAVAL") >= 0) continue;
         // LAND+NAVAL (and any other NAVAL + non-NAVAL) combo is now
         // emitted at every coastal hex so dijkstra has a real
         // transition-zone node to pick for embark / disembark routes.
