@@ -72,7 +72,11 @@ function buildLayerControls() {
   }
 }
 
-const WEIGHT_LABELS = { "Embark": "Embark / disembark" };
+const WEIGHT_LABELS = {
+  // Override map for friendlier names — left empty now. The CLASSES list
+  // already has good bare names (Embark, Disembark, Ferry, Fording);
+  // tooltips on the inputs cover what each one means.
+};
 function buildWeightControls() {
   weightsEl.innerHTML = "";
   // Header row above the two input columns.
@@ -89,10 +93,13 @@ function buildWeightControls() {
     row.className = "weight-row";
     const label = WEIGHT_LABELS[cls] || cls;
     row.innerHTML = `<span class="swatch ${cls}"></span><span class="name">${escapeHtml(label)}</span>`
-      + `<input type="number" min="0" step="0.5" value="${weights[cls]}" data-col="default" />`
-      + `<input type="number" min="0" step="0.5" value="${roadWeights[cls]}" data-col="road" />`;
+      + `<input type="number" min="0" step="any" value="${weights[cls]}" data-col="default" />`
+      + `<input type="number" min="0" step="any" value="${roadWeights[cls]}" data-col="road" />`;
     const inputs = row.querySelectorAll("input");
     const reroute = () => {
+      // Weight changes affect the hex-mode graph (LAND passability rule
+      // + per-mode costs), so rebuild that layer before rerouting.
+      if (typeof recomputeHexModeGraph === "function") recomputeHexModeGraph();
       if (ROUTES.length > 0) {
         recomputePath(); renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
       }
@@ -136,6 +143,26 @@ function updateEndpoints() {
     const card = document.createElement("div");
     card.className = "route-card" + (route.id === ACTIVE_ROUTE_ID ? " active" : "");
     card.style.borderLeftColor = rgbCss(route.color);
+    card.title = "Double-click to fit the camera to this route";
+    // Double-click anywhere on the card frame (but NOT on an inner control
+    // that has its own dblclick handler — those stop propagation) pans
+    // and zooms the camera so the route fills the stage. Picked from the
+    // card-level dblclick so the user can dbl-click whitespace, the
+    // header label, the stats area, etc.
+    card.addEventListener("dblclick", (e) => {
+      // Don't fire when the user is double-clicking an input/editable
+      // value inside the card (the alpha-val makeEditable handler etc.)
+      // or when they're dbl-clicking a control like the delete (×) or
+      // waypoint-delete buttons.
+      const tag = (e.target && e.target.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      const cls = e.target && e.target.classList;
+      if (cls && (cls.contains("editable-val") ||
+                  cls.contains("route-del") ||
+                  cls.contains("wp-del") ||
+                  cls.contains("route-color"))) return;
+      if (typeof fitCameraToRoute === "function") fitCameraToRoute(route);
+    });
 
     // Header: swatch, label, "make active" click target, delete button.
     const header = document.createElement("div");
@@ -195,7 +222,7 @@ function updateEndpoints() {
       const dist = fmtMiKm(t.miles, t.km);
       let h = `<div class="row"><span>Hexes</span><span>${t.hexes}</span></div>`
             + `<div class="row"><span>Distance</span><span>${dist}</span></div>`
-            + `<div class="row"><span>Cost</span><span>${t.cost.toFixed(1)}</span></div>`;
+            + `<div class="row"><span>IRL Hours</span><span>${t.cost.toFixed(1)}</span></div>`;
       if (t.embarks)     h += `<div class="row"><span>Embarks</span><span>${t.embarks}</span></div>`;
       if (t.ferries)     h += `<div class="row"><span>Ferries</span><span>${t.ferries}</span></div>`;
       if (!t.reachable)  h += `<div class="row reach"><span>Path</span><span>unreachable</span></div>`;
@@ -255,10 +282,18 @@ function updateEndpoints() {
             : "";
 
           // Start of the whole route is free; otherwise show this hex's
-          // per-hex cost contribution.
+          // per-hex cost contribution. Sub-threshold hexes (line spent
+          // fewer than MIN_PIXELS_PER_PATH_HEX px in them) get a "free"
+          // tag and cost 0 — the line just brushed through, not enough
+          // to count as a real hex traversal.
+          const subThreshold = !!(seg.subThresholdHexes && seg.subThresholdHexes.has(hid));
+          const pxCount = seg.hexPxCount ? seg.hexPxCount.get(hid) : null;
           let costStr;
           if (k === 0) {
             costStr = `<span class="cost free">start</span>`;
+          } else if (subThreshold) {
+            const pxStr = (pxCount != null) ? ` (${pxCount}px)` : "";
+            costStr = `<span class="cost free" title="Line crossed only${pxStr} — below the min-px-per-hex threshold, so this hex is free">free${pxStr}</span>`;
           } else if (isFinite(w)) {
             costStr = `<span class="cost">${(+w).toFixed(2)}</span>`;
           } else {
@@ -305,7 +340,7 @@ function updatePathInfo() {
         + `<div class="row"><span>Waypoints</span><span>${t.waypoints}</span></div>`
         + `<div class="row"><span>Hexes</span><span>${t.hexes}</span></div>`
         + `<div class="row"><span>Distance</span><span>${dist}</span></div>`
-        + `<div class="row"><span>Cost</span><span>${t.cost.toFixed(1)}</span></div>`;
+        + `<div class="row"><span>IRL Hours</span><span>${t.cost.toFixed(1)}</span></div>`;
   if (t.embarks) h += `<div class="row"><span>Embarks</span><span>${t.embarks}</span></div>`;
   if (t.ferries) h += `<div class="row"><span>Ferries</span><span>${t.ferries}</span></div>`;
   h += `</div>`;
@@ -344,6 +379,38 @@ document.getElementById("undo-waypoint").addEventListener("click", () => {
   }
 });
 document.getElementById("clear-sel").addEventListener("click", clearSelection);
+
+// Save / Load routes. Save downloads a JSON file; Load opens a file picker
+// (the hidden <input type=file> next to the button) and replaces the
+// current ROUTES with the contents of the chosen file.
+document.getElementById("save-routes").addEventListener("click", () => {
+  if (ROUTES.length === 0) {
+    alert("No routes to save.");
+    return;
+  }
+  try { saveRoutesToFile(); }
+  catch (e) {
+    console.error("Save routes failed:", e);
+    alert("Save routes failed: " + (e && e.message ? e.message : e));
+  }
+});
+const _loadInput = document.getElementById("load-routes-input");
+document.getElementById("load-routes").addEventListener("click", () => {
+  // Clear value so picking the SAME file twice still fires "change".
+  _loadInput.value = "";
+  _loadInput.click();
+});
+_loadInput.addEventListener("change", async (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  try {
+    await loadRoutesFromFile(f);
+    updateEndpoints(); updatePathInfo(); updateStatus(); renderSelection();
+  } catch (err) {
+    console.error("Load routes failed:", err);
+    alert("Load routes failed: " + (err && err.message ? err.message : err));
+  }
+});
 window.addEventListener("keydown", (e) => {
   // Escape clears everything; Ctrl/Cmd-Z pops the last waypoint of the active
   // route (with full route-drop on the last waypoint). Ignored when focus is
@@ -444,6 +511,10 @@ function buildLineControls() {
   const mpLabel  = mpRow.querySelector(".alpha-val");
   const applyMp = () => {
     mpLabel.textContent = MIN_PIXELS_PER_PATH_HEX + "px";
+    // The threshold gates road-component → ROAD vs LAND assignment in
+    // the hex-mode graph, so the mode graph must rebuild before any
+    // route recompute would see the new rule.
+    if (typeof recomputeHexModeGraph === "function") recomputeHexModeGraph();
     if (ROUTES.length > 0) {
       recomputePath(); renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
     }
@@ -589,6 +660,30 @@ function buildLineControls() {
     renderSelection();
   });
   lineEl.appendChild(dbgSubhexTypesRow);
+
+  // Graph-cache dump button. Builds a binary snapshot of every heavy
+  // precompute output (pixel index, masks, per-hex pixel lists, subhex
+  // components, blocked edges, component neighbors) and downloads it as
+  // `graph_cache.bin`. Save the downloaded file next to neighbors.json;
+  // subsequent page loads will fetch it and skip the precompute work
+  // (the hex-mode graph still rebuilds — it depends on weights). Bump
+  // CACHE_VERSION in app.js and re-dump if you change precompute logic.
+  const cacheRow = document.createElement("div");
+  cacheRow.className = "button-row";
+  cacheRow.style.marginTop = "8px";
+  cacheRow.innerHTML = `<span class="button" id="dump-graph-cache" title="Save the heavy precompute outputs to graph_cache.bin so the next load skips them">Dump graph cache</span>`;
+  cacheRow.querySelector("#dump-graph-cache").addEventListener("click", () => {
+    if (typeof dumpGraphCache === "function") {
+      try { dumpGraphCache(); }
+      catch (e) {
+        console.error("Cache dump failed:", e);
+        alert("Cache dump failed: " + (e && e.message ? e.message : e));
+      }
+    } else {
+      alert("dumpGraphCache not available — app.js may not have finished loading.");
+    }
+  });
+  lineEl.appendChild(cacheRow);
 }
 
 // Settings panel show/hide toggle.

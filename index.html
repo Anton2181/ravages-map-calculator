@@ -29,6 +29,11 @@
         <span class="button" id="undo-waypoint" title="Undo last waypoint (Ctrl+Z)">Undo</span>
         <span class="button" id="clear-sel">Clear all</span>
       </div>
+      <div class="button-row" style="margin-bottom:8px;">
+        <span class="button" id="save-routes" title="Download all routes as a JSON file">Save routes</span>
+        <span class="button" id="load-routes" title="Load routes from a JSON file">Load routes</span>
+        <input type="file" id="load-routes-input" accept="application/json,.json" style="display:none" />
+      </div>
       <div id="routes-list"></div>
       <div id="path-info"></div>
     </div>
@@ -71,6 +76,7 @@
     <canvas id="map-canvas"></canvas>
     <canvas id="hl-canvas"></canvas>
     <div id="hover-tooltip" class="hidden"></div>
+    <div id="mode-picker" class="hidden"></div>
     <div id="status">—</div>
     <div id="loading">Loading map data…</div>
   </div>

@@ -4,7 +4,7 @@ const LAYERS = [
   { id: "sea",         file: "sea.png",                 label: "Sea fill",               on: true,  opacity: 1.00, hidden: true },
   { id: "continent",   file: "Continent Meat.png",      label: "Outline",                on: true,  opacity: 1.00 },
   { id: "terrain",     file: "Terrain.png",             label: "Terrain",                on: true,  opacity: 1.00 },
-  { id: "borders",     file: "Borders.png",             label: "Borders",                on: false, opacity: 1.00 },
+  { id: "borders",     file: "Borders_clean.png",       label: "Borders",                on: false, opacity: 1.00, prerasterise: true },
   { id: "core",        file: "core commanderies.png",      label: "Core commanderies",      on: false, opacity: 1.00 },
   { id: "frontier",    file: "frontier commanderies.png",  label: "Frontier commanderies",  on: false, opacity: 1.00 },
   { id: "provinces",   file: "provinces commanderies.png", label: "Province commanderies",  on: false, opacity: 1.00 },
@@ -23,19 +23,29 @@ const LAYERS = [
 // "extra-heavy mountain" tier). Those are resolved via canonicalSubhexClass
 // below — never as separate weight columns — so the sheet stays the
 // single source of truth for what land classes exist.
-const CLASSES = ["Flatlands", "Hills", "Mountains", "Lake", "Sea", "Ocean", "Embark", "Ferry"];
+const CLASSES = ["Flatlands", "Hills", "Mountains", "Lake", "Sea", "Ocean", "Embark", "Disembark", "Ferry", "Fording"];
 const DEFAULT_WEIGHTS = {
-  "Flatlands": 1, "Hills": 2, "Mountains": 5,
-  // Water hex traversal weights (used directly when sailing water->water).
-  // Sailing is faster than overland, so lakes and seas are cheap; ocean
-  // is the slowest water but still cheaper than rough land.
-  "Lake": 0.5, "Sea": 0.5, "Ocean": 1,
-  // Embark — land <-> water boundary crossing (loading or unloading a ship).
-  "Embark": 3,
-  // Ferry — surcharge added in dijkstraSubhexPath when a subhex-pair edge
-  // crosses (or uses) a thick-river pixel inside a road-flagged hex. Models
-  // the time / cost of waiting for and riding the ferry across the river.
-  "Ferry": 4,
+  "Flatlands": 30, "Hills": 30, "Mountains": 60,
+  // Water traversal weights (used directly when sailing water -> water).
+  // All naval classes share the same cost — Lake/Sea/Ocean merged at 2.5.
+  // Cheap relative to overland because ships move much faster than a
+  // land party.
+  "Lake": 2.5, "Sea": 2.5, "Ocean": 2.5,
+  // Embark — boarding a ship (land -> water). Heavy: 7.
+  "Embark": 7,
+  // Disembark — leaving a ship (water -> land). Allowed only at a hex
+  // flagged Stronghold; cost defaults to 0 because the time-penalty is
+  // baked into the Embark surcharge on the way out.
+  "Disembark": 0,
+  // Ferry — surcharge for crossing a RED (thick) river. Only available
+  // where the artwork paints a road overlay on the river (the "ferry
+  // mark"); unmarked thick river is impassable. Defaults to 0 (free) —
+  // the time-penalty for actually using a marked ferry is small enough
+  // that the modeled cost is just the road/land bank traversal.
+  "Ferry": 0,
+  // Fording — surcharge for crossing a GREEN (thin) river. Thin rivers
+  // are fordable anywhere they appear (green-overlay pixels).
+  "Fording": 5,
 };
 // Road column of the traversal-weight matrix. When dijkstra routes via
 // a road COMPONENT, we use THIS table's value keyed by the parent hex's
@@ -44,11 +54,16 @@ const DEFAULT_WEIGHTS = {
 // use the default column (a road doesn't help you load a ship or sail
 // faster).
 const DEFAULT_ROAD_WEIGHTS = {
-  "Flatlands": 0.5, "Hills": 1, "Mountains": 2,
-  // Water and embark mirror the default column (roads don't help shipping).
-  "Lake": 0.5, "Sea": 0.5, "Ocean": 1,
-  "Embark": 3,
-  "Ferry": 4,
+  // Roads flatten the per-terrain cost to a single value (15) regardless of
+  // the underlying Flatlands/Hills/Mountains class — a paved imperial road
+  // moves a party at the same pace whether it runs through valley or pass.
+  "Flatlands": 15, "Hills": 15, "Mountains": 15,
+  // Water and embark/disembark mirror the default column.
+  "Lake": 2.5, "Sea": 2.5, "Ocean": 2.5,
+  "Embark": 7,
+  "Disembark": 0,
+  "Ferry": 0,
+  "Fording": 5,
 };
 
 // Class aliases — resolved before any weight lookup. The subhex artwork
@@ -195,6 +210,66 @@ let SUBHEX_COMPONENT_COUNT = null;       // Map<subhexId, number of components>
 // "skip road components smaller than MIN_PIXELS_PER_PATH_HEX") consult the
 // component's actual artwork size without rescanning pixels.
 let SUBHEX_COMPONENT_PIXEL_COUNT = null;  // Map<"sid:comp", number of pixels>
+// Full pixel-index list per (subhex, component). Captured at flood-fill
+// time so the per-hex MODE pixel sets can be assembled cheaply by union
+// without rescanning the bbox. Feeds the (hex, mode) graph the mode-based
+// dijkstra runs on.
+let SUBHEX_COMPONENT_PIXELS = null;       // Map<"sid:comp", Uint32Array of pixel indices>
+
+// ---------- Hex-mode graph (the layer dijkstra actually runs on) ----------
+// Each hex contributes up to four MODE nodes representing distinct
+// traversal patterns through the hex. dijkstra picks the cheapest
+// sequence of (hex, mode) nodes; the renderer draws the line through
+// the chosen modes' pixel sets directly — no tier escalation, no mask
+// broadening.
+//
+// Mode catalog (fixed):
+//   LAND        — non-road, non-naval pixels of land subhexes that pass
+//                 the assigned-weight rule (subhex class weight ≤ parent
+//                 hex's terrain weight). Heavier subhexes are excluded.
+//   ROAD        — road / city pixels that DO NOT touch thick river, and
+//                 whose owning road component has at least
+//                 MIN_PIXELS_PER_PATH_HEX pixels. Tiny road scraps fall
+//                 through into LAND (no road discount for them).
+//   NAVAL       — naval-class subhex pixels (Sea / Lake / Ocean) that
+//                 aren't blocked by thick river.
+//   ROAD_FERRY  — road / city pixels that DO touch thick river. Only
+//                 ferry hexes produce these. Cost = road weight + Ferry
+//                 surcharge, baked in (so dijkstra optimises for the
+//                 same number the UI displays).
+//
+// HEX_MODES: Map<hex_id, Map<mode_name, modeInfo>>
+//   modeInfo = { mode, kind, pixels: Uint32Array, cost: number, isFerry: bool }
+//   `mode` is the unique per-hex name like "LAND#0", "LAND#1", "ROAD#0".
+//   `kind` is the underlying class ("LAND" / "ROAD" / "NAVAL" / "ROAD_FERRY").
+//   Each kind's pixel bucket inside the hex is flood-filled into
+//   8-connected components — so a hex whose land is split by a thick river
+//   gets two LAND nodes (LAND#0, LAND#1) with no in-hex edge between them,
+//   and dijkstra can't teleport across.
+//
+// HEX_MODE_NEIGHBORS: Map<"hex:mode", Set<"hex:mode">>
+//   An edge means dijkstra can move from one to the other AND the renderer
+//   can draw a line that does so (8-connected pixel-adjacency, no
+//   corner-cut). Both intra-hex (transition between modes inside a hex)
+//   and cross-hex (border crossings) are encoded here.
+let HEX_MODES = null;
+let HEX_MODE_NEIGHBORS = null;
+// Debug feature — manual override of which mode dijkstra is allowed to use
+// for a specific hex. Map<hex_id, mode_name>. When set, dijkstraHexModePath
+// skips edges into or out of any non-override mode of that hex, effectively
+// forcing the path to traverse the hex via the chosen mode (or fail to
+// reach it). Persisted only in memory; set via the right-click menu on the
+// map. Useful for probing "what if dijkstra had picked combo X for this
+// hex" without changing weights.
+let HEX_MODE_OVERRIDES = new Map();
+// Per-pixel mode index — populated by precomputeHexModes. Lets
+// precomputeHexModeNeighbors and hexModeAtPixel resolve "which mode-node
+// owns this pixel" in O(1). 0 means "no mode" (water barrier, off-map).
+// Component index is per-(hex, kind) — same as the suffix in the mode name.
+let PIX_MODE_KIND = null;  // Uint8Array: 0 none, 1 LAND, 2 ROAD, 3 NAVAL, 4 ROAD_FERRY, 5 FORD
+let PIX_MODE_COMP = null;  // Uint16Array: component index within (hex, kind)
+const MODE_KIND_NAMES = ["", "LAND", "ROAD", "NAVAL", "ROAD_FERRY", "FORD"];
+const MODE_KIND_NUMS  = { LAND: 1, ROAD: 2, NAVAL: 3, ROAD_FERRY: 4, FORD: 5 };
 // Per-(subhex,component) adjacency map. Keys are "subhexId:compId" node
 // strings; values are Sets of neighbor node strings reachable across a clear
 // (non-thick) border pixel pair. Used by the component-aware Dijkstra.
@@ -260,6 +335,12 @@ let HEX_HAS_ROAD = null;
 // that runs in some other direction — only road subhexes on the dijkstra
 // path get the road discount, not the whole hex.
 let ROAD_SUBHEXES = null;
+// Pre-computed set of SUBHEX ids that contain at least one river pixel.
+// (rivers.png — thick or thin, no distinction). Used by the ferry road+river
+// subhex tier in restrict(): inside a ferry hex, if road-only fill fails to
+// reach From->To, broaden to every pixel of every road OR river subhex of
+// the hex before falling back to a full-hex restore.
+let RIVER_SUBHEXES = null;
 // Per-hex pixel lists in FULL-IMAGE coordinates. Let routeThroughMask skip
 // the per-route bbox scan entirely — we iterate only the pixels that belong
 // to relevant hexes, not the whole bbox (which on a long route can be 5-10×
@@ -337,6 +418,177 @@ function loadImage(src) {
     img.onerror = () => reject(new Error("Failed to load " + src));
     img.src = src;
   });
+}
+
+
+// ============================================================================
+// Minimal pure-JS PNG decoder — used for layers tagged with `prerasterise`
+// (e.g. Borders.png) where the browser's <img> and createImageBitmap
+// decoders both binarise partial-alpha pixels to 0/255 despite the
+// colorSpaceConversion/premultiplyAlpha hints. By owning the decode we
+// hand `putImageData` the literal RGBA bytes from the PNG IDAT — no
+// gamma, no premultiplication, no colour-space surgery.
+//
+// Scope: 8-bit / channel, non-interlaced, colour-type 6 (RGBA). The
+// loader catches a throw and falls back to the createImageBitmap path
+// for any PNG outside this slice, so we don't have to handle palette,
+// 16-bit, grayscale, or Adam7 interlace.
+//
+// Uses DecompressionStream("deflate") — available in every modern
+// browser, no zlib dependency.
+// ============================================================================
+async function decodePngRgba(bytes) {
+  // PNG signature
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (bytes.length < 8) throw new Error("PNG: too short");
+  for (let i = 0; i < 8; i++) {
+    if (bytes[i] !== sig[i]) throw new Error("PNG: bad signature");
+  }
+  let offset = 8;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let width = 0, height = 0, bitDepth = 0, colorType = 0, interlace = 0;
+  const idatChunks = [];
+  let totalIdat = 0;
+  while (offset < bytes.length) {
+    if (offset + 8 > bytes.length) throw new Error("PNG: truncated chunk header");
+    const length = dv.getUint32(offset, false); offset += 4;
+    const type =
+      String.fromCharCode(bytes[offset]) +
+      String.fromCharCode(bytes[offset + 1]) +
+      String.fromCharCode(bytes[offset + 2]) +
+      String.fromCharCode(bytes[offset + 3]);
+    offset += 4;
+    if (offset + length + 4 > bytes.length) throw new Error("PNG: truncated chunk body (" + type + ")");
+    if (type === "IHDR") {
+      width      = dv.getUint32(offset, false);
+      height     = dv.getUint32(offset + 4, false);
+      bitDepth   = bytes[offset + 8];
+      colorType  = bytes[offset + 9];
+      // bytes+10 compression, +11 filter — both must be 0 per spec.
+      interlace  = bytes[offset + 12];
+    } else if (type === "IDAT") {
+      // Capture (subarray, no copy) — we'll splice them into a single
+      // stream input below.
+      idatChunks.push(bytes.subarray(offset, offset + length));
+      totalIdat += length;
+    } else if (type === "IEND") {
+      break;
+    }
+    offset += length + 4; // skip data + CRC
+  }
+  if (bitDepth !== 8) throw new Error("PNG: unsupported bit depth " + bitDepth);
+  if (colorType !== 6) throw new Error("PNG: unsupported colour type " + colorType + " (need RGBA)");
+  if (interlace !== 0) throw new Error("PNG: interlace not supported");
+  if (idatChunks.length === 0) throw new Error("PNG: no IDAT");
+
+  // Glue the IDAT payloads into one zlib stream.
+  const zlib = new Uint8Array(totalIdat);
+  {
+    let o = 0;
+    for (const c of idatChunks) { zlib.set(c, o); o += c.length; }
+  }
+
+  // DecompressionStream("deflate") expects a zlib-wrapped deflate stream
+  // (which is what PNG's IDAT payload is — 2-byte zlib header + DEFLATE
+  // + 4-byte Adler32). Modern browsers accept it as-is; some older ones
+  // want raw deflate. Try "deflate" first, fall back to "deflate-raw" by
+  // stripping the 2-byte header.
+  let inflated;
+  try {
+    inflated = await _inflate(zlib, "deflate");
+  } catch (e) {
+    // Strip zlib header + trailer and retry with deflate-raw.
+    if (zlib.length < 6) throw e;
+    const raw = zlib.subarray(2, zlib.length - 4);
+    inflated = await _inflate(raw, "deflate-raw");
+  }
+
+  // Unfilter. PNG RGBA 8-bit: each scanline is 1 filter byte + width*4 data bytes.
+  const bpp = 4;             // bytes per pixel (RGBA)
+  const stride = width * bpp;
+  const expected = height * (stride + 1);
+  if (inflated.length < expected) {
+    throw new Error("PNG: inflated stream short — expected " + expected + " got " + inflated.length);
+  }
+  const out = new Uint8ClampedArray(width * height * 4);
+  let inPos = 0;
+  let prevRow = new Uint8Array(stride); // all zeros for first row
+  const curRow = new Uint8Array(stride);
+  for (let y = 0; y < height; y++) {
+    const filter = inflated[inPos++];
+    // Copy raw scanline (still-filtered) into curRow.
+    for (let i = 0; i < stride; i++) curRow[i] = inflated[inPos + i];
+    inPos += stride;
+    switch (filter) {
+      case 0: // None
+        break;
+      case 1: // Sub: x + left
+        for (let i = bpp; i < stride; i++) {
+          curRow[i] = (curRow[i] + curRow[i - bpp]) & 0xff;
+        }
+        break;
+      case 2: // Up: x + above
+        for (let i = 0; i < stride; i++) {
+          curRow[i] = (curRow[i] + prevRow[i]) & 0xff;
+        }
+        break;
+      case 3: // Average: x + floor((left + above) / 2)
+        for (let i = 0; i < stride; i++) {
+          const left = i >= bpp ? curRow[i - bpp] : 0;
+          const above = prevRow[i];
+          curRow[i] = (curRow[i] + ((left + above) >> 1)) & 0xff;
+        }
+        break;
+      case 4: // Paeth
+        for (let i = 0; i < stride; i++) {
+          const left   = i >= bpp ? curRow[i - bpp] : 0;
+          const above  = prevRow[i];
+          const upLeft = i >= bpp ? prevRow[i - bpp] : 0;
+          curRow[i] = (curRow[i] + _paeth(left, above, upLeft)) & 0xff;
+        }
+        break;
+      default:
+        throw new Error("PNG: unknown filter type " + filter);
+    }
+    // Pour curRow into the output buffer.
+    const dst = y * stride;
+    for (let i = 0; i < stride; i++) out[dst + i] = curRow[i];
+    // Swap rows.
+    const tmp = prevRow; prevRow = curRow.slice(); // copy because we reuse curRow
+    // (Using slice keeps prevRow stable while we overwrite curRow next iter.)
+    // We could double-buffer to avoid the slice, but height is ~2k so cheap.
+    void tmp;
+  }
+  return { width, height, rgba: out };
+}
+
+function _paeth(a, b, c) {
+  // a = left, b = above, c = upper-left
+  const p = a + b - c;
+  const pa = Math.abs(p - a);
+  const pb = Math.abs(p - b);
+  const pc = Math.abs(p - c);
+  if (pa <= pb && pa <= pc) return a;
+  if (pb <= pc) return b;
+  return c;
+}
+
+async function _inflate(bytes, format) {
+  // bytes can be a Uint8Array view; wrap as a Response body for the stream.
+  const stream = new Response(bytes).body.pipeThrough(new DecompressionStream(format));
+  const reader = stream.getReader();
+  const parts = [];
+  let total = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    total += value.length;
+  }
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
 }
 
 // Recognize a CSV cell as a "yes" flag. Tolerates "yes"/"y"/"true"/"1"/"x"
@@ -436,6 +688,500 @@ function hexNeighbors(hid) {
   }
   return out;
 }
+
+// ============================================================================
+// Graph cache — serialises the heavy static precomputes (pixel index, masks,
+// per-hex pixel lists, subhex-component flood-fill, blocked-edge set,
+// component-neighbor map) to a single binary blob so subsequent page loads
+// can skip the bulk of the precompute work.
+//
+// The cache holds EVERYTHING UP TO precomputeSubhexComponentNeighbors. The
+// hex-mode graph (precomputeHexModes + precomputeHexModeNeighbors) depends
+// on the weights table and MIN_PIXELS_PER_PATH_HEX so it is NOT cached —
+// it rebuilds cheaply on top of the cached subhex/component layer every
+// load.
+//
+// File format (little-endian throughout):
+//
+//   bytes 0..7   = "RVGCACHE" (8 magic bytes, no terminator)
+//   bytes 8..11  = u32 version (CACHE_VERSION, bump on precompute changes)
+//   bytes 12..15 = u32 section count
+//
+// Then `section count` sections, each:
+//   u32 nameLen, name UTF-8 bytes
+//   u32 typeLen, type-tag UTF-8 bytes
+//   u32 payloadLen, payload bytes
+//
+// Type tags encode the payload shape:
+//   "u8" / "u16" / "u32"   — raw typed-array bytes
+//   "set_i"                — u32 count, then count u32 ids
+//   "set_s"                — u32 count, then for each item u16 len + UTF-8
+//   "map_i_n"              — u32 count, then for each (u32 key, u32 value)
+//   "map_s_n"              — u32 count, then for each (u16 keyLen + UTF-8 + u32 value)
+//   "map_i_u32"            — u32 count, then for each (u32 key, u32 arrLen, u32[arrLen])
+//   "map_s_u32"            — u32 count, then for each (u16 keyLen + UTF-8 + u32 arrLen + u32[arrLen])
+//   "map_s_set_s"          — u32 count, then for each (u16 keyLen + UTF-8 + u32 setSize + setSize x (u16 valLen + UTF-8))
+//
+// To regenerate when the precompute logic OR the source data (PNG layers,
+// hex_data.json, subhex_data.json, neighbors.json) changes:
+//   1. Bump CACHE_VERSION below so the old file fails the version check.
+//   2. Open the page; the loader will fall back to the full precompute.
+//   3. Click "Dump graph cache" in the Settings → Path-line panel.
+//   4. Save the downloaded `graph_cache.bin` next to neighbors.json.
+//   5. Subsequent loads skip the heavy precomputes.
+// ============================================================================
+const CACHE_VERSION = 11;
+const CACHE_MAGIC = "RVGCACHE";
+
+// ---- low-level writers ----
+function _cacheBuildSection(name, type, payload) {
+  // payload is a Uint8Array. Returns a Uint8Array containing the full
+  // section header + payload.
+  const nameBytes = new TextEncoder().encode(name);
+  const typeBytes = new TextEncoder().encode(type);
+  const total = 4 + nameBytes.length + 4 + typeBytes.length + 4 + payload.length;
+  const out = new Uint8Array(total);
+  const dv = new DataView(out.buffer);
+  let o = 0;
+  dv.setUint32(o, nameBytes.length, true); o += 4;
+  out.set(nameBytes, o); o += nameBytes.length;
+  dv.setUint32(o, typeBytes.length, true); o += 4;
+  out.set(typeBytes, o); o += typeBytes.length;
+  dv.setUint32(o, payload.length, true); o += 4;
+  out.set(payload, o);
+  return out;
+}
+
+// ---- payload encoders (each returns a Uint8Array) ----
+function _encU8(arr) {
+  if (!arr) return new Uint8Array(0);
+  return new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+function _encU16(arr) {
+  if (!arr) return new Uint8Array(0);
+  return new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+function _encU32(arr) {
+  if (!arr) return new Uint8Array(0);
+  return new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+function _encSetI(set) {
+  if (!set) return new Uint8Array(4); // count 0
+  const out = new Uint8Array(4 + set.size * 4);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, set.size, true);
+  let o = 4;
+  for (const id of set) { dv.setUint32(o, id, true); o += 4; }
+  return out;
+}
+function _encSetS(set) {
+  if (!set) return new Uint8Array(4);
+  const enc = new TextEncoder();
+  const items = [];
+  let totalStr = 0;
+  for (const s of set) {
+    const b = enc.encode(s);
+    items.push(b);
+    totalStr += 2 + b.length;
+  }
+  const out = new Uint8Array(4 + totalStr);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, items.length, true);
+  let o = 4;
+  for (const b of items) {
+    dv.setUint16(o, b.length, true); o += 2;
+    out.set(b, o); o += b.length;
+  }
+  return out;
+}
+function _encMapIN(map) {
+  if (!map) return new Uint8Array(4);
+  const out = new Uint8Array(4 + map.size * 8);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, map.size, true);
+  let o = 4;
+  for (const [k, v] of map) {
+    dv.setUint32(o, k, true); o += 4;
+    dv.setUint32(o, v, true); o += 4;
+  }
+  return out;
+}
+function _encMapSN(map) {
+  if (!map) return new Uint8Array(4);
+  const enc = new TextEncoder();
+  const entries = [];
+  let totalStr = 0;
+  for (const [k, v] of map) {
+    const kb = enc.encode(k);
+    entries.push([kb, v]);
+    totalStr += 2 + kb.length + 4;
+  }
+  const out = new Uint8Array(4 + totalStr);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, entries.length, true);
+  let o = 4;
+  for (const [kb, v] of entries) {
+    dv.setUint16(o, kb.length, true); o += 2;
+    out.set(kb, o); o += kb.length;
+    dv.setUint32(o, v, true); o += 4;
+  }
+  return out;
+}
+function _encMapIU32(map) {
+  if (!map) return new Uint8Array(4);
+  // Two-pass: compute total size, then write.
+  let total = 4;
+  for (const [k, arr] of map) total += 4 + 4 + arr.byteLength;
+  const out = new Uint8Array(total);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, map.size, true);
+  let o = 4;
+  for (const [k, arr] of map) {
+    dv.setUint32(o, k, true); o += 4;
+    dv.setUint32(o, arr.length, true); o += 4;
+    out.set(new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength), o);
+    o += arr.byteLength;
+  }
+  return out;
+}
+function _encMapSU32(map) {
+  if (!map) return new Uint8Array(4);
+  const enc = new TextEncoder();
+  const entries = [];
+  let total = 4;
+  for (const [k, arr] of map) {
+    const kb = enc.encode(k);
+    entries.push([kb, arr]);
+    total += 2 + kb.length + 4 + arr.byteLength;
+  }
+  const out = new Uint8Array(total);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, entries.length, true);
+  let o = 4;
+  for (const [kb, arr] of entries) {
+    dv.setUint16(o, kb.length, true); o += 2;
+    out.set(kb, o); o += kb.length;
+    dv.setUint32(o, arr.length, true); o += 4;
+    out.set(new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength), o);
+    o += arr.byteLength;
+  }
+  return out;
+}
+function _encMapSSetS(map) {
+  if (!map) return new Uint8Array(4);
+  const enc = new TextEncoder();
+  const entries = [];
+  let total = 4;
+  for (const [k, set] of map) {
+    const kb = enc.encode(k);
+    const items = [];
+    let inner = 0;
+    for (const v of set) {
+      const vb = enc.encode(v);
+      items.push(vb);
+      inner += 2 + vb.length;
+    }
+    entries.push([kb, items]);
+    total += 2 + kb.length + 4 + inner;
+  }
+  const out = new Uint8Array(total);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, entries.length, true);
+  let o = 4;
+  for (const [kb, items] of entries) {
+    dv.setUint16(o, kb.length, true); o += 2;
+    out.set(kb, o); o += kb.length;
+    dv.setUint32(o, items.length, true); o += 4;
+    for (const vb of items) {
+      dv.setUint16(o, vb.length, true); o += 2;
+      out.set(vb, o); o += vb.length;
+    }
+  }
+  return out;
+}
+
+// ---- payload decoders ----
+// Each takes a DataView and a starting offset; returns { value, offset }.
+function _decU8(dv, o, payloadLen) {
+  // payloadLen == 0 is the "null/absent" sentinel — preserves the null
+  // semantics downstream code expects (vs. accidentally returning an
+  // empty array that silently no-ops on every lookup).
+  if (payloadLen === 0) return { value: null, offset: o };
+  // Copy out (otherwise the typed array would share the cache buffer which
+  // is going to be garbage-collected after deserialization).
+  const out = new Uint8Array(payloadLen);
+  out.set(new Uint8Array(dv.buffer, dv.byteOffset + o, payloadLen));
+  return { value: out, offset: o + payloadLen };
+}
+function _decU16(dv, o, payloadLen) {
+  if (payloadLen === 0) return { value: null, offset: o };
+  // Copy via a fresh ArrayBuffer to guarantee 2-byte alignment.
+  const out = new Uint16Array(payloadLen / 2);
+  const src = new Uint8Array(dv.buffer, dv.byteOffset + o, payloadLen);
+  new Uint8Array(out.buffer).set(src);
+  return { value: out, offset: o + payloadLen };
+}
+function _decU32(dv, o, payloadLen) {
+  if (payloadLen === 0) return { value: null, offset: o };
+  const out = new Uint32Array(payloadLen / 4);
+  const src = new Uint8Array(dv.buffer, dv.byteOffset + o, payloadLen);
+  new Uint8Array(out.buffer).set(src);
+  return { value: out, offset: o + payloadLen };
+}
+function _decSetI(dv, o) {
+  const count = dv.getUint32(o, true); o += 4;
+  const s = new Set();
+  for (let i = 0; i < count; i++) { s.add(dv.getUint32(o, true)); o += 4; }
+  return { value: s, offset: o };
+}
+function _decSetS(dv, o) {
+  const count = dv.getUint32(o, true); o += 4;
+  const s = new Set();
+  const td = new TextDecoder();
+  for (let i = 0; i < count; i++) {
+    const len = dv.getUint16(o, true); o += 2;
+    const bytes = new Uint8Array(dv.buffer, dv.byteOffset + o, len);
+    s.add(td.decode(bytes)); o += len;
+  }
+  return { value: s, offset: o };
+}
+function _decMapIN(dv, o) {
+  const count = dv.getUint32(o, true); o += 4;
+  const m = new Map();
+  for (let i = 0; i < count; i++) {
+    const k = dv.getUint32(o, true); o += 4;
+    const v = dv.getUint32(o, true); o += 4;
+    m.set(k, v);
+  }
+  return { value: m, offset: o };
+}
+function _decMapSN(dv, o) {
+  const count = dv.getUint32(o, true); o += 4;
+  const m = new Map();
+  const td = new TextDecoder();
+  for (let i = 0; i < count; i++) {
+    const len = dv.getUint16(o, true); o += 2;
+    const k = td.decode(new Uint8Array(dv.buffer, dv.byteOffset + o, len));
+    o += len;
+    const v = dv.getUint32(o, true); o += 4;
+    m.set(k, v);
+  }
+  return { value: m, offset: o };
+}
+function _decMapIU32(dv, o) {
+  const count = dv.getUint32(o, true); o += 4;
+  const m = new Map();
+  for (let i = 0; i < count; i++) {
+    const k = dv.getUint32(o, true); o += 4;
+    const arrLen = dv.getUint32(o, true); o += 4;
+    const arr = new Uint32Array(arrLen);
+    const src = new Uint8Array(dv.buffer, dv.byteOffset + o, arrLen * 4);
+    new Uint8Array(arr.buffer).set(src);
+    o += arrLen * 4;
+    m.set(k, arr);
+  }
+  return { value: m, offset: o };
+}
+function _decMapSU32(dv, o) {
+  const count = dv.getUint32(o, true); o += 4;
+  const m = new Map();
+  const td = new TextDecoder();
+  for (let i = 0; i < count; i++) {
+    const klen = dv.getUint16(o, true); o += 2;
+    const k = td.decode(new Uint8Array(dv.buffer, dv.byteOffset + o, klen));
+    o += klen;
+    const arrLen = dv.getUint32(o, true); o += 4;
+    const arr = new Uint32Array(arrLen);
+    const src = new Uint8Array(dv.buffer, dv.byteOffset + o, arrLen * 4);
+    new Uint8Array(arr.buffer).set(src);
+    o += arrLen * 4;
+    m.set(k, arr);
+  }
+  return { value: m, offset: o };
+}
+function _decMapSSetS(dv, o) {
+  const count = dv.getUint32(o, true); o += 4;
+  const m = new Map();
+  const td = new TextDecoder();
+  for (let i = 0; i < count; i++) {
+    const klen = dv.getUint16(o, true); o += 2;
+    const k = td.decode(new Uint8Array(dv.buffer, dv.byteOffset + o, klen));
+    o += klen;
+    const setSize = dv.getUint32(o, true); o += 4;
+    const s = new Set();
+    for (let j = 0; j < setSize; j++) {
+      const vlen = dv.getUint16(o, true); o += 2;
+      const v = td.decode(new Uint8Array(dv.buffer, dv.byteOffset + o, vlen));
+      o += vlen;
+      s.add(v);
+    }
+    m.set(k, s);
+  }
+  return { value: m, offset: o };
+}
+
+// Manifest of cacheable globals — single source of truth for both encode
+// and decode. `get` returns the live value; `set` writes the decoded value
+// to the right global. `type` picks the codec.
+function _cacheManifest() {
+  return [
+    { name: "HEX_ID_PX",                    type: "u16",         get: () => HEX_ID_PX,                    set: v => { HEX_ID_PX = v; } },
+    { name: "SUBHEX_ID_PX",                 type: "u32",         get: () => SUBHEX_ID_PX,                 set: v => { SUBHEX_ID_PX = v; } },
+    { name: "HEX_PIXELS",                   type: "map_i_u32",   get: () => HEX_PIXELS,                   set: v => { HEX_PIXELS = v; } },
+    { name: "ROAD_PIXEL_MASK",              type: "u8",          get: () => ROAD_PIXEL_MASK,              set: v => { ROAD_PIXEL_MASK = v; } },
+    { name: "RIVER_PIXEL_MASK",             type: "u8",          get: () => RIVER_PIXEL_MASK,             set: v => { RIVER_PIXEL_MASK = v; } },
+    { name: "STRICT_RIVER_PIXEL_MASK",      type: "u8",          get: () => STRICT_RIVER_PIXEL_MASK,      set: v => { STRICT_RIVER_PIXEL_MASK = v; } },
+    { name: "THICK_RIVER_PIXEL_MASK",       type: "u8",          get: () => THICK_RIVER_PIXEL_MASK,       set: v => { THICK_RIVER_PIXEL_MASK = v; } },
+    // THICK_RIVER_BLOCKING_MASK is the same reference as THICK_RIVER_PIXEL_MASK
+    // (see buildPixelMasks). Skip writing a duplicate copy; we re-alias on load.
+    { name: "THIN_RIVER_EXPANDED_MASK",     type: "u8",          get: () => THIN_RIVER_EXPANDED_MASK,     set: v => { THIN_RIVER_EXPANDED_MASK = v; } },
+    { name: "HEX_ROAD_PIXELS",              type: "map_i_u32",   get: () => HEX_ROAD_PIXELS,              set: v => { HEX_ROAD_PIXELS = v; } },
+    { name: "HEX_RIVER_PIXELS",             type: "map_i_u32",   get: () => HEX_RIVER_PIXELS,             set: v => { HEX_RIVER_PIXELS = v; } },
+    { name: "HEX_HAS_ROAD",                 type: "set_i",       get: () => HEX_HAS_ROAD,                 set: v => { HEX_HAS_ROAD = v; } },
+    { name: "ROAD_SUBHEXES",                type: "set_i",       get: () => ROAD_SUBHEXES,                set: v => { ROAD_SUBHEXES = v; } },
+    { name: "RIVER_SUBHEXES",               type: "set_i",       get: () => RIVER_SUBHEXES,               set: v => { RIVER_SUBHEXES = v; } },
+    { name: "FERRY_HEXES",                  type: "set_i",       get: () => FERRY_HEXES,                  set: v => { FERRY_HEXES = v; } },
+    { name: "LAND_HEX_WATER_PIXELS",        type: "map_i_u32",   get: () => LAND_HEX_WATER_PIXELS,        set: v => { LAND_HEX_WATER_PIXELS = v; } },
+    { name: "SUBHEX_PIXEL_COMPONENT",       type: "u16",         get: () => SUBHEX_PIXEL_COMPONENT,       set: v => { SUBHEX_PIXEL_COMPONENT = v; } },
+    { name: "SUBHEX_COMPONENT_COUNT",       type: "map_i_n",     get: () => SUBHEX_COMPONENT_COUNT,       set: v => { SUBHEX_COMPONENT_COUNT = v; } },
+    { name: "SUBHEX_COMPONENT_PIXEL_COUNT", type: "map_s_n",     get: () => SUBHEX_COMPONENT_PIXEL_COUNT, set: v => { SUBHEX_COMPONENT_PIXEL_COUNT = v; } },
+    { name: "SUBHEX_COMPONENT_PIXELS",      type: "map_s_u32",   get: () => SUBHEX_COMPONENT_PIXELS,      set: v => { SUBHEX_COMPONENT_PIXELS = v; } },
+    { name: "ROAD_COMPONENTS",              type: "set_s",       get: () => ROAD_COMPONENTS,              set: v => { ROAD_COMPONENTS = v; } },
+    { name: "THICK_RIVER_COMPONENTS",       type: "set_s",       get: () => THICK_RIVER_COMPONENTS,       set: v => { THICK_RIVER_COMPONENTS = v; } },
+    { name: "BLOCKED_SUBHEX_EDGES",         type: "set_s",       get: () => BLOCKED_SUBHEX_EDGES,         set: v => { BLOCKED_SUBHEX_EDGES = v; } },
+    { name: "SUBHEX_COMPONENT_NEIGHBORS",   type: "map_s_set_s", get: () => SUBHEX_COMPONENT_NEIGHBORS,   set: v => { SUBHEX_COMPONENT_NEIGHBORS = v; } },
+  ];
+}
+
+function _encodeBySection(type, value) {
+  switch (type) {
+    case "u8":           return _encU8(value);
+    case "u16":          return _encU16(value);
+    case "u32":          return _encU32(value);
+    case "set_i":        return _encSetI(value);
+    case "set_s":        return _encSetS(value);
+    case "map_i_n":      return _encMapIN(value);
+    case "map_s_n":      return _encMapSN(value);
+    case "map_i_u32":    return _encMapIU32(value);
+    case "map_s_u32":    return _encMapSU32(value);
+    case "map_s_set_s":  return _encMapSSetS(value);
+    default: throw new Error("Unknown cache section type: " + type);
+  }
+}
+
+function _decodeBySection(type, dv, payloadStart, payloadLen) {
+  switch (type) {
+    case "u8":           return _decU8(dv, payloadStart, payloadLen).value;
+    case "u16":          return _decU16(dv, payloadStart, payloadLen).value;
+    case "u32":          return _decU32(dv, payloadStart, payloadLen).value;
+    case "set_i":        return _decSetI(dv, payloadStart).value;
+    case "set_s":        return _decSetS(dv, payloadStart).value;
+    case "map_i_n":      return _decMapIN(dv, payloadStart).value;
+    case "map_s_n":      return _decMapSN(dv, payloadStart).value;
+    case "map_i_u32":    return _decMapIU32(dv, payloadStart).value;
+    case "map_s_u32":    return _decMapSU32(dv, payloadStart).value;
+    case "map_s_set_s": return _decMapSSetS(dv, payloadStart).value;
+    default: throw new Error("Unknown cache section type: " + type);
+  }
+}
+
+// Build the binary cache blob from the currently-populated globals.
+// Caller is responsible for running all the precomputes first.
+function buildGraphCacheBlob() {
+  const manifest = _cacheManifest();
+  // Header: 8 magic + u32 version + u32 sectionCount = 16 bytes.
+  const header = new Uint8Array(16);
+  const dv = new DataView(header.buffer);
+  const magicBytes = new TextEncoder().encode(CACHE_MAGIC);
+  header.set(magicBytes, 0);
+  dv.setUint32(8,  CACHE_VERSION,    true);
+  dv.setUint32(12, manifest.length,  true);
+
+  const chunks = [header];
+  for (const entry of manifest) {
+    const live = entry.get();
+    const payload = _encodeBySection(entry.type, live);
+    chunks.push(_cacheBuildSection(entry.name, entry.type, payload));
+  }
+  return new Blob(chunks, { type: "application/octet-stream" });
+}
+
+// Trigger a browser download of the current cache. Wired to the
+// "Dump graph cache" button in the Settings → Path-line panel.
+function dumpGraphCache() {
+  const blob = buildGraphCacheBlob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "graph_cache.bin";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  console.log(`graph_cache.bin generated (${(blob.size / (1024*1024)).toFixed(1)} MB). ` +
+              `Save it next to neighbors.json to enable cache-fast startup.`);
+}
+
+// Attempt to load the cache file. Returns true on success (globals populated,
+// caller can skip the heavy precomputes), false on absence / version mismatch /
+// parse error. Never throws — always returns false on any failure path so the
+// caller can fall back to the full precompute.
+async function tryLoadGraphCache() {
+  let buf;
+  try {
+    const r = await fetch("graph_cache.bin", { cache: "no-store" });
+    if (!r.ok) return false;
+    buf = await r.arrayBuffer();
+  } catch (e) {
+    return false;
+  }
+  if (buf.byteLength < 16) return false;
+  const dv = new DataView(buf);
+  // Magic
+  const magic = new TextDecoder().decode(new Uint8Array(buf, 0, 8));
+  if (magic !== CACHE_MAGIC) {
+    console.warn("graph_cache.bin: bad magic, ignoring");
+    return false;
+  }
+  const version = dv.getUint32(8, true);
+  if (version !== CACHE_VERSION) {
+    console.warn(`graph_cache.bin: version ${version} != current ${CACHE_VERSION}, recomputing`);
+    return false;
+  }
+  const sectionCount = dv.getUint32(12, true);
+  const manifest = _cacheManifest();
+  const byName = new Map();
+  for (const e of manifest) byName.set(e.name, e);
+
+  const td = new TextDecoder();
+  let o = 16;
+  try {
+    for (let i = 0; i < sectionCount; i++) {
+      const nameLen = dv.getUint32(o, true); o += 4;
+      const name = td.decode(new Uint8Array(buf, o, nameLen)); o += nameLen;
+      const typeLen = dv.getUint32(o, true); o += 4;
+      const type = td.decode(new Uint8Array(buf, o, typeLen)); o += typeLen;
+      const payloadLen = dv.getUint32(o, true); o += 4;
+      const entry = byName.get(name);
+      if (entry && entry.type === type) {
+        const value = _decodeBySection(type, dv, o, payloadLen);
+        entry.set(value);
+      } else if (entry) {
+        console.warn(`graph_cache.bin: section ${name} type mismatch (${type} vs expected ${entry.type}), skipping`);
+      }
+      // Else: unknown section, just skip past it.
+      o += payloadLen;
+    }
+  } catch (e) {
+    console.warn("graph_cache.bin: parse error, falling back to recompute:", e);
+    return false;
+  }
+  // Re-alias THICK_RIVER_BLOCKING_MASK to THICK_RIVER_PIXEL_MASK (the two are
+  // semantically the same object; buildPixelMasks assigns one to the other).
+  THICK_RIVER_BLOCKING_MASK = THICK_RIVER_PIXEL_MASK;
+  return true;
+}
+
 async function loadAll() {
   loadingEl.textContent = "Loading hex data…";
   HEX_DATA = await (await fetch("hex_data.json")).json();
@@ -461,25 +1207,164 @@ async function loadAll() {
   const sctx = sc.getContext("2d", { willReadFrequently: true });
   sctx.drawImage(sIm, 0, 0);
   SUBHEX_ID_IMG_DATA = sctx.getImageData(0, 0, sc.width, sc.height);
+  // Kick off the layer PNG load in parallel — we always need IMAGES[] for
+  // rendering even when the precompute cache is present, so we may as well
+  // overlap that work with the cache fetch / precompute.
+  const layersPromise = Promise.all(LAYERS.map(async (l) => {
+    try {
+      if (l.prerasterise) {
+        // Some RGBA PNGs (notably Borders.png) lose their partial-alpha
+        // pixels when decoded via the browser's PNG decoder — both <img>
+        // and createImageBitmap binarise partial-alpha pixels to 0/255
+        // regardless of colorSpaceConversion/premultiplyAlpha hints.
+        //
+        // Bypass the browser PNG decoder entirely: fetch the file as
+        // bytes, decode the PNG ourselves via decodePngRgba (chunk parse +
+        // DecompressionStream("deflate") + per-row unfilter), and drop the
+        // raw RGBA bytes onto a canvas via putImageData. putImageData
+        // skips alpha premultiplication and colour-space conversion — the
+        // exact two operations that were destroying the partial-alpha
+        // pixels — so every alpha value in the file lands on the canvas
+        // unchanged. The opacity slider still applies via mapCtx.globalAlpha.
+        //
+        // Fallback chain: manual decode -> createImageBitmap(no colour
+        // surgery) -> plain <img>. Each level loses fidelity but at least
+        // keeps the layer rendering.
+        let placed = false;
+        try {
+          const resp = await fetch(encodeURI(l.file));
+          if (!resp.ok) throw new Error("fetch failed: " + resp.status);
+          const buf = await resp.arrayBuffer();
+          const decoded = await decodePngRgba(new Uint8Array(buf));
+          const c = document.createElement("canvas");
+          c.width = decoded.width; c.height = decoded.height;
+          const cx = c.getContext("2d");
+          const imgData = new ImageData(decoded.rgba, decoded.width, decoded.height);
+          cx.putImageData(imgData, 0, 0);
+          c.naturalWidth = c.width; c.naturalHeight = c.height;
+          IMAGES[l.id] = c;
+          placed = true;
+        } catch (decErr) {
+          console.warn("Manual PNG decode failed for", l.id, "— falling back to createImageBitmap:", decErr);
+        }
+        if (!placed) {
+          try {
+            if (typeof createImageBitmap !== "function") {
+              throw new Error("createImageBitmap unavailable");
+            }
+            const resp = await fetch(encodeURI(l.file));
+            if (!resp.ok) throw new Error("fetch failed: " + resp.status);
+            const blob = await resp.blob();
+            const bmp = await createImageBitmap(blob, {
+              colorSpaceConversion: "none",
+              premultiplyAlpha: "none",
+            });
+            try {
+              bmp.naturalWidth = bmp.width;
+              bmp.naturalHeight = bmp.height;
+            } catch (_) { /* read-only — handled below */ }
+            if (bmp.naturalWidth === bmp.width && bmp.naturalHeight === bmp.height) {
+              IMAGES[l.id] = bmp;
+            } else {
+              const c = document.createElement("canvas");
+              c.width = bmp.width; c.height = bmp.height;
+              c.getContext("2d").drawImage(bmp, 0, 0);
+              c.naturalWidth = c.width; c.naturalHeight = c.height;
+              IMAGES[l.id] = c;
+            }
+            placed = true;
+          } catch (bmpErr) {
+            console.warn("createImageBitmap path failed for", l.id, "— falling back to <img>:", bmpErr);
+          }
+        }
+        if (!placed) {
+          // Last-resort <img> + canvas. Partial alpha will binarise, but
+          // at least the layer renders.
+          const img = await loadImage(encodeURI(l.file));
+          const c = document.createElement("canvas");
+          c.width = img.naturalWidth; c.height = img.naturalHeight;
+          c.getContext("2d").drawImage(img, 0, 0);
+          c.naturalWidth = c.width; c.naturalHeight = c.height;
+          IMAGES[l.id] = c;
+        }
+      } else {
+        IMAGES[l.id] = await loadImage(encodeURI(l.file));
+      }
+    } catch (e) {
+      console.warn("Layer load failed:", l.id, e);
+      IMAGES[l.id] = null;
+    }
+  }));
+
+  loadingEl.textContent = "Loading graph cache…";
+  const cacheLoaded = await tryLoadGraphCache();
+  if (cacheLoaded) {
+    // Cache hit — we still need the PNG layers for rendering. Wait for
+    // them, then build mode graph (which depends on tunable settings
+    // and so is never cached).
+    loadingEl.textContent = "Loading map layers…";
+    await layersPromise;
+    for (const c of [mapCanvas, hlCanvas]) {
+      c.width = HEX_DATA.image_width; c.height = HEX_DATA.image_height;
+    }
+    // Rebuild LAND_HEX_WATER_PIXELS against the freshly-fetched HEX_TERRAIN.
+    // The CSV lives in Google Sheets and CAN change between sessions, while
+    // the rest of the cache is keyed on static map data only — re-running
+    // this one cheap precompute keeps the cache valid even if the sheet's
+    // edited without bumping CACHE_VERSION.
+    precomputeLandHexWaterPixels();
+    // RIVER_SUBHEXES wasn't in older cache files. If absent, derive it now
+    // from HEX_RIVER_PIXELS (cheap; iterates only river pixels).
+    if (!RIVER_SUBHEXES) precomputeRiverSubhexes();
+    loadingEl.textContent = "Building mode graph…";
+    precomputeHexModes();
+    precomputeHexModeNeighbors();
+    addComboModeNeighbors();
+    loadingEl.classList.add("hidden");
+    console.log("Loaded graph state from graph_cache.bin — heavy precomputes skipped.");
+    return;
+  }
+
+  // No cache: run the full precompute path.
   loadingEl.textContent = "Indexing pixels…";
   precomputeHexIndexes();
   precomputeLandHexWaterPixels();
   loadingEl.textContent = "Loading map layers…";
-  await Promise.all(LAYERS.map(async (l) => {
-    try { IMAGES[l.id] = await loadImage(encodeURI(l.file)); }
-    catch (e) { console.warn("Layer load failed:", l.id, e); IMAGES[l.id] = null; }
-  }));
+  await layersPromise;
   for (const c of [mapCanvas, hlCanvas]) {
     c.width = HEX_DATA.image_width; c.height = HEX_DATA.image_height;
   }
   buildPixelMasks();
   precomputeHexRoadRiverPixels();
   precomputeRoadSubhexes();
+  precomputeRiverSubhexes();
   precomputeFerryHexes();
   precomputeSubhexComponents();
   precomputeBlockedSubhexEdges();
   precomputeSubhexComponentNeighbors();
+  precomputeHexModes();
+  precomputeHexModeNeighbors();
+  addComboModeNeighbors();
   loadingEl.classList.add("hidden");
+}
+
+// Recompute the mode-graph layer. Cheap (relative to flood-fill) so
+// safe to call on weight changes — LAND mode pixel membership depends
+// on the assigned-weight rule, and cost values are weight-derived for
+// every mode. Routes need a rebuild after this to pick up changes.
+function recomputeHexModeGraph() {
+  precomputeHexModes();
+  precomputeHexModeNeighbors();
+  addComboModeNeighbors();
+  // Prune overrides whose pinned mode no longer exists after the rebuild
+  // (e.g., a weight change removed a kind from this hex). Without this,
+  // dijkstra would silently fail to find a path through the hex.
+  if (HEX_MODE_OVERRIDES && HEX_MODES) {
+    for (const [hid, mode] of Array.from(HEX_MODE_OVERRIDES.entries())) {
+      const modes = HEX_MODES.get(hid);
+      if (!modes || !modes.has(mode)) HEX_MODE_OVERRIDES.delete(hid);
+    }
+  }
 }
 
 // Identify hexes whose artwork has road pixels physically overlaid on thick-
@@ -505,13 +1390,13 @@ function precomputeFerryHexes() {
 }
 
 // Flood-fill each subhex's non-thick pixels into connected components.
-// Now the flood ALSO refuses to cross the road/non-road boundary, so road
-// pixels (roads + cities) form their own component, distinct from the
-// surrounding land of the same subhex. That makes "road" a real graph
-// node — dijkstra can only get the road discount by ACTUALLY routing
-// through road pixels, not by entering a subhex that happens to contain
-// a stray road. Component ids still restart at 1 inside each subhex;
-// ROAD_COMPONENTS tags which of those are the road side.
+// Road and non-road pixels join the SAME component — roads don't split
+// land, so a road that runs through a subhex doesn't carve the surrounding
+// land into two halves. ROAD_COMPONENTS still tags any component that
+// contains at least one road pixel (semantically "road-bearing"), but the
+// component is no longer road-pure; precomputeHexModes does the per-pixel
+// LAND vs ROAD bucketing using ROAD_PIXEL_MASK directly. Component ids
+// still restart at 1 inside each subhex.
 function precomputeSubhexComponents() {
   if (!SUBHEX_ID_PX || !SUBHEX_ID_IMG_DATA || !SUBHEXES_BY_HEX) return;
   const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
@@ -519,6 +1404,7 @@ function precomputeSubhexComponents() {
   SUBHEX_PIXEL_COMPONENT = new Uint16Array(N);
   SUBHEX_COMPONENT_COUNT = new Map();
   SUBHEX_COMPONENT_PIXEL_COUNT = new Map();
+  SUBHEX_COMPONENT_PIXELS = new Map();
   ROAD_COMPONENTS = new Set();
   THICK_RIVER_COMPONENTS = new Set();
   const thick = THICK_RIVER_BLOCKING_MASK || THICK_RIVER_PIXEL_MASK;
@@ -554,13 +1440,14 @@ function precomputeSubhexComponents() {
           if (SUBHEX_PIXEL_COMPONENT[i] !== 0) continue;
           compCount++;
           const compId = compCount;
-          const seedIsRoad = road ? !!road[i] : false;
-          if (seedIsRoad) ROAD_COMPONENTS.add(`${subId}:${compId}`);
-          // Track whether THIS component (subhex + compId) ends up
-          // containing any thick-river pixel. In ferry hexes the flood
-          // admits thick pixels, so a component can include them. We
-          // tag the component in THICK_RIVER_COMPONENTS as soon as we
-          // see a thick pixel.
+          // Track whether THIS component (subhex + compId) contains any
+          // road pixel and/or any thick-river pixel. The flood no longer
+          // splits at the road/non-road boundary, so road and land within
+          // the same subhex end up in ONE component — ROAD_COMPONENTS now
+          // means "this component is road-bearing" rather than "road-pure".
+          // In ferry hexes the flood admits thick pixels, so a component
+          // can also include them; THICK_RIVER_COMPONENTS tags those.
+          let compHasRoad  = !!(road && road[i]);
           let compHasThick = !!(thickPx && thickPx[i]);
           let compPixCount = 1;
           SUBHEX_PIXEL_COMPONENT[i] = compId;
@@ -570,14 +1457,15 @@ function precomputeSubhexComponents() {
             const idx = queue[head++];
             const cy = (idx / W) | 0;
             const cx = idx - cy * W;
-            // 4-connected neighbors restricted to: same subhex, non-thick
-            // (when blockThick), and SAME road class as the seed. The
-            // road-class check is what creates the road-vs-land split.
+            // 4-connected neighbors restricted to: same subhex and non-thick
+            // (when blockThick). Road vs non-road is no longer a wall —
+            // the flood spans both freely so a road through a subhex
+            // doesn't split its land.
             if (cx + 1 < W) {
               const ni = idx + 1;
-              const niIsRoad = road ? !!road[ni] : false;
-              if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0 && niIsRoad === seedIsRoad) {
+              if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0) {
                 SUBHEX_PIXEL_COMPONENT[ni] = compId;
+                if (road && road[ni]) compHasRoad = true;
                 if (thickPx && thickPx[ni]) compHasThick = true;
                 compPixCount++;
                 queue[tail++] = ni;
@@ -585,9 +1473,9 @@ function precomputeSubhexComponents() {
             }
             if (cx > 0) {
               const ni = idx - 1;
-              const niIsRoad = road ? !!road[ni] : false;
-              if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0 && niIsRoad === seedIsRoad) {
+              if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0) {
                 SUBHEX_PIXEL_COMPONENT[ni] = compId;
+                if (road && road[ni]) compHasRoad = true;
                 if (thickPx && thickPx[ni]) compHasThick = true;
                 compPixCount++;
                 queue[tail++] = ni;
@@ -595,9 +1483,9 @@ function precomputeSubhexComponents() {
             }
             if (cy + 1 < H) {
               const ni = idx + W;
-              const niIsRoad = road ? !!road[ni] : false;
-              if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0 && niIsRoad === seedIsRoad) {
+              if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0) {
                 SUBHEX_PIXEL_COMPONENT[ni] = compId;
+                if (road && road[ni]) compHasRoad = true;
                 if (thickPx && thickPx[ni]) compHasThick = true;
                 compPixCount++;
                 queue[tail++] = ni;
@@ -605,17 +1493,24 @@ function precomputeSubhexComponents() {
             }
             if (cy > 0) {
               const ni = idx - W;
-              const niIsRoad = road ? !!road[ni] : false;
-              if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0 && niIsRoad === seedIsRoad) {
+              if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0) {
                 SUBHEX_PIXEL_COMPONENT[ni] = compId;
+                if (road && road[ni]) compHasRoad = true;
                 if (thickPx && thickPx[ni]) compHasThick = true;
                 compPixCount++;
                 queue[tail++] = ni;
               }
             }
           }
+          if (compHasRoad)  ROAD_COMPONENTS.add(`${subId}:${compId}`);
           if (compHasThick) THICK_RIVER_COMPONENTS.add(`${subId}:${compId}`);
           SUBHEX_COMPONENT_PIXEL_COUNT.set(`${subId}:${compId}`, compPixCount);
+          // Snapshot this component's pixels before the queue gets
+          // overwritten by the next flood. tail === compPixCount at this
+          // point, so queue[0..compPixCount-1] is the full pixel list.
+          const compPx = new Uint32Array(compPixCount);
+          for (let qi = 0; qi < compPixCount; qi++) compPx[qi] = queue[qi];
+          SUBHEX_COMPONENT_PIXELS.set(`${subId}:${compId}`, compPx);
         }
       }
       SUBHEX_COMPONENT_COUNT.set(subId, compCount);
@@ -792,15 +1687,625 @@ function subhexComponentAt(subhexId, prefPixelIdx) {
 
 // Walk every subhex-pair edge in NEIGHBORS and check whether the SHARED
 // BORDER between them has any clear (non-thick-river) crossing pair. If
-// every border-pair (an A-pixel 4-adjacent to a B-pixel) is blocked by a
-// thick-river pixel on either side, the edge is considered impassable —
-// the rendered line couldn't have crossed there anyway, so dijkstraSubhexPath
-// shouldn't pick paths that depend on it.
-//
-// Heavy: O(sum-of-bbox-intersections) pixel work, but it only runs once at
-// load time. Result is a Set of canonical "min|max" pair strings (smaller
-// subhex id first) so each undirected edge is stored once and either
-// direction lookup uses the same key.
+// ---------------------------------------------------------------------
+// Hex-mode graph precompute. Builds HEX_MODES (per-hex mode catalog with
+// pixel set + cost per mode) and HEX_MODE_NEIGHBORS (the edge graph).
+// Recompute whenever weights change — costs and the LAND assigned-weight
+// rule depend on weights.
+// ---------------------------------------------------------------------
+function precomputeHexModes() {
+  HEX_MODES = new Map();
+  PIX_MODE_KIND = null;
+  PIX_MODE_COMP = null;
+  if (!SUBHEX_ID_PX || !HEX_ID_PX || !HEX_DATA || !SUBHEXES_BY_HEX) return;
+  if (!SUBHEX_ID_IMG_DATA) return;
+  const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
+  const N = W * H;
+  // Per-pixel mode lookup arrays (populated as we build each kind's
+  // components below). 0 = no mode (water barrier, off-map, dropped
+  // pixels). Component index is per-(hex, kind) so it matches the suffix
+  // we use in the mode name.
+  PIX_MODE_KIND = new Uint8Array(N);
+  PIX_MODE_COMP = new Uint16Array(N);
+
+  // 8-connected flood-fill with RIVER-AWARE corner-cut. Two diagonal
+  // bucket pixels are connected only when neither orthogonal corner is
+  // a river pixel-that's-not-in-the-bucket. Effect:
+  //   * LAND's flood-fill on a hex bisected by a green river produces
+  //     two components (one per bank) because the river pixels live in
+  //     FORD, not LAND, and their presence in the diagonal corner now
+  //     blocks the cross-river link.
+  //   * LAND+FORD union's flood-fill still spans the river because the
+  //     river pixels ARE in the combo bucket, so the corner check
+  //     short-circuits (corner is in bucket → not a separator).
+  //   * Thick rivers (in FERRY or not at all) act the same way: they
+  //     separate buckets that don't include them.
+  // Non-river "void" corners (no mask at all) still allow the diagonal
+  // — that's the difference from a full standard corner-cut, which
+  // would over-split modes through perfectly-mundane narrow stretches.
+  const thinMask  = THIN_RIVER_EXPANDED_MASK;
+  const thickMask = THICK_RIVER_PIXEL_MASK;
+  // strictCornerCut === true matches line A*'s no-corner-cut rule exactly:
+  // a diagonal hop is blocked if EITHER orthogonal corner is outside the
+  // bucket. Used for COMBO components, where the renderer's path-full mask
+  // is restricted to exactly the combo's pixels — so flood-fill MUST agree
+  // with what A* can actually trace, otherwise dijkstra picks a combo
+  // whose two blobs touch only at a corner and the rendered line can't
+  // cross the pinch.
+  //
+  // strictCornerCut === false (default) is the river-aware corner-cut:
+  // a diagonal is blocked only when an orthogonal corner is a river
+  // pixel not in the bucket. This is the right rule for SINGLE-kind
+  // components because the renderer's broader mask usually still
+  // contains the non-river corner pixels, so allowing the diagonal
+  // doesn't desync flood-fill from A*'s reachable set.
+  function floodComponents(bucket, strictCornerCut) {
+    const visited = new Set();
+    const comps = [];
+    for (const seed of bucket) {
+      if (visited.has(seed)) continue;
+      visited.add(seed);
+      const stack = [seed];
+      const comp = [];
+      while (stack.length > 0) {
+        const p = stack.pop();
+        comp.push(p);
+        const py = (p / W) | 0;
+        const px = p - py * W;
+        for (let dy = -1; dy <= 1; dy++) {
+          const ny = py + dy;
+          if (ny < 0 || ny >= H) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = px + dx;
+            if (nx < 0 || nx >= W) continue;
+            const ni = ny * W + nx;
+            if (visited.has(ni)) continue;
+            if (!bucket.has(ni)) continue;
+            if (dx !== 0 && dy !== 0) {
+              const c1 = py * W + nx;     // row of p, col of n
+              const c2 = ny * W + px;     // row of n, col of p
+              if (strictCornerCut) {
+                // No-corner-cut: both orthogonal corners must be in the
+                // bucket. Mirrors aStarInMask in pathfinding.js.
+                if (!bucket.has(c1) || !bucket.has(c2)) continue;
+              } else {
+                // River-aware corner-cut: rivers act as flood-fill
+                // separators for any mode that doesn't include them.
+                const c1River = (thinMask && thinMask[c1]) || (thickMask && thickMask[c1]);
+                const c2River = (thinMask && thinMask[c2]) || (thickMask && thickMask[c2]);
+                if (c1River && !bucket.has(c1)) continue;
+                if (c2River && !bucket.has(c2)) continue;
+              }
+            }
+            visited.add(ni);
+            stack.push(ni);
+          }
+        }
+      }
+      comps.push(new Uint32Array(comp));
+    }
+    return comps;
+  }
+  // Drop micro-components — handfuls of pixels that are almost certainly
+  // artwork artifacts (a stray road pixel that got bucketed alone, etc.).
+  // They clutter the picker and can give dijkstra phantom routing
+  // options. Tuned conservatively: anything ≤ MIN_MODE_COMPONENT_PIXELS
+  // gets dropped.
+  const MIN_MODE_COMPONENT_PIXELS = 4;
+  function pruneTinyComponents(comps) {
+    return comps.filter(c => c.length > MIN_MODE_COMPONENT_PIXELS);
+  }
+
+  for (const [hid, subs] of SUBHEXES_BY_HEX) {
+    const hexT = canonicalHexTerrain(HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null);
+    const hexW = hexT ? +weights[hexT] : NaN;
+    const roadW = hexT ? +roadWeights[hexT] : NaN;
+
+    // Ferry hexes: the road segment in this hex is intentionally short
+    // (just the run-up to a river crossing), so applying the usual
+    // pixel-count threshold to gate ROAD-mode formation would erase the
+    // route's reason for being here, leaving dijkstra to pick LAND over
+    // ROAD_FERRY. Force the threshold off for ferry hexes so ROAD mode
+    // always forms when there are any road pixels at all.
+    const hexIsFerry = FERRY_HEXES ? FERRY_HEXES.has(hid) : false;
+
+    // Per-kind pixel buckets. Sets so flood-fill can ask O(1) "is this
+    // neighbor in the bucket". FORD is the new green-river bucket —
+    // separate from FERRY (which only ever holds painted road+thick
+    // overlays) and from LAND/ROAD (thin-river pixels are no longer
+    // mixed into either).
+    const landSet  = new Set();
+    const roadSet  = new Set();
+    const navalSet = new Set();
+    const ferrySet = new Set();
+    const fordSet  = new Set();
+
+    for (const sub of subs) {
+      const compCount = SUBHEX_COMPONENT_COUNT.get(sub.id) || 0;
+      const subIsNaval = WATER_TERRAINS.has(sub.class);
+      // Subhex class is no longer used to gate LAND-mode membership: a
+      // Mountain subhex inside a Hills hex (or any heavier-than-assigned
+      // subhex) contributes its pixels to landSet just like any other
+      // land subhex. The hex's assigned terrain still drives the LAND-
+      // mode cost (hexW), so the heavier subhex is traversed at the
+      // hex's cost — not its own class cost.
+
+      for (let comp = 1; comp <= compCount; comp++) {
+        const compKey = `${sub.id}:${comp}`;
+        const pixels = SUBHEX_COMPONENT_PIXELS ? SUBHEX_COMPONENT_PIXELS.get(compKey) : null;
+        if (!pixels || pixels.length === 0) continue;
+        // Road and thick-river flags are tested PER PIXEL now: the
+        // flood-fill no longer splits at the road/non-road boundary, so
+        // one component can mix land, road, and (in ferry hexes) ferry
+        // pixels. We walk the component once to collect road-pixel count
+        // and road-pixel index list — those drive the ROAD / ROAD_FERRY
+        // buckets — then walk again to do the per-pixel bucket assignment.
+        const roadMask  = ROAD_PIXEL_MASK;
+        const thickMask = THICK_RIVER_PIXEL_MASK;
+        let roadPixCount = 0;
+        if (roadMask) {
+          for (let pi = 0; pi < pixels.length; pi++) {
+            if (roadMask[pixels[pi]]) roadPixCount++;
+          }
+        }
+        // Road bucket always accepts road pixels. pruneTinyComponents
+        // (≤ MIN_MODE_COMPONENT_PIXELS) still drops microscopic ROAD
+        // flood-fill components downstream, so true stray-1-pixel road
+        // blips don't pollute the graph. Removing the per-component
+        // MIN_PIXELS_PER_PATH_HEX gate makes ROAD modes available for
+        // every hex with a real road segment painted — which is what
+        // lets dijkstra "snap to road" in start/end hexes via the
+        // multi-start/multi-end seeding below.
+        const roadAccepted = true;
+        const thinMask = THIN_RIVER_EXPANDED_MASK;
+        for (let pi = 0; pi < pixels.length; pi++) {
+          const p = pixels[pi];
+          const isRoadPix  = !!(roadMask  && roadMask[p]);
+          const isThickPix = !!(thickMask && thickMask[p]);
+          const isThinPix  = !isThickPix && !!(thinMask && thinMask[p]);
+          if (subIsNaval) {
+            // Naval-class subhex — all pixels go to NAVAL, unchanged.
+            navalSet.add(p);
+            continue;
+          }
+          if (isThickPix) {
+            // Thick (red) river pixel. Ferry the old way: ONLY pixels
+            // painted with a road overlay (the "ferry mark") are
+            // crossable, going into ferrySet. Unmarked thick-river
+            // pixels are blocked — left out of every bucket so they
+            // contribute no graph node.
+            if (isRoadPix) ferrySet.add(p);
+            continue;
+          }
+          if (isThinPix) {
+            // Thin (green) river pixel — its own FORD kind. Pulled out
+            // of LAND and ROAD entirely (the earlier "merge thin river
+            // into roadSet for bridging" hack is gone). Crossings are
+            // expressed via LAND+FORD / ROAD+FORD combos with the
+            // separate Fording surcharge.
+            fordSet.add(p);
+            continue;
+          }
+          if (isRoadPix) {
+            // Road pixel on non-thick / non-thin terrain. Always counts
+            // as land (so the renderer can step through it at land
+            // cost) and also as road if the component's road population
+            // meets the threshold.
+            landSet.add(p);
+            if (roadAccepted) roadSet.add(p);
+            continue;
+          }
+          // Pure land pixel. Added unconditionally — the old subhex-
+          // class weight gate is gone.
+          landSet.add(p);
+        }
+      }
+    }
+
+    // ── Expand ferrySet to the FULL red river of the hex ─────────────
+    // If the hex has any painted ferry-mark pixel (road ∩ thick), the
+    // whole thick-river area of the hex becomes ferry-crossable — the
+    // mask covers the full river so line A* has room to draw the
+    // crossing. The line A* is independently forced to pass THROUGH a
+    // ferry-mark pixel via the routeLineFromModes waypoint injection
+    // (see "ferry-mark waypoints" below), so the line still touches
+    // the painted mark while running across the wider river.
+    //
+    // Hexes WITHOUT any ferry mark keep ferrySet empty, so no
+    // ROAD_FERRY mode emits and the thick river remains impassable.
+    if (ferrySet.size > 0 && THICK_RIVER_PIXEL_MASK && HEX_PIXELS) {
+      const hexAllPx = HEX_PIXELS.get(hid);
+      if (hexAllPx) {
+        const thick = THICK_RIVER_PIXEL_MASK;
+        for (let i = 0; i < hexAllPx.length; i++) {
+          const p = hexAllPx[i];
+          if (thick[p]) ferrySet.add(p);
+        }
+      }
+    }
+    // fordSet: every thin-river pixel of the hex (any hex).
+
+    const hexModes = new Map();
+
+    // For each kind, flood-fill the per-hex pixel bucket into 8-connected
+    // components, then add one mode entry per component named like
+    // `${kind}#${idx}`. This is what fixes thick-river-split land: the
+    // two halves end up as LAND#0 and LAND#1 with no in-hex edge between
+    // them, so dijkstra has to go around (or via a ROAD_FERRY mode).
+    const emitComponents = (kindName, bucket, cost, isFerry) => {
+      if (bucket.size === 0 || !isFinite(cost)) return;
+      const kindNum = MODE_KIND_NUMS[kindName];
+      const comps = pruneTinyComponents(floodComponents(bucket));
+      for (let ci = 0; ci < comps.length; ci++) {
+        const pixels = comps[ci];
+        const name = `${kindName}#${ci}`;
+        hexModes.set(name, {
+          mode: name,
+          kind: kindName,
+          pixels,
+          cost,
+          isFerry,
+        });
+        // Stamp per-pixel lookup so precomputeHexModeNeighbors and
+        // hexModeAtPixel can resolve "what mode owns this pixel" in O(1).
+        for (let i = 0; i < pixels.length; i++) {
+          PIX_MODE_KIND[pixels[i]] = kindNum;
+          PIX_MODE_COMP[pixels[i]] = ci;
+        }
+      }
+    };
+
+    emitComponents("LAND", landSet, hexW, false);
+    emitComponents("ROAD", roadSet, roadW, false);
+    const isHexNaval = hexT && WATER_TERRAINS.has(hexT);
+    const navalW = isHexNaval ? hexW : +weights["Sea"];
+    if (navalSet.size > 0) {
+      // Naval cost: if the hex's sheet terrain is itself naval, use that
+      // weight (sailing). Otherwise this is a stranded naval subhex
+      // inside a land hex; bill it at "Sea" weight.
+      emitComponents("NAVAL", navalSet, navalW, false);
+    }
+    const ferrySurcharge = +weights["Ferry"]   || 0;
+    const fordSurcharge  = +weights["Fording"] || 0;
+    if (ferrySet.size > 0 && isFinite(ferrySurcharge) && ferrySurcharge >= 0) {
+      // ROAD_FERRY = the painted ferry-mark pixels of this hex (road
+      // overlaid on thick river). Single-mode cost = the ferry
+      // surcharge alone (0 is allowed — a marked ferry can be free,
+      // the road/land bank still pays its own cost via combo).
+      emitComponents("ROAD_FERRY", ferrySet, ferrySurcharge, true);
+    }
+    if (fordSet.size > 0 && isFinite(fordSurcharge) && fordSurcharge >= 0) {
+      // FORD = thin (green) river pixels of this hex. Separate kind
+      // from ROAD_FERRY, separate weight ("Fording").
+      emitComponents("FORD", fordSet, fordSurcharge, false);
+    }
+
+    // ── COMBO MODES ── pixel-union of multiple single-kind buckets, with
+    // costs SUMMED from per-kind base contributions. Lets dijkstra pick a
+    // single "what this hex is being used as" node whose pixels exactly
+    // cover the chosen traversal (e.g., ROAD+ROAD_FERRY = the road on
+    // both banks plus the ferry crossing, with cost road+ferry, NO land
+    // pixels included). Solves the "dijkstra picks LAND for a ferry hex,
+    // and the line mask drags in all the Plains pixels" problem.
+    //
+    // Base contributions per kind (always one occurrence per combo):
+    //   LAND       → hex weight
+    //   ROAD       → road weight
+    //   ROAD_FERRY → ferry surcharge alone (the road portion is the
+    //                ROAD kind's responsibility if it's also in the combo)
+    //   NAVAL      → naval weight (hex's terrain if water, else "Sea")
+    //
+    // We only generate combos whose pixel union is strictly larger than
+    // any constituent kind's set — same pixels at a higher cost would
+    // just be dominated, so they're not worth emitting. In practice this
+    // skips LAND+ROAD (road ⊂ land already) and any combo whose
+    // constituent kinds have empty buckets.
+    const baseCosts = {
+      LAND: hexW,
+      ROAD: roadW,
+      ROAD_FERRY: ferrySurcharge,
+      NAVAL: navalW,
+      FORD: fordSurcharge,
+    };
+    const kindSets = {
+      LAND: landSet,
+      ROAD: roadSet,
+      ROAD_FERRY: ferrySet,
+      NAVAL: navalSet,
+      FORD: fordSet,
+    };
+    const kindList = ["LAND", "ROAD", "ROAD_FERRY", "NAVAL", "FORD"];
+    // baseCosts[k] >= 0 (not > 0) so kinds with a 0-cost contribution
+    // — e.g., Ferry surcharge defaulting to 0 — still participate in
+    // combos. Without this ROAD_FERRY would silently vanish from every
+    // combo when Ferry weight is 0.
+    const presentKinds = kindList.filter(k =>
+      kindSets[k].size > 0 && isFinite(baseCosts[k]) && baseCosts[k] >= 0);
+    const nKinds = presentKinds.length;
+    if (nKinds >= 2) {
+      for (let mask = 1; mask < (1 << nKinds); mask++) {
+        // Need at least 2 kinds for a combo.
+        let bits = 0;
+        for (let i = 0; i < nKinds; i++) if (mask & (1 << i)) bits++;
+        if (bits < 2) continue;
+        const kinds = [];
+        let cost = 0;
+        const union = new Set();
+        let maxConstituentSize = 0;
+        for (let i = 0; i < nKinds; i++) {
+          if (!(mask & (1 << i))) continue;
+          const k = presentKinds[i];
+          kinds.push(k);
+          cost += baseCosts[k];
+          for (const p of kindSets[k]) union.add(p);
+          if (kindSets[k].size > maxConstituentSize) {
+            maxConstituentSize = kindSets[k].size;
+          }
+        }
+        // ── COMBO-LEVEL FILTER ───────────────────────────────────────
+        // Skip combos whose pixel union isn't strictly larger than the
+        // largest constituent kind's set: same pixels at a higher cost
+        // are always dominated.
+        if (union.size <= maxConstituentSize) continue;
+        // Also skip combos where one constituent kind's pixel set is
+        // entirely contained in another's (e.g., ROAD ⊂ LAND because
+        // landSet absorbs road pixels). The combo's union is just the
+        // larger kind's set; the combo is dominated by that single
+        // kind's mode.
+        let absorbed = false;
+        for (const k1 of kinds) {
+          if (absorbed) break;
+          const s1 = kindSets[k1];
+          for (const k2 of kinds) {
+            if (k1 === k2) continue;
+            const s2 = kindSets[k2];
+            // Quick reject — if s1 has more pixels than s2, can't be ⊂ s2.
+            if (s1.size > s2.size) continue;
+            let allIn = true;
+            for (const p of s1) {
+              if (!s2.has(p)) { allIn = false; break; }
+            }
+            if (allIn) { absorbed = true; break; }
+          }
+        }
+        if (absorbed) continue;
+        // ── FORD↔NAVAL GUARD ─────────────────────────────────────────
+        // A thin (green) river that meets open water is NOT a legal
+        // traversal: FORD models "wade across a narrow stream" and
+        // NAVAL models "travel by ship". Even at a stronghold, there's
+        // no ferry/disembark semantics for the FORD side — you cross a
+        // ford by walking, which doesn't connect to a naval node. Drop
+        // any combo that contains BOTH so dijkstra can't use a river
+        // mouth as a free river→sea (or sea→river) transition.
+        if (kinds.indexOf("FORD") >= 0 && kinds.indexOf("NAVAL") >= 0) continue;
+        // ── DISEMBARK-AT-STRONGHOLD GUARD ────────────────────────────
+        // A combo containing NAVAL + any non-NAVAL kind means the route
+        // can cross the land/water boundary INSIDE this combo (between
+        // pixel modes of the same combo node). Dijkstra's cross-hex
+        // edge check enforces "naval→land requires Stronghold", but it
+        // can't see boundary crossings that happen entirely inside a
+        // single combo. To prevent dijkstra from sneaking past the
+        // stronghold rule via a LAND+NAVAL combo, drop these mixed
+        // combos for hexes that aren't strongholds.
+        const hasNaval    = kinds.indexOf("NAVAL") >= 0;
+        const hasNonNaval = kinds.some(k => k !== "NAVAL");
+        if (hasNaval && hasNonNaval) {
+          const isStronghold = !!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(hid));
+          if (!isStronghold) continue;
+        }
+        if (union.size === 0 || !isFinite(cost) || cost < 0) continue;
+        const comboKindName = kinds.join("+");
+        // Strict corner-cut for combos: see floodComponents comment. A combo
+        // whose two pixel blobs touch only at a diagonal corner would
+        // produce one component under the river-aware rule but can't be
+        // rendered as a line — line A* refuses to corner-cut. Match it here.
+        const comps = pruneTinyComponents(floodComponents(union, true));
+        for (let ci = 0; ci < comps.length; ci++) {
+          const pixels = comps[ci];
+          // ── COMPONENT-LEVEL FILTER ──────────────────────────────────
+          // After flood-fill, a combo can produce components that contain
+          // pixels from only ONE constituent kind (because that kind's
+          // pixels are spatially disjoint from the others' in this hex).
+          // Such a component is identical to the single-kind component
+          // it overlaps, but at a higher sum-cost — dominated. Drop it.
+          let pureSingleKind = false;
+          for (const k of kinds) {
+            const kSet = kindSets[k];
+            let allIn = true;
+            for (let pi = 0; pi < pixels.length; pi++) {
+              if (!kSet.has(pixels[pi])) { allIn = false; break; }
+            }
+            if (allIn) { pureSingleKind = true; break; }
+          }
+          if (pureSingleKind) continue;
+          const name = `${comboKindName}#${ci}`;
+          hexModes.set(name, {
+            mode: name,
+            kind: comboKindName,
+            kinds,                            // array, for downstream filtering
+            isCombo: true,
+            pixels,
+            cost,
+            isFerry: kinds.indexOf("ROAD_FERRY") >= 0,
+          });
+          // Combos deliberately do NOT stamp PIX_MODE_KIND/PIX_MODE_COMP
+          // (those arrays carry a single value per pixel; combos overlap
+          // single modes on the same pixels). Combo edges are derived in
+          // addComboModeNeighbors from the constituent single modes'
+          // neighbors instead.
+        }
+      }
+    }
+
+    if (hexModes.size > 0) HEX_MODES.set(hid, hexModes);
+  }
+}
+
+// Combo modes don't appear in the PIX_MODE_KIND / PIX_MODE_COMP arrays
+// (a pixel can belong to multiple combos at once, but the arrays only
+// hold one entry per pixel). So precomputeHexModeNeighbors — which
+// derives edges from those arrays — never sees combos. We patch them in
+// after the fact: a combo's neighbors are the UNION of all its
+// constituent single-kind modes' cross-hex neighbors, plus free intra-hex
+// edges to every other mode/combo in the same hex. The reverse direction
+// (single mode → combo across a hex boundary) is added symmetrically so
+// dijkstra can transition INTO a combo from a neighbor's perspective.
+function addComboModeNeighbors() {
+  if (!HEX_MODES || !HEX_MODE_NEIGHBORS) return;
+  for (const [hid, modes] of HEX_MODES) {
+    // Index single modes of this hex by their kind, so a combo can find
+    // its constituents' graph keys in O(1).
+    const singleKeysByKind = new Map();
+    for (const [name, info] of modes) {
+      if (info.isCombo) continue;
+      const fullKey = `${hid}:${name}`;
+      let list = singleKeysByKind.get(info.kind);
+      if (!list) { list = []; singleKeysByKind.set(info.kind, list); }
+      list.push(fullKey);
+    }
+
+    for (const [name, info] of modes) {
+      if (!info.isCombo) continue;
+      const comboKey = `${hid}:${name}`;
+      let nbs = HEX_MODE_NEIGHBORS.get(comboKey);
+      if (!nbs) { nbs = new Set(); HEX_MODE_NEIGHBORS.set(comboKey, nbs); }
+
+      // Inherit cross-hex edges only from constituent components whose
+      // pixels ACTUALLY overlap with this combo component's pixels. The
+      // earlier version unioned every constituent component's edges,
+      // which over-connected the combo: a combo component that contained
+      // (say) ROAD#1 + ROAD_FERRY#0 would inherit edges from ROAD#0 as
+      // well, even though ROAD#0's pixels aren't in this combo — letting
+      // dijkstra pick paths the renderer couldn't follow. Now we check
+      // overlap per constituent.
+      const comboPixSet = new Set();
+      for (let i = 0; i < info.pixels.length; i++) comboPixSet.add(info.pixels[i]);
+      for (const k of info.kinds) {
+        const keys = singleKeysByKind.get(k) || [];
+        for (const constituentKey of keys) {
+          // Resolve the constituent's mode info to inspect its pixels.
+          const colonAt = constituentKey.indexOf(":");
+          const constName = constituentKey.slice(colonAt + 1);
+          const constMode = modes.get(constName);
+          if (!constMode) continue;
+          // Quick early-out: scan the constituent's pixels for any
+          // membership in comboPixSet. One hit is enough.
+          let overlaps = false;
+          const cpx = constMode.pixels;
+          for (let i = 0; i < cpx.length; i++) {
+            if (comboPixSet.has(cpx[i])) { overlaps = true; break; }
+          }
+          if (!overlaps) continue;
+          const constNbs = HEX_MODE_NEIGHBORS.get(constituentKey);
+          if (!constNbs) continue;
+          for (const nb of constNbs) {
+            // Skip intra-hex edges from the constituent's set — we'll
+            // add fresh intra-hex edges below covering combos too.
+            if (nb.startsWith(`${hid}:`)) continue;
+            nbs.add(nb);
+          }
+        }
+      }
+
+      // Free intra-hex edges to every other mode (single or combo) of
+      // this hex. Dijkstra's intra-hex transition is free (the running
+      // max takes care of the cost), so this gives combos the same
+      // intra-hex mobility single modes already have.
+      for (const [otherName] of modes) {
+        if (otherName === name) continue;
+        nbs.add(`${hid}:${otherName}`);
+      }
+
+      // Reverse direction: every cross-hex neighbor needs to know it
+      // can transition INTO this combo.
+      for (const nb of nbs) {
+        if (nb.startsWith(`${hid}:`)) continue;
+        let nbNbs = HEX_MODE_NEIGHBORS.get(nb);
+        if (!nbNbs) { nbNbs = new Set(); HEX_MODE_NEIGHBORS.set(nb, nbNbs); }
+        nbNbs.add(comboKey);
+      }
+    }
+  }
+}
+
+// Walk the per-pixel mode lookup and link every (hex, mode) node to
+// every other (hex, mode) it's 8-connected to (across hex borders or
+// across mode boundaries inside the same hex). Both kinds of edges
+// share the same map. Diagonals require at least one of the two
+// orthogonal corners to also be passable (no corner-cut), matching
+// the renderer's A*.
+function precomputeHexModeNeighbors() {
+  HEX_MODE_NEIGHBORS = new Map();
+  if (!HEX_MODES || !HEX_ID_PX || !SUBHEX_ID_IMG_DATA) return;
+  if (!PIX_MODE_KIND || !PIX_MODE_COMP) return;
+  const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
+  const pixKind = PIX_MODE_KIND;
+  const pixComp = PIX_MODE_COMP;
+  const pixHex  = HEX_ID_PX;  // already populated globally
+  const numToKind = MODE_KIND_NAMES;
+
+  const link = (aKey, bKey) => {
+    let set = HEX_MODE_NEIGHBORS.get(aKey);
+    if (!set) { set = new Set(); HEX_MODE_NEIGHBORS.set(aKey, set); }
+    set.add(bKey);
+  };
+
+  // Walk every passable pixel; for each 8-neighbor that's also passable
+  // and not the same (hex, kind, comp), link the two mode nodes.
+  for (let y = 0; y < H; y++) {
+    const row = y * W;
+    for (let x = 0; x < W; x++) {
+      const i = row + x;
+      const kA = pixKind[i];
+      if (!kA) continue;
+      const cA = pixComp[i];
+      const hA = pixHex[i];
+      // Orthogonal
+      if (x + 1 < W) checkAndLink(i, i + 1, kA, cA, hA, pixKind, pixComp, pixHex, numToKind, link, x, y, +1, 0, W, H);
+      if (y + 1 < H) checkAndLink(i, i + W, kA, cA, hA, pixKind, pixComp, pixHex, numToKind, link, x, y, 0, +1, W, H);
+      // Diagonal (no corner-cut)
+      if (x + 1 < W && y + 1 < H) checkAndLink(i, i + W + 1, kA, cA, hA, pixKind, pixComp, pixHex, numToKind, link, x, y, +1, +1, W, H);
+      if (x > 0     && y + 1 < H) checkAndLink(i, i + W - 1, kA, cA, hA, pixKind, pixComp, pixHex, numToKind, link, x, y, -1, +1, W, H);
+    }
+  }
+}
+// Helper hoisted so precomputeHexModeNeighbors stays readable.
+function checkAndLink(i, j, kA, cA, hA, pixKind, pixComp, pixHex, numToKind, link, x, y, dx, dy, W, H) {
+  const kB = pixKind[j];
+  if (!kB) return;
+  const hB = pixHex[j];
+  const cB = pixComp[j];
+  // Same (hex, kind, component) — no edge needed (self-loop).
+  if (hA === hB && kA === kB && cA === cB) return;
+  // River kinds (FORD = green, ROAD_FERRY = red) are HEX-INTERNAL only.
+  // You can't enter a river from a different hex — you must arrive on
+  // the bank of THIS hex via LAND or ROAD and then traverse the river
+  // within the hex via a LAND+FORD / ROAD+FORD / LAND+ROAD_FERRY /
+  // ROAD+ROAD_FERRY combo. Block ANY cross-hex edge where either side
+  // is FORD or ROAD_FERRY. Combos still get their cross-hex edges via
+  // their LAND/ROAD constituents (addComboModeNeighbors).
+  const FORD       = MODE_KIND_NUMS.FORD;
+  const ROAD_FERRY = MODE_KIND_NUMS.ROAD_FERRY;
+  if (hA !== hB) {
+    if (kA === FORD || kB === FORD)             return;
+    if (kA === ROAD_FERRY || kB === ROAD_FERRY) return;
+  }
+  // Corner-cut check on diagonals. MUST match line A*'s rule
+  // (aStarInMask in pathfinding.js) so we never create an edge the
+  // renderer can't actually trace: line A* blocks the diagonal if
+  // EITHER orthogonal corner is impassable.
+  if (dx !== 0 && dy !== 0) {
+    const ox = y * W + (x + dx);
+    const oy = (y + dy) * W + x;
+    if (!pixKind[ox] || !pixKind[oy]) return;
+  }
+  const aKey = `${hA}:${numToKind[kA]}#${cA}`;
+  const bKey = `${hB}:${numToKind[kB]}#${cB}`;
+  link(aKey, bKey);
+  link(bKey, aKey);
+}
+
 function precomputeBlockedSubhexEdges() {
   BLOCKED_SUBHEX_EDGES = new Set();
   // Use the dilated blocking mask so the edge check agrees with what
@@ -1239,6 +2744,22 @@ function precomputeRoadSubhexes() {
   }
 }
 
+// Parallel to precomputeRoadSubhexes — collect every subhex id that contains
+// at least one river pixel (rivers.png). Used by the ferry road+river-subhex
+// tier in restrict() to decide which subhexes' pixels count as "the route
+// belongs here" inside a ferry hex when the route can't be resolved by road
+// pixels alone. Pixel-driven, same as ROAD_SUBHEXES: no spreadsheet flag.
+function precomputeRiverSubhexes() {
+  RIVER_SUBHEXES = new Set();
+  if (!HEX_RIVER_PIXELS || !SUBHEX_ID_PX) return;
+  for (const arr of HEX_RIVER_PIXELS.values()) {
+    for (let i = 0; i < arr.length; i++) {
+      const sid = SUBHEX_ID_PX[arr[i]];
+      if (sid) RIVER_SUBHEXES.add(sid);
+    }
+  }
+}
+
 // Effective traversal weight for one COMPONENT of a subhex. A component is
 // the unit dijkstra navigates: road and non-road pixels of the same subhex
 // form distinct components (see precomputeSubhexComponents), so we can
@@ -1495,6 +3016,329 @@ function dijkstraHexPath(srcHex, dstHex) {
 // values for the same (subhex, component) are distinct nodes — necessary
 // for dominance to work right when a heavier-max path arrives first but a
 // lighter-max path is strictly cheaper later in the same hex.
+// Pick the (hex, mode) node that owns a given pixel. The renderer hands
+// us a click pixel; we need the matching mode node so dijkstra knows
+// which kind of route the user is starting / ending on.
+function hexModeAtPixel(pixIdx) {
+  if (pixIdx == null || !HEX_MODES || !HEX_ID_PX) return null;
+  const hid = HEX_ID_PX[pixIdx];
+  if (!hid) return null;
+  const modes = HEX_MODES.get(hid);
+  if (!modes) return null;
+  // O(1) lookup via the per-pixel mode arrays populated by
+  // precomputeHexModes. Each pixel belongs to exactly one (kind, comp).
+  if (PIX_MODE_KIND && PIX_MODE_COMP) {
+    const k = PIX_MODE_KIND[pixIdx];
+    if (k) {
+      const name = `${MODE_KIND_NAMES[k]}#${PIX_MODE_COMP[pixIdx]}`;
+      if (modes.has(name)) return name;
+    }
+  }
+  // Fallback for pixels that aren't in any mode (e.g. user clicked on a
+  // blocked pixel) — pick the closest mode-node of the hex by pixel
+  // distance so the routing still has somewhere to start/end.
+  let best = null, bestDist = Infinity;
+  if (SUBHEX_ID_IMG_DATA) {
+    const W = SUBHEX_ID_IMG_DATA.width;
+    const py = (pixIdx / W) | 0, px = pixIdx - py * W;
+    for (const [name, info] of modes) {
+      const pxs = info.pixels;
+      for (let i = 0; i < pxs.length; i++) {
+        const p = pxs[i];
+        const qy = (p / W) | 0, qx = p - qy * W;
+        const dx = qx - px, dy = qy - py;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestDist) { bestDist = d2; best = name; if (d2 === 0) return name; }
+      }
+    }
+  }
+  return best || modes.keys().next().value || null;
+}
+
+// Mode-graph dijkstra. State: (hex, mode, runningMaxInCurrentHex). The
+// running max model: crossing into a new hex pays the leaving hex's
+// running max; intra-hex transitions between modes update the running
+// max for free (max(uMax, vMode.cost)). LAND ↔ NAVAL transitions —
+// whether intra-hex or cross-hex — add the Embark surcharge. The Ferry
+// surcharge is already baked into ROAD_FERRY's mode cost, so just
+// entering a ROAD_FERRY node bills it once. Returns:
+//   { path: [[hex, mode], ...], hexWeights, pathRoadHexes,
+//     pathComponents, totalCost, usedFerryHexes, embarks, ferries }
+// path is the (hex, mode) sequence dijkstra picked, in order; the rest
+// mirror what the old dijkstra used to return so computeSegment can
+// drop in.
+// True if the given mode (single OR combo) involves NAVAL traversal. Used
+// by dijkstra and the path-reconstruction loop to bill the Embark
+// surcharge on transitions in/out of any naval-touching mode. The single
+// `info.kind === "NAVAL"` check missed combos like LAND+NAVAL or
+// ROAD+NAVAL whose `kind` is the combined string — dijkstra would
+// silently route through them embark-free.
+function modeIsNaval(info) {
+  if (!info) return false;
+  if (info.kind === "NAVAL") return true;
+  if (info.kinds && info.kinds.indexOf("NAVAL") >= 0) return true;
+  return false;
+}
+function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, toPixIdx) {
+  if (!HEX_MODES || !HEX_MODE_NEIGHBORS) return null;
+  const fromModes = HEX_MODES.get(fromHexId);
+  const toModes   = HEX_MODES.get(toHexId);
+  if (!fromModes || !toModes) return null;
+  // Multi-start / multi-end semantics: the start hex contributes 0 to
+  // total cost regardless of which mode is used (free start), and the
+  // line A* snaps the click pixel to whichever mode dijkstra picks. So
+  // seed every mode of fromHexId as a candidate start, and accept any
+  // mode of toHexId as a valid goal.
+  //
+  // SUBHEX-LEVEL FILTER: only consider modes whose pixel set INCLUDES
+  // the click pixel's subhex. Without this, dijkstra can land on a
+  // cheaper mode that happens to be in the same hex but a different
+  // subhex (e.g., the other bank of a thick river), and the line A*
+  // ends up snapping the click pixel to a point on the wrong side of
+  // the river. With the filter, dijkstra is forced to enter/exit via
+  // a mode that actually covers the click's subhex.
+  //
+  // Debug overrides (HEX_MODE_OVERRIDES) further restrict the candidate
+  // set to just the pinned mode for that hex.
+  const startOverride = HEX_MODE_OVERRIDES.get(fromHexId);
+  const endOverride   = HEX_MODE_OVERRIDES.get(toHexId);
+  // Pixel-level endpoint filter: a mode is a valid start (or end) only
+  // if its flood-fill pixel set contains the EXACT click pixel. Looser
+  // subhex-level matching let modes on the wrong side of a thick river
+  // qualify when their subhex was split — they had pixels in the same
+  // subhex as the click, just on the opposite bank. Pixel-level pins
+  // the endpoint to a mode that actually reaches the click point.
+  const modeContainsPixel = (info, idx) => {
+    if (idx == null) return true;   // unknown pixel → no filter
+    const pxs = info.pixels;
+    for (let i = 0; i < pxs.length; i++) {
+      if (pxs[i] === idx) return true;
+    }
+    return false;
+  };
+
+  // DEBUG: detailed log for the long-route diagnostic. Triggered by
+  // window.__DEBUG_DIJKSTRA = true in the dev console.
+  const DBG = (typeof window !== "undefined") && window.__DEBUG_DIJKSTRA;
+  const dbgHexes = (typeof window !== "undefined") && window.__DEBUG_DIJKSTRA_HEXES;
+  const dbgLog = DBG ? (...args) => console.log("[djk]", ...args) : () => {};
+  if (DBG) {
+    dbgLog("start", { fromHexId, fromMode, toHexId, toMode });
+    // Dump modes available in 1838 (or whichever hex(es) the user pinned).
+    if (dbgHexes) {
+      for (const h of dbgHexes) {
+        const modes = HEX_MODES.get(h);
+        if (modes) {
+          const summary = [];
+          for (const [name, info] of modes) {
+            const nb = HEX_MODE_NEIGHBORS.get(`${h}:${name}`);
+            const nbHexes = new Set();
+            const nbSelf = [];
+            if (nb) for (const k of nb) {
+              const c = k.indexOf(":");
+              const nh = +k.slice(0, c);
+              if (nh === h) nbSelf.push(k.slice(c + 1));
+              else nbHexes.add(nh);
+            }
+            summary.push({ name, cost: info.cost, pixels: info.pixels.length,
+              intraHex: nbSelf, neighborHexes: Array.from(nbHexes) });
+          }
+          dbgLog(`hex ${h} modes:`, summary);
+        } else {
+          dbgLog(`hex ${h} has NO modes`);
+        }
+      }
+    }
+  }
+
+  // Same-hex segment is handled in computeSegment via an early branch
+  // that never reaches dijkstra, so fromHexId !== toHexId here.
+
+  const dist = new Map();
+  const prev = new Map();
+  const heap = new MinHeap2();
+  // Heap payload: [d, key, runningMax, hexId, isStart].
+  // ── MULTI-START SEED ──
+  // Push every candidate start mode of fromHexId at cost 0. Restricted
+  // to modes whose pixels include the click pixel's subhex (so dijkstra
+  // doesn't snap to a mode on the wrong side of a thick river within
+  // the same hex). Pinned start hexes further narrow to just the
+  // override.
+  const startStateKeys = new Set();
+  for (const [mName, mInfo] of fromModes) {
+    if (!isFinite(mInfo.cost) || mInfo.cost < 0) continue;
+    if (startOverride && mName !== startOverride) continue;
+    if (!modeContainsPixel(mInfo, fromPixIdx)) continue;
+    const sKey = `${fromHexId}:${mName}`;
+    const sStateKey = `${sKey}|${mInfo.cost}`;
+    dist.set(sStateKey, 0);
+    startStateKeys.add(sStateKey);
+    heap.push([0, sKey, mInfo.cost, fromHexId, true]);
+  }
+  if (heap.size() === 0) return null;     // no valid start modes
+
+  let bestTotal = Infinity, bestStateKey = null;
+
+  while (heap.size() > 0) {
+    const [d, , uKey, uMax, uHex, uIsStart] = heap.pop();
+    if (d >= bestTotal) break;
+    const uStateKey = `${uKey}|${uMax}`;
+    if (d > (dist.get(uStateKey) ?? Infinity)) continue;
+
+    // Decode current node.
+    const colon = uKey.indexOf(":");
+    const uMode = uKey.slice(colon + 1);
+    const uInfo = HEX_MODES.get(uHex)?.get(uMode);
+
+    // ── MULTI-END GOAL CHECK ──
+    // Any state landing on a mode of toHexId IS a candidate goal — as
+    // long as the mode's pixels include the click pixel's subhex (so
+    // the line A* actually reaches the click point, not the opposite
+    // bank of a river). Pinned end hex further restricts to override.
+    if (uHex === toHexId
+        && (!endOverride || uMode === endOverride)
+        && uInfo && modeContainsPixel(uInfo, toPixIdx)) {
+      // Close out destination hex's running max (0 if we never left start).
+      const close = uIsStart ? 0 : uMax;
+      const total = d + close;
+      if (DBG) dbgLog("goal-pop", { d, uMax, close, total, bestTotal });
+      if (total < bestTotal) { bestTotal = total; bestStateKey = uStateKey; }
+      continue;
+    }
+
+    const neighbors = HEX_MODE_NEIGHBORS.get(uKey);
+    if (!neighbors) continue;
+
+    const uIsNaval = modeIsNaval(uInfo);
+
+    for (const vKey of neighbors) {
+      const colonV = vKey.indexOf(":");
+      const vHex = +vKey.slice(0, colonV);
+      const vMode = vKey.slice(colonV + 1);
+      const vInfo = HEX_MODES.get(vHex)?.get(vMode);
+      // Cost of 0 is valid (e.g., Ferry surcharge defaulting to 0).
+      // Skip only if cost is non-finite or negative.
+      if (!vInfo || !isFinite(vInfo.cost) || vInfo.cost < 0) continue;
+      // Honor the debug override — if vHex has a pinned mode, drop edges
+      // into any other mode of that hex. Forces dijkstra to traverse the
+      // hex via the pinned mode (or fail).
+      const vOverride = HEX_MODE_OVERRIDES.get(vHex);
+      if (vOverride && vMode !== vOverride) continue;
+      const vIsNaval = modeIsNaval(vInfo);
+
+      // ── ONE MODE PER HEX ──
+      // Intra-hex transitions (vHex === uHex) are disabled. Every hex
+      // must be entered AND exited via the same mode. Multi-kind
+      // traversal within a hex has to use a combo mode that bundles
+      // the relevant kinds + their sum-cost. Without this skip,
+      // dijkstra would chain singletons via free intra-hex moves and
+      // the cheapest path would routinely pick multiple modes per
+      // hex, defeating the "one picked mode per hex" rule.
+      if (vHex === uHex) continue;
+      // Cross-hex transition. Pay leaving hex's running max (0 if we
+      // never left start), reset to v's mode cost.
+      const close = uIsStart ? 0 : uMax;
+      let nd = d + close;
+      const nMax = vInfo.cost;
+      const nHex = vHex;
+      const nIsStart = false;
+      // ── Naval boundary ──
+      // Embark fires only on land → naval (entering water). Cost = Embark.
+      // Disembark fires only on naval → land (leaving water). Blocked
+      // unless the destination hex has a Stronghold flag; cost = Disembark.
+      if (uIsNaval && !vIsNaval) {
+        // Disembark.
+        if (!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(vHex))) continue;
+        const dw = +weights["Disembark"] || 0;
+        if (isFinite(dw) && dw > 0) nd += dw;
+      } else if (!uIsNaval && vIsNaval) {
+        // Embark.
+        const e = +weights["Embark"];
+        if (isFinite(e) && e > 0) nd += e;
+      }
+
+      const nStateKey = `${vKey}|${nMax}`;
+      if (nd < (dist.get(nStateKey) ?? Infinity)) {
+        dist.set(nStateKey, nd);
+        prev.set(nStateKey, uStateKey);
+        heap.push([nd, vKey, nMax, nHex, nIsStart]);
+      }
+    }
+  }
+
+  if (bestStateKey == null) return null;
+
+  // Reconstruct (hex, mode) sequence (deduped consecutive same-key).
+  const keys = [];
+  let cur = bestStateKey;
+  // Multi-start prev-chain walk: terminate at any seeded start state
+  // (those have no entry in `prev` since they were enqueued without one).
+  while (cur != null) {
+    keys.push(cur);
+    if (startStateKeys.has(cur)) break;
+    const p = prev.get(cur);
+    if (!p) break;
+    cur = p;
+  }
+  keys.reverse();
+  const path = [];
+  const hexWeights = new Map();
+  const pathRoadHexes = new Set();
+  const usedFerryHexes = new Set();
+  let embarks = 0, ferries = 0;
+  let lastKey = null;
+  let prevKind = null;
+  for (const sk of keys) {
+    const pipe = sk.indexOf("|");
+    const k = sk.slice(0, pipe);
+    if (k === lastKey) continue;
+    const colon = k.indexOf(":");
+    const hex = +k.slice(0, colon);
+    const mode = k.slice(colon + 1);
+    const info = HEX_MODES.get(hex)?.get(mode);
+    if (!info) continue;
+    path.push([hex, mode]);
+    const prevMax = hexWeights.get(hex);
+    if (prevMax == null || info.cost > prevMax) hexWeights.set(hex, info.cost);
+    // Combo modes carry a `kinds` array; single modes only have `kind`.
+    // Normalize so the checks below work on both.
+    const infoKinds = info.kinds || [info.kind];
+    if (infoKinds.indexOf("ROAD") >= 0 || infoKinds.indexOf("ROAD_FERRY") >= 0) pathRoadHexes.add(hex);
+    if (info.isFerry) { ferries++; usedFerryHexes.add(hex); }
+    // Embark count tracks land → naval boundary crossings only (boarding
+    // a ship). Disembarks (naval → land) are tracked separately because
+    // they're free under the current cost model and only allowed at
+    // Stronghold hexes. prevKind is a boolean "was the previous mode
+    // naval-touching?" so the comparison works for both single and combo
+    // modes.
+    const isNaval = modeIsNaval(info);
+    if (prevKind === false && isNaval === true) embarks++;
+    prevKind = isNaval;
+    lastKey = k;
+  }
+
+  // pathComponents — kept for callers (tooltip, etc.) but mode-graph
+  // doesn't track per-component data. Leave empty; downstream consumers
+  // that need it will fall through.
+  const pathComponents = new Set();
+
+  if (DBG) {
+    dbgLog("FINAL path:", path.map(([h, m]) => `${h}:${m}`).join(" -> "));
+    dbgLog("FINAL totalCost:", bestTotal, "ferries:", ferries, "embarks:", embarks);
+  }
+
+  return {
+    path,
+    hexWeights,
+    pathRoadHexes,
+    pathComponents,
+    totalCost: bestTotal,
+    usedFerryHexes,
+    embarks,
+    ferries,
+  };
+}
+
 function dijkstraSubhexPath(fromSubId, toSubId, fromPixelIdx, toPixelIdx) {
   if (fromSubId == null || toSubId == null) return null;
   if (!NEIGHBORS) return null;
@@ -1564,21 +3408,12 @@ function dijkstraSubhexPath(fromSubId, toSubId, fromPixelIdx, toPixelIdx) {
       if (!isFinite(vW) || vW <= 0) continue;
       const vIsNaval = WATER_TERRAINS.has(vSub.class);
       const vIsRoad  = ROAD_COMPONENTS && ROAD_COMPONENTS.has(`${vSid}:${vComp}`);
-      // Assigned-weight restriction for LAND components only: a land
-      // component (non-road, non-naval) is impassable if its class
-      // weight exceeds the parent hex's assigned terrain weight. So a
-      // Mountains subhex inside a Flatlands hex is unreachable by
-      // dijkstra. Road components and naval components ignore this gate
-      // (road can cut through any terrain at the road weight; naval
-      // routes obey the embark rule). The destination is exempt — if
-      // the user clicked into a heavy land subhex, we still need to
-      // reach it; we just can't TRANSIT through other heavy land.
-      const isDestination = (vSid === toSubId && vComp === toComp);
-      if (!vIsRoad && !vIsNaval && !isDestination) {
-        const vT = HEX_TERRAIN ? canonicalHexTerrain(HEX_TERRAIN.get(vSub.hex)) : null;
-        const vHexW = vT ? +weights[vT] : NaN;
-        if (isFinite(vHexW) && vW > vHexW) continue;
-      }
+      // (The old assigned-weight transit restriction — blocking land
+      // subhexes whose class weight exceeded the parent hex's terrain
+      // weight, e.g. a Mountains subhex inside a Flatlands hex — has
+      // been removed. Heavier-than-assigned land subhexes are now
+      // traversable; the parent hex's terrain weight still drives the
+      // per-hex traversal cost.)
 
       let nd, nMax, nHex, nIsStart;
       if (vSub.hex === uHex) {
@@ -1723,33 +3558,54 @@ function buildSubhexMaskForHexPath(hexPath, fromSubId, toSubId) {
 // their own map's hex pixel size.
 let MIN_PIXELS_PER_PATH_HEX = 10;
 
-// Walk the rendered line pixel-by-pixel, count centerline pixels per hex,
-// and return the hexes the line actually spends a meaningful stretch in
-// (>= MIN_PIXELS_PER_PATH_HEX), in first-seen order. Also returns a per-hex
-// max effective weight derived from the components the line went through —
-// that's what the segment's cost should bill, since cost should match what
-// the line actually traversed (not dijkstra's hex sequence, which can
-// briefly enter adjacent hexes that the line passes through too quickly to
-// matter).
+// Walk the rendered line pixel-by-pixel using the same Bresenham+thick
+// stamp drawPathLine uses, counting DISTINCT painted pixels per hex.
+// Returns EVERY hex the line crossed (in first-seen order). Hexes the
+// drawn line covers fewer than MIN_PIXELS_PER_PATH_HEX pixels in are
+// kept in the path but their effective weight is forced to 0 — "free"
+// hexes. The segment's cost-adjustment step refunds dijkstra's per-hex
+// contribution for these hexes downstream.
 //
-// alwaysInclude is an iterable of hex ids that count regardless of how few
-// pixels they have (start/end hexes — the user explicitly clicked them).
+// Returns:
+//   hexPath          — full ordered list of hexes the line crossed
+//   hexWeights       — per-hex effective weight (0 for sub-threshold hexes)
+//   pxCount          — per-hex DISTINCT-painted pixel count (line-width aware)
+//   subThresholdHexes — Set of hex ids the line painted < threshold px in
+//   allCrossed       — full set (same as hexPath, kept for backward compat)
+//
+// alwaysInclude is an iterable of hex ids that must be considered full-cost
+// regardless of pixel count (start/end hexes — user explicitly clicked them).
 function countLineMainHexes(linePts, alwaysInclude) {
-  const out = { hexPath: [], hexWeights: new Map(), allCrossed: new Set() };
+  const out = {
+    hexPath: [], hexWeights: new Map(), pxCount: new Map(),
+    subThresholdHexes: new Set(), allCrossed: new Set(),
+  };
   if (!linePts || linePts.length < 1 || !HEX_ID_PX || !SUBHEX_ID_PX || !SUBHEX_ID_IMG_DATA) return out;
   const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
-  const count    = new Map();
+  // Distinct painted pixels per hex (line-width-aware).
+  const painted  = new Map();   // hex_id -> Set<full pixel index>
   const weightMx = new Map();
   const firstAt  = new Map();
   let seq = 0;
-  const sample = (x, y) => {
+  // Mirror drawPathLine's stamp size: a Math.max(1, round(LINE_WIDTH)) ×
+  // same square centered at each Bresenham step, with half = floor(thick/2).
+  // Adjacent stamps overlap heavily, so we de-dupe via the per-hex Set.
+  const thick = Math.max(1, Math.round(LINE_WIDTH));
+  const half  = Math.floor(thick / 2);
+  // Sample a SINGLE pixel into the per-hex painted set + update weight tracking.
+  const sampleOne = (x, y) => {
     if (x < 0 || y < 0 || x >= W || y >= H) return;
     const fullIdx = y * W + x;
     const hid = HEX_ID_PX[fullIdx];
     if (!hid) return;
-    count.set(hid, (count.get(hid) || 0) + 1);
-    if (!firstAt.has(hid)) firstAt.set(hid, seq);
+    let set = painted.get(hid);
+    if (!set) {
+      set = new Set();
+      painted.set(hid, set);
+      firstAt.set(hid, seq);
+    }
     seq++;
+    set.add(fullIdx);
     out.allCrossed.add(hid);
     const sid = SUBHEX_ID_PX[fullIdx];
     const sub = SUBHEX_INDEX.get(sid);
@@ -1760,6 +3616,17 @@ function countLineMainHexes(linePts, alwaysInclude) {
     const prev = weightMx.get(hid);
     if (prev == null || w > prev) weightMx.set(hid, w);
   };
+  // Stamp a thick×thick square at (cx, cy), matching drawPathLine's
+  // pixel-perfect Bresenham mode. For thick = 1 it's just the single
+  // pixel; for larger thicks the centered square gets painted.
+  const stamp = (cx, cy) => {
+    if (thick <= 1) { sampleOne(cx, cy); return; }
+    for (let oy = -half; oy < thick - half; oy++) {
+      for (let ox = -half; ox < thick - half; ox++) {
+        sampleOne(cx + ox, cy + oy);
+      }
+    }
+  };
   for (let i = 0; i < linePts.length - 1; i++) {
     let x0 = Math.round(linePts[i].x),     y0 = Math.round(linePts[i].y);
     const x1 = Math.round(linePts[i + 1].x), y1 = Math.round(linePts[i + 1].y);
@@ -1767,23 +3634,26 @@ function countLineMainHexes(linePts, alwaysInclude) {
     const dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     let err = dx + dy;
     while (true) {
-      sample(x0, y0);
+      stamp(x0, y0);
       if (x0 === x1 && y0 === y1) break;
       const e2 = 2 * err;
       if (e2 >= dy) { err += dy; x0 += sx; }
       if (e2 <= dx) { err += dx; y0 += sy; }
     }
   }
-  // Force-include start/end (and anything else the caller pins). They get a
-  // synthetic high pixel count so the threshold can't drop them.
+  // Convert the per-hex painted Sets to plain counts for downstream code.
+  const count = new Map();
+  for (const [hid, set] of painted) count.set(hid, set.size);
+  // Force-include start/end (and anything else the caller pins). Pinned
+  // hexes always get full cost — they can't be sub-threshold.
   const pinned = new Set();
   if (alwaysInclude) for (const hid of alwaysInclude) { if (hid != null) pinned.add(hid); }
+  // Build the full hex path — every hex the line touched, sorted by
+  // first-sampled order. A pinned hex the line never sampled (e.g., a
+  // start hex where the click pixel lands exactly at the segment endpoint)
+  // gets injected with a synthetic earlier order.
   const main = [];
-  for (const [hid, c] of count) {
-    if (pinned.has(hid) || c >= MIN_PIXELS_PER_PATH_HEX) main.push(hid);
-  }
-  // A pinned hex the line never crossed (e.g. start hex but the line starts
-  // right at the click pixel without sampling that hex) — synthesize it.
+  for (const hid of count.keys()) main.push(hid);
   for (const hid of pinned) {
     if (!firstAt.has(hid)) {
       firstAt.set(hid, -1 - main.length);
@@ -1792,9 +3662,19 @@ function countLineMainHexes(linePts, alwaysInclude) {
   }
   main.sort((a, b) => firstAt.get(a) - firstAt.get(b));
   out.hexPath = main;
+  // Per-hex effective weight: 0 for sub-threshold (non-pinned) hexes,
+  // otherwise the max effective weight the line actually crossed.
   for (const hid of main) {
-    const w = weightMx.get(hid);
-    if (isFinite(w)) out.hexWeights.set(hid, w);
+    const c = count.get(hid) || 0;
+    out.pxCount.set(hid, c);
+    const subThreshold = !pinned.has(hid) && c < MIN_PIXELS_PER_PATH_HEX;
+    if (subThreshold) {
+      out.subThresholdHexes.add(hid);
+      out.hexWeights.set(hid, 0);
+    } else {
+      const w = weightMx.get(hid);
+      if (isFinite(w)) out.hexWeights.set(hid, w);
+    }
   }
   return out;
 }
@@ -1817,13 +3697,12 @@ function countSubhexEmbarks(linePts) {
     if (!sid) return;
     const sub = SUBHEX_INDEX.get(sid);
     if (!sub) return;
-    // Naval (Sea/Lake/Ocean) transitions ALWAYS trigger an embark
-    // crossing — even inside a ferry hex. Naval and ferry are two
-    // independent concepts; the ferry surcharge is for crossing
-    // thick-river PIXELS (handled by countFerryCrossings), while
-    // embark is for crossing the naval/non-naval CLASS boundary.
+    // Count only land → water crossings (embark events). Disembarks
+    // (water → land) are free under the current cost model and only
+    // allowed at Stronghold hexes — dijkstra refuses the transition
+    // otherwise, so we don't separately tally them here.
     const w = WATER_TERRAINS.has(sub.class);
-    if (prevIsWater !== null && w !== prevIsWater) crossings++;
+    if (prevIsWater === false && w === true) crossings++;
     prevIsWater = w;
   };
   for (let i = 0; i < linePts.length - 1; i++) {
@@ -1968,61 +3847,60 @@ function computeSegment(wa, wb) {
   const W = SUBHEX_ID_IMG_DATA ? SUBHEX_ID_IMG_DATA.width : 0;
   const fromPixIdx = (W > 0) ? ((wa.px.y | 0) * W + (wa.px.x | 0)) : null;
   const toPixIdx   = (W > 0) ? ((wb.px.y | 0) * W + (wb.px.x | 0)) : null;
-  const djk = dijkstraSubhexPath(wa.subhexId, wb.subhexId, fromPixIdx, toPixIdx);
+  // Mode-graph dijkstra: pick start/end (hex, mode) nodes from the
+  // click pixels, then route through the hex-mode graph. Both dijkstra
+  // and the renderer use this single graph as the source of truth, so
+  // there's no "dijkstra found a path the renderer can't follow"
+  // mismatch anymore.
+  const fromMode = hexModeAtPixel(fromPixIdx);
+  const toMode   = hexModeAtPixel(toPixIdx);
+  if (!fromMode || !toMode) {
+    return { hexIds: [], subhexIds: new Set(), cost: 0, embarks: 0, ferries: 0,
+             sameHex: false, reachable: false, linePts: null, debugMask: null };
+  }
+  const djk = dijkstraHexModePath(wa.hexId, fromMode, wb.hexId, toMode, fromPixIdx, toPixIdx);
   if (!djk) {
     return { hexIds: [], subhexIds: new Set(), cost: 0, embarks: 0, ferries: 0,
              sameHex: false, reachable: false, linePts: null, debugMask: null };
   }
-  // Unpack: subhexPath is the sid sequence; hexWeights gives the per-hex
-  // max effective weight along the actual (component-aware) chosen path
-  // — used directly for terrainCost so dijkstra's cost and the rendered
-  // segment's cost can't drift apart. pathRoadHexes lists hexes whose
-  // chosen path went through a road component — routeThroughMask uses
-  // this to decide which hexes restrict() should snap to road pixels.
-  const subhexPath    = djk.path;
-  const hexWeights    = djk.hexWeights;
+  // Unpack mode-graph results. modeHexPath is the deduplicated hex
+  // sequence; modePath is the (hex, mode) sequence dijkstra picked.
+  const modePath     = djk.path;          // [[hex, mode], ...]
+  const hexWeights   = djk.hexWeights;
   const pathRoadHexes = djk.pathRoadHexes;
-  const pathComponents = djk.pathComponents;
+  const pathComponents = djk.pathComponents;  // empty in mode-graph; kept for tooltip compat
+  const usedFerryHexes = djk.usedFerryHexes;
   const dijkstraTotalCost = djk.totalCost;
-  // Derive the hex path (consecutive-dedupe) so the rest of the code keeps
-  // working with the existing hex-level abstractions (mask building, line
-  // rendering, route stats).
+  const dijkstraEmbarks = djk.embarks;
+  const dijkstraFerries = djk.ferries;
+  // Derive the hex path from modePath (consecutive-dedupe).
   const hexPath = [];
-  for (const sid of subhexPath) {
-    const sub = SUBHEX_INDEX.get(sid);
-    if (!sub) continue;
-    if (hexPath.length === 0 || hexPath[hexPath.length - 1] !== sub.hex) {
-      hexPath.push(sub.hex);
+  for (const [hex] of modePath) {
+    if (hexPath.length === 0 || hexPath[hexPath.length - 1] !== hex) {
+      hexPath.push(hex);
     }
   }
-  // Mask: chosen subhexes, plus same-hex NON-naval expansion for A* maneuver
-  // room. Naval expansion is intentionally NOT done: even when Dijkstra
-  // touches a naval subhex in a hex (e.g. the endpoint sits on the shore),
-  // other naval subhexes of the same hex stay out of the mask. Otherwise a
-  // small lake inside a Land hex on the path would get every Sea subhex
-  // dumped into the route's display + drawing mask just because some other
-  // naval subhex in the hex was used.
-  const subSet = new Set(subhexPath);
+  // Legacy subhexPath for downstream code (debug mask, tooltip etc.) — we
+  // no longer have a subhex sequence, but expose an empty array so
+  // existing access patterns don't crash.
+  const subhexPath = [];
+  // subSet: subhex ids the chosen mode pixels actually fall in. Used by
+  // the path-mask overlay and a few legacy bits of code; derived now
+  // from the chosen mode pixels instead of the old subhex sequence.
+  const subSet = new Set();
   if (wa.subhexId != null) subSet.add(wa.subhexId);
   if (wb.subhexId != null) subSet.add(wb.subhexId);
-  const hexHasNonNaval = new Set();    // hex_id where Dijkstra used a non-naval subhex
-  for (const sid of subhexPath) {
-    const sub = SUBHEX_INDEX.get(sid);
-    if (!sub) continue;
-    if (!WATER_TERRAINS.has(sub.class)) hexHasNonNaval.add(sub.hex);
-  }
-  for (const hid of hexHasNonNaval) {
-    const subs = SUBHEXES_BY_HEX.get(hid) || [];
-    for (const sub of subs) {
-      // Naval subhexes are NOT expanded into subSet, even for ferry hexes.
-      // A naval subhex only ends up in subSet if Dijkstra explicitly picked
-      // it (via the initial `new Set(subhexPath)`). Otherwise the line
-      // shouldn't drift into the Sea — the cheaper river-ferry route stays
-      // strictly inside its Plains subhex. The Stage-3 ferry fallback in
-      // restrict() still covers the case where Dijkstra *did* choose a sea
-      // crossing: navalPx gets restored only if road+thick can't bridge.
-      if (WATER_TERRAINS.has(sub.class)) continue;
-      subSet.add(sub.id);
+  const Wfull = SUBHEX_ID_IMG_DATA ? SUBHEX_ID_IMG_DATA.width : 0;
+  if (Wfull > 0 && SUBHEX_ID_PX) {
+    for (const [hex, mode] of modePath) {
+      const info = HEX_MODES.get(hex)?.get(mode);
+      if (!info) continue;
+      // Sample one pixel per ~50 to keep this cheap on long routes.
+      const step = Math.max(1, (info.pixels.length / 256) | 0);
+      for (let i = 0; i < info.pixels.length; i += step) {
+        const sid = SUBHEX_ID_PX[info.pixels[i]];
+        if (sid) subSet.add(sid);
+      }
     }
   }
 
@@ -2046,79 +3924,66 @@ function computeSegment(wa, wb) {
     // alone didn't span.
     useAdjacents: false,  // legacy flag; adj broadening is gone
   };
-  // Run the strict pass — tiers internally fall through path → adj road →
-  // path full → adj full as connectivity demands. If still no line, fall
-  // back to opening every non-naval subhex of every path hex.
-  let linePts = routeThroughMask(subSet, ctx);
-  if ((!linePts || linePts.length === 0) && hexPath.length > 0) {
-    const fallback = new Set();
-    if (wa.subhexId != null) fallback.add(wa.subhexId);
-    if (wb.subhexId != null) fallback.add(wb.subhexId);
-    for (const sid of subhexPath) fallback.add(sid);
-    for (const hid of hexPath) {
-      for (const sub of (SUBHEXES_BY_HEX.get(hid) || [])) {
-        if (WATER_TERRAINS.has(sub.class)) continue;
-        fallback.add(sub.id);
-      }
-    }
-    linePts = routeThroughMask(fallback, ctx);
-  }
+  // Mode-graph rendering: mask is the union of chosen (hex, mode)'s
+  // pixel sets, A* finds the shortest path through it. No tier
+  // escalation needed — the mode graph guarantees the renderer can
+  // follow any path dijkstra picked.
+  let linePts = routeLineFromModes(modePath, wa.px, wb.px, debugSink);
 
-  // Hex count + per-hex cost come from the RENDERED LINE, not from
-  // dijkstra's chosen sequence. Dijkstra picks a hex sequence by cost; the
-  // line A*'s through the resulting mask and sometimes dips a few pixels
-  // into an adjacent hex to follow a road bleed. Those brief detours
-  // should not count as "path hexes" for the user-facing counter or for
-  // distance — they ARE in the dijkstra sequence (or in adj-broadening
-  // territory) but the user perceives them as part of the same path
-  // through the main hex. Filter by MIN_PIXELS_PER_PATH_HEX so a hex only
-  // counts when the line actually spends a meaningful stretch there.
   // Embark / ferry counts come from the rendered line so the UI matches
-  // the visible line.
-  const embarks    = linePts ? countSubhexEmbarks(linePts)   : 0;
-  const ferryRes   = linePts ? countFerryCrossings(linePts)  : { count: 0, used: new Set() };
+  // the visible line. Dijkstra also tracks its own counts (used in the
+  // mode-graph cost optimisation) — we use the line-derived ones for
+  // the UI displays since they're tied directly to what's on screen.
+  const embarks    = linePts ? countSubhexEmbarks(linePts)   : dijkstraEmbarks;
+  const ferryRes   = linePts ? countFerryCrossings(linePts)  : { count: dijkstraFerries, used: usedFerryHexes };
   const ferries    = ferryRes.count;
-  const usedFerryHexes = ferryRes.used;
+  const lineUsedFerryHexes = ferryRes.used;
 
-  // Line-derived per-hex max effective weight — what the line actually
-  // traverses, pixel by pixel. We use this as the COST source rather
-  // than dijkstra's bestTotal because the rendered line can diverge
-  // from dijkstra's chosen component sequence (the mask may expand to
-  // fullhex via tier 10 to bridge an artwork gap, and A* then takes a
-  // shorter pixel path through that wider mask). Cost should reflect
-  // what's visible, not what dijkstra optimised toward.
-  const lineMain = countLineMainHexes(linePts);
+  // Line-derived per-hex pixel count + max effective weight. Hexes the
+  // line spent fewer than MIN_PIXELS_PER_PATH_HEX pixels in are flagged
+  // sub-threshold and get a hexWeight of 0 (the "barely-touched hexes
+  // are free" rule). Start and end hexes are pinned as full-cost so they
+  // never count as sub-threshold regardless of how few line pixels they
+  // contain.
+  const lineMain = countLineMainHexes(linePts, [wa.hexId, wb.hexId]);
 
-  // Combined per-hex cost: prefer the line-derived value (line actually
-  // crossed pixels there), fall back to dijkstra's hexWeights for hexes
-  // dijkstra picked but the line skipped (rare — usually the start
-  // hex where the centerline never samples).
-  let terrainCost = 0;
-  for (let i = 1; i < hexPath.length; i++) {
-    const hid = hexPath[i];
-    let w = lineMain.hexWeights.get(hid);
-    if (!isFinite(w)) w = hexWeights.get(hid);
-    if (isFinite(w)) terrainCost += w;
+  // Cost adjustment for sub-threshold hexes. dijkstra's bestTotal is what
+  // dijkstra optimised over (each non-start hex contributed its running
+  // max). For every sub-threshold hex EXCEPT the segment's start hex
+  // (whose contribution was 0 in dijkstra anyway), refund dijkstra's
+  // per-hex contribution to bring the total down to the "barely-touched
+  // hexes are free" cost.
+  let adjustedCost = dijkstraTotalCost;
+  if (lineMain.subThresholdHexes && lineMain.subThresholdHexes.size > 0) {
+    for (const subHex of lineMain.subThresholdHexes) {
+      if (subHex === wa.hexId) continue;   // start contributed 0 already
+      const w = hexWeights.get(subHex);
+      if (isFinite(w)) adjustedCost -= w;
+    }
+    // Floor at 0 just in case of accumulated FP slop or surcharges that
+    // shouldn't be negated.
+    if (adjustedCost < 0) adjustedCost = 0;
   }
-  const embarkCost = embarks * (+weights["Embark"]);
-  const ferryCost  = ferries * (+weights["Ferry"]);
-
   return {
-    hexIds: hexPath,           // dijkstra's hex sequence — drives count, distance, breakdown
+    hexIds: hexPath,           // hex sequence — drives count, distance, breakdown
     subhexIds: subSet,
-    subhexPath,                // dijkstra's chosen subhex sequence (NOT the expanded mask)
-    pathRoadHexes,             // hexes dijkstra routed via a road component
-    pathComponents,            // exact "sid:comp" strings dijkstra traversed
+    subhexPath,                // empty under mode graph; kept for compat
+    pathRoadHexes,             // hexes dijkstra routed via ROAD / ROAD_FERRY
+    pathComponents,            // empty under mode graph; kept for compat
+    modePath,                  // [[hex, mode], ...] — the actual graph path
     lineHexPath: lineMain.hexPath,
     hexWeights: lineMain.hexWeights.size > 0 ? lineMain.hexWeights : hexWeights,
-                               // Line-derived weights for the breakdown
+                               // Line-derived weights for the breakdown UI
                                // when available — falls back to dijkstra's
-                               // for hexes the line never sampled.
-    dijkstraHexWeights: hexWeights, // kept for debug
-    cost: terrainCost + embarkCost + ferryCost,
+                               // per-hex mode cost. Sub-threshold hexes
+                               // appear here with weight 0.
+    dijkstraHexWeights: hexWeights,
+    subThresholdHexes: lineMain.subThresholdHexes,
+    hexPxCount:        lineMain.pxCount,
+    cost: adjustedCost,
     embarks,
     ferries,
-    usedFerryHexes,            // ferry hexes the line actually crossed a thick river in
+    usedFerryHexes: lineUsedFerryHexes,
     sameHex: false, reachable: true,
     linePts: (linePts && linePts.length > 0) ? linePts : null,
     debugMask: debugSink.mask ? debugSink : null,
@@ -2250,6 +4115,202 @@ function clearAllRoutes() {
   syncActiveProjection();
 }
 
+// ── Debug: hex-mode overrides ─────────────────────────────────────────────
+// Pin a specific (hex, mode) so dijkstra is restricted to that mode for the
+// given hex. Returns true if the mode exists on the hex.
+//
+// Pinning does NOT trigger a route recompute — the user explicitly asked
+// for the dijkstra path to stay frozen while they stage pins, so they can
+// compare the pre-pin path against the post-pin one. The picker exposes an
+// "Apply pinned overrides" action that calls applyHexModeOverrides() to
+// rebuild routes once the user is ready to see the change.
+function setHexModeOverride(hid, modeName) {
+  if (!HEX_MODES) return false;
+  const modes = HEX_MODES.get(hid);
+  if (!modes || !modes.has(modeName)) return false;
+  HEX_MODE_OVERRIDES.set(hid, modeName);
+  return true;
+}
+function clearHexModeOverride(hid) {
+  if (!HEX_MODE_OVERRIDES.has(hid)) return false;
+  HEX_MODE_OVERRIDES.delete(hid);
+  return true;
+}
+function clearAllHexModeOverrides() {
+  if (HEX_MODE_OVERRIDES.size === 0) return false;
+  HEX_MODE_OVERRIDES.clear();
+  return true;
+}
+function getHexModeOverride(hid) {
+  return HEX_MODE_OVERRIDES.get(hid) || null;
+}
+// Explicit "apply" — rebuild routes so the staged overrides take effect.
+function applyHexModeOverrides() {
+  for (const r of ROUTES) rebuildRoute(r);
+  syncActiveProjection();
+}
+// Alias retained for any callers that still expect the old name.
+const recomputeAllRoutes = applyHexModeOverrides;
+
+// ── Save / load routes ─────────────────────────────────────────────────────
+// Serialise the current ROUTES to a compact JSON blob: just waypoint
+// identifiers + click pixels + color, no derived state (segments / totals
+// rebuild from the waypoints on load). Returns a string ready to download.
+function serializeRoutes() {
+  const payload = {
+    version: 1,
+    activeRouteId: ACTIVE_ROUTE_ID,
+    routes: ROUTES.map(r => ({
+      id: r.id,
+      color: r.color.slice(),
+      waypoints: r.waypoints.map(wp => ({
+        subhexId: wp.subhexId,
+        hexId:    wp.hexId,
+        px:       { x: wp.px.x, y: wp.px.y },
+      })),
+    })),
+  };
+  return JSON.stringify(payload, null, 2);
+}
+
+// Trigger a browser download of the current routes as a JSON file. The
+// filename includes a timestamp so multiple saves don't clobber each other.
+function saveRoutesToFile() {
+  const text = serializeRoutes();
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `ravages-routes-${ts}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Defer revoking so Firefox/Safari can actually start the download.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Replace the current ROUTES with the contents of a parsed JSON payload.
+// Validates each waypoint's subhexId against SUBHEX_INDEX so a stale save
+// file (referring to a subhex id that no longer exists) loads partially
+// rather than throwing. Each waypoint that survives gets its hexId and
+// px snapped to the current SUBHEX_INDEX entry's centroid when the saved
+// hexId/px look bogus.
+function loadRoutesFromObject(payload) {
+  if (!payload || !Array.isArray(payload.routes)) {
+    throw new Error("Invalid routes file (missing 'routes' array)");
+  }
+  clearAllRoutes();
+  let firstNewId = -1;
+  for (const sr of payload.routes) {
+    const route = newRoute();
+    if (firstNewId < 0) firstNewId = route.id;
+    if (Array.isArray(sr.color) && sr.color.length === 3) {
+      route.color = sr.color.slice(0, 3).map(v => Math.max(0, Math.min(255, v | 0)));
+    }
+    // newRoute() starts the route empty and active. Push waypoints
+    // directly (skipping addWaypointToActive's syncActiveProjection
+    // churn) and rebuild once at the end.
+    for (const wp of (sr.waypoints || [])) {
+      const sid = +wp.subhexId;
+      if (!isFinite(sid)) continue;
+      const sub = SUBHEX_INDEX.get(sid);
+      if (!sub) continue;
+      const hexId = (typeof wp.hexId === "number") ? wp.hexId : sub.hex;
+      const px = (wp.px && isFinite(+wp.px.x) && isFinite(+wp.px.y))
+        ? { x: +wp.px.x, y: +wp.px.y }
+        : { x: sub.centroid[0], y: sub.centroid[1] };
+      route.waypoints.push({ subhexId: sid, hexId, px });
+    }
+    rebuildRoute(route);
+  }
+  // Restore the active-route selection if the saved id is still around;
+  // otherwise default to the last route created (newRoute's behavior).
+  if (payload.activeRouteId != null) {
+    // Saved ids were assigned by the file-writing session; on load we
+    // created fresh ids in order, so we map by position.
+    const savedIdx = payload.routes.findIndex(r => r.id === payload.activeRouteId);
+    if (savedIdx >= 0 && savedIdx < ROUTES.length) {
+      ACTIVE_ROUTE_ID = ROUTES[savedIdx].id;
+    }
+  }
+  syncActiveProjection();
+}
+
+// Top-level entry from the file-input change handler.
+function loadRoutesFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        loadRoutesFromObject(data);
+        resolve();
+      } catch (e) {
+        reject(e);
+      }
+    };
+    reader.onerror = () => reject(reader.error || new Error("read failed"));
+    reader.readAsText(file);
+  });
+}
+
+// Compute the image-space bounding box of a route — both the click
+// pixels (waypoints) and every rendered line point, so a route that
+// snakes far from its waypoints still fits in the camera. Returns null
+// if the route is empty.
+function routeBoundingBox(route) {
+  if (!route || route.waypoints.length === 0) return null;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  const grow = (x, y) => {
+    if (!isFinite(x) || !isFinite(y)) return;
+    if (x < x0) x0 = x;
+    if (y < y0) y0 = y;
+    if (x > x1) x1 = x;
+    if (y > y1) y1 = y;
+  };
+  for (const wp of route.waypoints) grow(wp.px.x, wp.px.y);
+  if (route.segments) {
+    for (const seg of route.segments) {
+      if (!seg.linePts) continue;
+      for (const p of seg.linePts) grow(p.x, p.y);
+    }
+  }
+  if (!isFinite(x0)) return null;
+  return { x0, y0, x1, y1 };
+}
+
+// Pan/zoom the camera so the given route fills the stage with a small
+// margin. Single-waypoint routes get a fixed zoom so they don't snap to
+// absurd magnification.
+function fitCameraToRoute(route) {
+  const bbox = routeBoundingBox(route);
+  if (!bbox || !HEX_DATA) return;
+  const r = stage.getBoundingClientRect();
+  const PAD = 80;     // px of margin on each side in stage space
+  const usableW = Math.max(50, r.width  - PAD * 2);
+  const usableH = Math.max(50, r.height - PAD * 2);
+  const bw = Math.max(1, bbox.x1 - bbox.x0);
+  const bh = Math.max(1, bbox.y1 - bbox.y0);
+  // For a single-point route (1 waypoint, no segments) the bbox is a
+  // dot — fall back to a comfortable zoom rather than max-out.
+  const isPoint = route.waypoints.length === 1 && (!route.segments || route.segments.every(s => !s.linePts || s.linePts.length === 0));
+  let scale;
+  if (isPoint) {
+    scale = Math.min(2, view.scale > 0.8 ? view.scale : 1);
+  } else {
+    scale = Math.min(usableW / bw, usableH / bh);
+    // Clamp to the same range as zoomAt so the view stays sane.
+    scale = Math.max(0.05, Math.min(8, scale));
+  }
+  view.scale = scale;
+  const cx = (bbox.x0 + bbox.x1) / 2;
+  const cy = (bbox.y0 + bbox.y1) / 2;
+  view.x = r.width  / 2 - cx * scale;
+  view.y = r.height / 2 - cy * scale;
+  applyView();
+}
+
 // Keep the deprecated single-route globals in sync with the active route so
 // the few consumers that still read them (debug mask overlay, route-line draw
 // fallbacks) keep behaving sensibly without each needing its own per-route
@@ -2348,6 +4409,199 @@ function findBorderMidpoint(idA, idB) {
 // path is then evaluated INDIVIDUALLY: we RESTRICT that hex's passable area
 // down to its road/city pixels (so A* can only cross the hex by walking the
 // painted road), and keep the restriction only if From can still reach To.
+// Draw a line through the mode graph's chosen pixel sets. The mask is
+// the union of every (hex, mode)'s pixels along the path; A* finds the
+// shortest pixel route inside that mask from the start click pixel to
+// the end click pixel. No tier escalation, no adj broadening — the
+// mode graph already encodes everything renderable.
+//
+// modePath: [[hex, mode], ...] from dijkstraHexModePath
+// startPt, endPt: { x, y } click pixels
+// debugSink (optional): { mask, mw, mh, bx0, by0 } target for the
+//                       debug overlay; if omitted, _lastRouteMask is updated.
+function routeLineFromModes(modePath, startPt, endPt, debugSink) {
+  if (!modePath || modePath.length === 0 || !SUBHEX_ID_IMG_DATA) {
+    if (startPt && endPt) return [{ x: startPt.x, y: startPt.y }, { x: endPt.x, y: endPt.y }];
+    return [];
+  }
+  const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
+
+  // Compute mask bbox = bounding box of every mode's pixels.
+  let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+  const modeInfos = [];
+  for (const [hex, mode] of modePath) {
+    const info = HEX_MODES.get(hex)?.get(mode);
+    if (!info) continue;
+    modeInfos.push(info);
+    for (let i = 0; i < info.pixels.length; i++) {
+      const p = info.pixels[i];
+      const py = (p / W) | 0;
+      const px = p - py * W;
+      if (px < bx0) bx0 = px;
+      if (px > bx1) bx1 = px;
+      if (py < by0) by0 = py;
+      if (py > by1) by1 = py;
+    }
+  }
+  // Include start/end pixels in bbox so snapToMask can reach them.
+  if (startPt) {
+    if ((startPt.x | 0) < bx0) bx0 = startPt.x | 0;
+    if ((startPt.x | 0) > bx1) bx1 = startPt.x | 0;
+    if ((startPt.y | 0) < by0) by0 = startPt.y | 0;
+    if ((startPt.y | 0) > by1) by1 = startPt.y | 0;
+  }
+  if (endPt) {
+    if ((endPt.x | 0) < bx0) bx0 = endPt.x | 0;
+    if ((endPt.x | 0) > bx1) bx1 = endPt.x | 0;
+    if ((endPt.y | 0) < by0) by0 = endPt.y | 0;
+    if ((endPt.y | 0) > by1) by1 = endPt.y | 0;
+  }
+  if (!isFinite(bx0)) return [];
+  bx0 = Math.max(0, bx0 - 1); by0 = Math.max(0, by0 - 1);
+  bx1 = Math.min(W - 1, bx1 + 1); by1 = Math.min(H - 1, by1 + 1);
+  const mw = bx1 - bx0 + 1, mh = by1 - by0 + 1;
+
+  const mask = new Uint8Array(mw * mh);
+  for (const info of modeInfos) {
+    for (let i = 0; i < info.pixels.length; i++) {
+      const p = info.pixels[i];
+      const py = (p / W) | 0;
+      const px = p - py * W;
+      const idx = (py - by0) * mw + (px - bx0);
+      mask[idx] = 1;
+    }
+  }
+
+  // ── Cross-hex corner augmentation ─────────────────────────────────
+  // When two picked-mode pixels are diagonal across a hex border, the
+  // line A* needs the orthogonal corner cells to be in the mask to
+  // make the diagonal move. Mode-graph edges count diagonals as valid
+  // when one corner is globally passable, but the route mask only
+  // contains picked-mode pixels — so the corner pixel might exist in
+  // some OTHER mode of an adjacent hex and not be in the mask. Result:
+  // visible gap, two halves of the route that are diagonally adjacent
+  // but disconnected.
+  //
+  // Scope: only diagonal pairs where the two pixels are in DIFFERENT
+  // hexes (cross-hex). Intra-hex diagonals are left untouched so
+  // pinned modes stay strict and the line doesn't drift through
+  // non-picked modes within a hex.
+  //
+  // For each cross-hex diagonal in the ORIGINAL mask:
+  //   * If a corner pixel is globally passable (some mode owns it),
+  //     add it to the mask.
+  //   * Skip if the corner falls in a hex with an active override —
+  //     that hex's line stays in the pinned mode's pixel set only.
+  //
+  // Snapshot baseMask so newly-added pixels don't cascade.
+  if (PIX_MODE_KIND && HEX_ID_PX) {
+    const baseMask = new Uint8Array(mask);
+    const dxs = [+1, -1, +1, -1];
+    const dys = [+1, +1, -1, -1];
+    const overrides = HEX_MODE_OVERRIDES;
+    const tryAugment = (localIdx, fullIdx) => {
+      if (baseMask[localIdx]) return;             // already in mask
+      if (!PIX_MODE_KIND[fullIdx]) return;        // not globally passable
+      if (overrides && overrides.size > 0) {
+        const cHex = HEX_ID_PX[fullIdx];
+        if (cHex && overrides.has(cHex)) return;  // pinned hex's strict zone
+      }
+      mask[localIdx] = 1;
+    };
+    for (let y = 0; y < mh; y++) {
+      const rowBase = y * mw;
+      for (let x = 0; x < mw; x++) {
+        if (!baseMask[rowBase + x]) continue;
+        const fullA = (by0 + y) * W + (bx0 + x);
+        const hexA  = HEX_ID_PX[fullA];
+        for (let k = 0; k < 4; k++) {
+          const nx = x + dxs[k], ny = y + dys[k];
+          if (nx < 0 || ny < 0 || nx >= mw || ny >= mh) continue;
+          if (!baseMask[ny * mw + nx]) continue;
+          const fullB = (by0 + ny) * W + (bx0 + nx);
+          const hexB  = HEX_ID_PX[fullB];
+          if (hexA === hexB) continue;            // intra-hex — no augmentation
+          // Diagonal pair across a hex border. Augment corners.
+          const c1 = rowBase + nx;     // local (nx, y)
+          const c2 = ny * mw + x;      // local (x,  ny)
+          tryAugment(c1, (by0 + y)  * W + (bx0 + nx));
+          tryAugment(c2, (by0 + ny) * W + (bx0 + x));
+        }
+      }
+    }
+  }
+
+  const stash = { mask, mw, mh, bx0, by0 };
+  if (debugSink) Object.assign(debugSink, stash);
+  else            _lastRouteMask = stash;
+
+  const sPt = startPt || { x: bx0, y: by0 };
+  const ePt = endPt   || { x: bx1, y: by1 };
+
+  // ── Ferry-mark waypoint injection ──────────────────────────────────
+  // For every ferry hex on the modePath whose picked mode is
+  // ROAD_FERRY-containing (single ROAD_FERRY OR a combo with
+  // ROAD_FERRY among its kinds), force the line to pass through a
+  // ferry-mark pixel of that hex. The combo's mask covers the whole
+  // river, but the user wants the actual rendered line to touch the
+  // painted road+thick overlay — that's where the crossing happens
+  // narratively. Picking the centroid of the ferry-mark pixels as an
+  // intermediate waypoint and running A* segment-by-segment achieves
+  // that without restricting the mask itself.
+  const markWaypoints = [];
+  if (HEX_PIXELS && ROAD_PIXEL_MASK && THICK_RIVER_PIXEL_MASK) {
+    for (const [hex, mode] of modePath) {
+      const info = HEX_MODES.get(hex)?.get(mode);
+      if (!info) continue;
+      const isFerryMode = info.isFerry
+        || (info.kinds && info.kinds.indexOf("ROAD_FERRY") >= 0);
+      if (!isFerryMode) continue;
+      const hexAllPx = HEX_PIXELS.get(hex);
+      if (!hexAllPx) continue;
+      // Find road+thick (ferry-mark) pixels of this hex and average.
+      let sumX = 0, sumY = 0, count = 0;
+      for (let i = 0; i < hexAllPx.length; i++) {
+        const p = hexAllPx[i];
+        if (ROAD_PIXEL_MASK[p] && THICK_RIVER_PIXEL_MASK[p]) {
+          const py = (p / W) | 0;
+          sumX += p - py * W; sumY += py; count++;
+        }
+      }
+      if (count === 0) continue;
+      markWaypoints.push({ x: sumX / count, y: sumY / count });
+    }
+  }
+
+  // Helper: run A* between two points in the mask and return its
+  // smoothed polyline, or null on failure.
+  const runSeg = (a, b) => routeInBinaryMask(mask, mw, mh, bx0, by0, a, b);
+  if (markWaypoints.length === 0) {
+    return runSeg(sPt, ePt) || [];
+  }
+  // Multi-segment: start → mark₁ → mark₂ → … → end. Concatenate the
+  // smoothed sub-lines, dropping the duplicated joint point each time.
+  const out = [];
+  let prev = sPt;
+  for (const wp of markWaypoints) {
+    const sub = runSeg(prev, wp);
+    if (!sub || sub.length === 0) {
+      // Fallback: if A* can't reach the mark, do the whole line in one
+      // shot without the waypoint constraint.
+      return runSeg(sPt, ePt) || [];
+    }
+    if (out.length === 0) for (const p of sub) out.push(p);
+    else                  for (let i = 1; i < sub.length; i++) out.push(sub[i]);
+    prev = wp;
+  }
+  const finalSeg = runSeg(prev, ePt);
+  if (!finalSeg || finalSeg.length === 0) return runSeg(sPt, ePt) || [];
+  if (out.length === 0) for (const p of finalSeg) out.push(p);
+  else                  for (let i = 1; i < finalSeg.length; i++) out.push(finalSeg[i]);
+  return out;
+}
+
+// LEGACY: kept for the same-hex code path and a few callers that still
+// pass subSet. New code (cross-hex segments) uses routeLineFromModes.
 // A bad/disconnected road hex falls back to its full mask while the other
 // road hexes still snap to the road — so the rendered path follows the
 // painted road wherever the road is contiguous from edge to edge.
@@ -2520,6 +4774,17 @@ function routeThroughMask(subSet, ctx) {
   const thinRivPxByHex  = new Map();   // hex_id -> subset that are thin-river pixels (fordable / "green" in the debug overlay)
   const navalPxByHex    = new Map();   // hex_id -> subset of those that sit inside a naval-class subhex (sea ferries)
   const pathSubhexPxByHex = new Map(); // hex_id -> subset of NON-THICK pixels whose subhex was on dijkstra's chosen path
+  // Ferry hexes only — pixels of every subhex that's either in ROAD_SUBHEXES
+  // or RIVER_SUBHEXES, PLUS every road pixel of the hex regardless of subhex
+  // classification ("stray" road pixels in stranded water subhexes or
+  // overlaid on thick river). Used by the new ferry road+river-subhex
+  // restoration tier — sits between the per-pixel ferry/naval tiers and the
+  // fullhex tier. Effect: a ferry hex where road-only fill leaves the route
+  // disconnected gets broadened to all painted-as-route subhexes (road and
+  // river) before any fullhex restore is attempted, and any isolated road
+  // subhex surrounded by water (e.g., the road touching down on a riverbank
+  // island) gets pulled into the mask via its road pixels.
+  const ferryRoadRiverPxByHex = new Map();
   for (const hid of roadHexList) {
     hexPxByHex.set(hid, []);
     roadPxByHex.set(hid, []);
@@ -2527,6 +4792,7 @@ function routeThroughMask(subSet, ctx) {
     thinRivPxByHex.set(hid, []);
     navalPxByHex.set(hid, []);
     pathSubhexPxByHex.set(hid, []);
+    if (FERRY_HEXES && FERRY_HEXES.has(hid)) ferryRoadRiverPxByHex.set(hid, []);
   }
   // Pull typed-array references into locals so the JIT doesn't re-resolve.
   const subhexPx = SUBHEX_ID_PX;
@@ -2545,6 +4811,7 @@ function routeThroughMask(subSet, ctx) {
     const thickList   = isRoadHex ? thickRivPxByHex.get(hid) : null;
     const thinList    = isRoadHex ? thinRivPxByHex.get(hid)  : null;
     const navalList   = isRoadHex ? navalPxByHex.get(hid)    : null;
+    const ferryRRList = isRoadHex ? ferryRoadRiverPxByHex.get(hid) || null : null;
     for (let pi = 0; pi < pixels.length; pi++) {
       const fullIdx = pixels[pi];
       const fullY = (fullIdx / W) | 0;
@@ -2579,6 +4846,18 @@ function routeThroughMask(subSet, ctx) {
         // Sea/Lake/Ocean subhex rather than a thick river).
         const sub = SUBHEX_INDEX.get(sidHere);
         if (sub && WATER_TERRAINS.has(sub.class)) navalList.push(idx);
+        // Ferry hex only: pixel belongs to a road OR river subhex (per the
+        // pixel-driven ROAD_SUBHEXES / RIVER_SUBHEXES sets), OR the pixel
+        // is itself a road pixel (covers strays in a stranded water subhex
+        // that wouldn't otherwise qualify). The road+river-subhex tier
+        // restores exactly these to bridge a ferry crossing without going
+        // all the way to fullhex.
+        if (ferryRRList) {
+          const inRoadSub  = !!(ROAD_SUBHEXES  && ROAD_SUBHEXES.has(sidHere));
+          const inRiverSub = !!(RIVER_SUBHEXES && RIVER_SUBHEXES.has(sidHere));
+          const isRoadPix  = !!(ROAD_PIXEL_MASK && ROAD_PIXEL_MASK[fullIdx]);
+          if (inRoadSub || inRiverSub || isRoadPix) ferryRRList.push(idx);
+        }
         // Pixels belonging to a dijkstra-chosen COMPONENT of THIS hex,
         // with thick river excluded. This is what the Path-full tier
         // restores — strictly the route's own COMPONENT inside this
@@ -2828,6 +5107,13 @@ function routeThroughMask(subSet, ctx) {
         if (!hexHasNavalInPath(hid)) continue;
         px = navalPxByHex.get(hid) || null;
       }
+      else if (what === "ferryroadriver") {
+        // Ferry hexes only — restore pixels of road/river subhexes plus
+        // stray road pixels. See ferryRoadRiverPxByHex above for the
+        // selection rule.
+        if (!(FERRY_HEXES && FERRY_HEXES.has(hid))) continue;
+        px = ferryRoadRiverPxByHex.get(hid) || null;
+      }
       if (px) for (const i of px) mask[i] = 1;
     }
   };
@@ -2842,26 +5128,27 @@ function routeThroughMask(subSet, ctx) {
   //   2. Path thin                — per hex, cumulative.
   //   3. Path ferry               — thick-river pixels of path ferry hexes.
   //   4. Path naval (embark)      — sea-ferry pixels inside path hexes.
-  //   5. Ferry path full-hex      — per ferry path hex, ENTIRE hex's
+  //   5. Ferry path road+river    — per ferry path hex, all pixels of
+  //                                 road OR river subhexes, plus stray
+  //                                 road pixels in stranded subhexes.
+  //                                 Resolves the common "road connects
+  //                                 to ferry across a river" case without
+  //                                 opening the hex's unrelated land
+  //                                 subhexes.
+  //   6. Ferry path full-hex      — per ferry path hex, ENTIRE hex's
   //                                 pre-clearing mask (every passable
   //                                 pixel, not just dijkstra-chosen
   //                                 components). Resolves ferry-crossing
   //                                 gaps inside the hex without dragging
   //                                 any neighbors into the mask.
-  //   6. Adj road                 — road bleed from neighbors, all adjacents.
-  //   7. Adj thin                 — per adjacent, cumulative.
-  //   8. Regular path full        — per non-ferry path hex, dijkstra-chosen
+  //   7. Regular path full        — per non-ferry path hex, dijkstra-chosen
   //                                 subhexes only.
-  //   9. Adj thick                — per adjacent, cumulative.
-  //  10. Path full-hex (any path) — per path hex, entire pre-clearing
+  //   8. Path full-hex (any path) — per path hex, entire pre-clearing
   //                                 mask (every passable pixel). Last
   //                                 chance to resolve inside the route
   //                                 before the neighbor revert; ensures
   //                                 path hexes get full-hex inclusion
   //                                 before any neighbor does.
-  //  11. Adj full (revert)        — restore every adjacent hex to its
-  //                                 pre-clearing mask. Path hexes never
-  //                                 stay restricted past tier 10.
   //
   // The "per hex, cumulative" loops mean: for each hex in turn, apply the
   // tier to just that hex and recheck connectivity. The first hex whose
@@ -2918,12 +5205,21 @@ function routeThroughMask(subSet, ctx) {
     if (checkConn()) { connected = true; break; }
     applyTier(pathRestrictHexes, "naval");
     if (checkConn()) { connected = true; break; }
-    // Ferry path hexes get FULL-HEX escalation. CUMULATIVE is DISABLED
-    // here (third arg false) so we don't open every ferry hex when
-    // only one is actually the problem; if revert-on-fail can't find
-    // a single ferry hex whose fullhex solves connectivity, we fall
-    // through to per-hex regular-path escalation instead.
-    if (perHexEscalate(ferryPathHexes, "fullhex", false)) { connected = true; break; }
+    // Ferry path hexes: try road+river subhex broadening FIRST, then
+    // FULL-HEX as a fallback. The road+river-subhex pass restores every
+    // pixel of road or river subhexes (plus any stray road pixels in
+    // stranded water subhexes) — ferries usually connect to roads and
+    // the road+river subhexes are usually contiguous, so this resolves
+    // the typical ferry crossing without dragging in unrelated land
+    // subhexes of the hex. If that still doesn't connect, fall through
+    // to fullhex.
+    // CUMULATIVE is DISABLED on both passes (third arg false) so we
+    // don't open every ferry hex when only one is actually the problem;
+    // if revert-on-fail can't find a single ferry hex whose loosening
+    // solves connectivity, we fall through to per-hex regular-path
+    // escalation instead.
+    if (perHexEscalate(ferryPathHexes, "ferryroadriver", false)) { connected = true; break; }
+    if (perHexEscalate(ferryPathHexes, "fullhex",        false)) { connected = true; break; }
     // Regular path full (dijkstra-chosen components only), per hex.
     if (perHexEscalate(regularPathHexes, "full"))   { connected = true; break; }
     // Last resort: every path hex to its entire pre-clearing mask
@@ -3598,6 +5894,88 @@ function renderSelection() {
   drawDebugRiverTypes();
   drawDebugFerryHexes();
   drawDebugSubhexTypes();
+  drawHexModeOverrides();
+  drawModePreview();
+}
+
+// Paint each pinned (hex, mode) override's actual mode-pixel set on the
+// highlight canvas. Same cyan style the hover preview uses, so what you
+// "see" when staging an override matches what you "see" when hovering a
+// row in the picker. Earlier versions washed the whole overridden hex
+// in orange — but that obscured WHICH mode is pinned (orange could mean
+// LAND, ROAD#0, ROAD+ROAD_FERRY, …). The mode's pixel union answers
+// that question directly.
+const _dbgOverrideCanvas = document.createElement("canvas");
+const _dbgOverrideCtx = _dbgOverrideCanvas.getContext("2d");
+function drawHexModeOverrides() {
+  if (!HEX_MODE_OVERRIDES || HEX_MODE_OVERRIDES.size === 0) return;
+  if (!HEX_MODES || !HEX_DATA) return;
+  const W = HEX_DATA.image_width, H = HEX_DATA.image_height;
+  if (_dbgOverrideCanvas.width !== W || _dbgOverrideCanvas.height !== H) {
+    _dbgOverrideCanvas.width = W; _dbgOverrideCanvas.height = H;
+  } else {
+    _dbgOverrideCtx.clearRect(0, 0, W, H);
+  }
+  const img = _dbgOverrideCtx.createImageData(W, H);
+  let drewAny = false;
+  for (const [hid, modeName] of HEX_MODE_OVERRIDES) {
+    const modes = HEX_MODES.get(hid);
+    if (!modes) continue;
+    const info = modes.get(modeName);
+    if (!info || !info.pixels) continue;
+    drewAny = true;
+    const pxs = info.pixels;
+    for (let i = 0; i < pxs.length; i++) {
+      const p = pxs[i];
+      if (p < 0 || p >= W * H) continue;
+      const o = p * 4;
+      img.data[o]     = 60;
+      img.data[o + 1] = 230;
+      img.data[o + 2] = 255;
+      img.data[o + 3] = 200;
+    }
+  }
+  if (!drewAny) return;
+  _dbgOverrideCtx.putImageData(img, 0, 0);
+  hlCtx.drawImage(_dbgOverrideCanvas, 0, 0);
+}
+
+// ── Mode preview overlay ────────────────────────────────────────────
+// While the mode picker is open, hovering a row paints that mode's
+// pixel set on the highlight canvas in a high-contrast cyan, so the
+// user can "see what each node version looks like" before pinning.
+// MODE_PREVIEW = { hexId, modeName } | null.
+let MODE_PREVIEW = null;
+const _dbgPreviewCanvas = document.createElement("canvas");
+const _dbgPreviewCtx = _dbgPreviewCanvas.getContext("2d");
+function setModePreview(p) {
+  MODE_PREVIEW = p;
+  renderSelection();
+}
+function drawModePreview() {
+  if (!MODE_PREVIEW || !HEX_MODES || !HEX_DATA) return;
+  const modes = HEX_MODES.get(MODE_PREVIEW.hexId);
+  if (!modes) return;
+  const info = modes.get(MODE_PREVIEW.modeName);
+  if (!info || !info.pixels) return;
+  const W = HEX_DATA.image_width, H = HEX_DATA.image_height;
+  if (_dbgPreviewCanvas.width !== W || _dbgPreviewCanvas.height !== H) {
+    _dbgPreviewCanvas.width = W; _dbgPreviewCanvas.height = H;
+  } else {
+    _dbgPreviewCtx.clearRect(0, 0, W, H);
+  }
+  const img = _dbgPreviewCtx.createImageData(W, H);
+  for (let i = 0; i < info.pixels.length; i++) {
+    const p = info.pixels[i];
+    if (p < 0 || p >= W * H) continue;
+    const o = p * 4;
+    img.data[o]     = 60;
+    img.data[o + 1] = 230;
+    img.data[o + 2] = 255;
+    img.data[o + 3] = 200;
+  }
+  _dbgPreviewCtx.putImageData(img, 0, 0);
+  hlCtx.drawImage(_dbgPreviewCanvas, 0, 0);
 }
 
 // Filled circle at every waypoint of the route, with an outline so the marker
@@ -3667,8 +6045,19 @@ function lookupSubhex(px, py) {
 
 // =================== Interaction ===================
 let panning = false, panStart = null, mouseDownPos = null;
+// Returns true if the given event's target is inside the mode-picker popup
+// (or any other interactive overlay that should swallow stage clicks). Used
+// by the mousedown / mouseup handlers below to skip pan + click-to-waypoint
+// when the user is interacting with the popup — without this, picking a
+// mode in the right-click menu also drops a new waypoint at the click pos.
+function eventInsidePicker(e) {
+  const mp = document.getElementById("mode-picker");
+  if (!mp || mp.classList.contains("hidden")) return false;
+  return mp.contains(e.target);
+}
 stage.addEventListener("mousedown", (e) => {
   if (e.button !== 0) return;
+  if (eventInsidePicker(e)) return;
   panning = true;
   panStart = { x: e.clientX - view.x, y: e.clientY - view.y };
   mouseDownPos = { x: e.clientX, y: e.clientY };
@@ -3726,22 +6115,203 @@ stage.addEventListener("wheel", (e) => {
   zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
 }, { passive: false });
 
+// Right-click → mode picker for the hex under the cursor. Lets the user
+// pin a specific (hex, mode) so dijkstra is restricted to that mode for
+// that hex on the next route recompute. Suppresses the browser context
+// menu inside the stage so the picker can take its place.
+const modePickerEl = document.getElementById("mode-picker");
+function hideModePicker() {
+  if (modePickerEl) modePickerEl.classList.add("hidden");
+  if (MODE_PREVIEW) {
+    MODE_PREVIEW = null;
+    renderSelection();
+  }
+}
+function showModePicker(clientX, clientY, hexId) {
+  if (!modePickerEl || !HEX_MODES) return;
+  const modes = HEX_MODES.get(hexId);
+  if (!modes || modes.size === 0) {
+    modePickerEl.classList.add("hidden");
+    return;
+  }
+  // Find which mode dijkstra picked for this hex on the active route (so we
+  // can mark it). Same logic as the tooltip's pickedModes computation.
+  const activeRoute = (typeof getActiveRoute === "function") ? getActiveRoute() : null;
+  const debugRoute = activeRoute || (ROUTES.length > 0 ? ROUTES[0] : null);
+  const pickedSet = new Set();
+  if (debugRoute) {
+    for (const seg of debugRoute.segments) {
+      if (!seg.modePath) continue;
+      for (const [mhex, mmode] of seg.modePath) {
+        if (mhex === hexId) pickedSet.add(mmode);
+      }
+    }
+  }
+  const currentOverride = HEX_MODE_OVERRIDES.get(hexId) || null;
+  // Sort modes by cost (cheapest first), ties broken by name.
+  const entries = Array.from(modes.entries())
+    .sort((a, b) => (a[1].cost - b[1].cost) || a[0].localeCompare(b[0]));
+  const parts = [];
+  parts.push(`<div class="mp-header">Hex ${hexId} — pin mode (overrides dijkstra)</div>`);
+  // For each mode, compute its cross-hex neighbor MODES, grouped by hex.
+  // Showing the actual neighbor modes (not just hex ids) lets you see
+  // exactly which (hex, mode) nodes the picked one claims to connect to
+  // — phantom edges are then directly readable from this listing.
+  const modeNeighborGroups = new Map();   // mode name → "1379(LAND#0, ROAD#1); 1468(ROAD#0)"
+  for (const [name] of entries) {
+    const key = `${hexId}:${name}`;
+    const nbs = HEX_MODE_NEIGHBORS && HEX_MODE_NEIGHBORS.get(key);
+    const byHex = new Map();
+    if (nbs) {
+      for (const nb of nbs) {
+        const colonAt = nb.indexOf(":");
+        const nh = +nb.slice(0, colonAt);
+        if (nh === hexId) continue;       // skip intra-hex
+        const m = nb.slice(colonAt + 1);
+        let arr = byHex.get(nh);
+        if (!arr) { arr = []; byHex.set(nh, arr); }
+        arr.push(m);
+      }
+    }
+    let str = "—";
+    if (byHex.size > 0) {
+      const groups = Array.from(byHex.entries()).sort((a, b) => a[0] - b[0]);
+      str = groups.map(([nh, modes]) =>
+        `${nh}(${modes.sort().join(", ")})`).join("; ");
+    }
+    modeNeighborGroups.set(name, str);
+  }
+  for (const [name, info] of entries) {
+    const tags = [];
+    if (pickedSet.has(name)) tags.push(`<span class="mp-tag">picked</span>`);
+    if (currentOverride === name) tags.push(`<span class="mp-tag">pinned</span>`);
+    const klass = "mp-item"
+      + (currentOverride === name ? " override" : "")
+      + (pickedSet.has(name) && currentOverride !== name ? " picked" : "");
+    const nbStr = modeNeighborGroups.get(name) || "—";
+    const nbHtml = `<div class="mp-neighbors">→ ${escapeTooltipHtml(nbStr)}</div>`;
+    parts.push(
+      `<div class="${klass}" data-mode="${escapeTooltipHtml(name)}">`
+      + `<div class="mp-row-main">`
+      + `<span>${escapeTooltipHtml(name)}${tags.join("")}</span>`
+      + `<span class="mp-cost">${(+info.cost).toFixed(2)} · ${info.pixels.length}px</span>`
+      + `</div>`
+      + nbHtml
+      + `</div>`);
+  }
+  parts.push(`<div class="mp-sep"></div>`);
+  if (currentOverride) {
+    parts.push(`<div class="mp-action" data-action="clear">Clear pin on hex ${hexId}</div>`);
+  }
+  if (HEX_MODE_OVERRIDES.size > 0) {
+    parts.push(`<div class="mp-action mp-apply" data-action="apply">Apply pinned overrides (${HEX_MODE_OVERRIDES.size}) — recompute routes</div>`);
+    parts.push(`<div class="mp-action" data-action="clear-all">Clear ALL pins (${HEX_MODE_OVERRIDES.size})</div>`);
+  }
+  parts.push(`<div class="mp-action" data-action="cancel">Cancel</div>`);
+  modePickerEl.innerHTML = parts.join("");
+
+  // Click handlers — delegated to the popup container. Pinning a mode is
+  // STAGED only (no route rebuild) — the user explicitly wants the
+  // dijkstra path to stay frozen while they stage overrides. The
+  // "Apply" action above triggers the rebuild on demand.
+  modePickerEl.onclick = (ev) => {
+    const item = ev.target.closest(".mp-item");
+    if (item) {
+      const mode = item.getAttribute("data-mode");
+      if (mode) setHexModeOverride(hexId, mode);
+      setModePreview(null);
+      hideModePicker();
+      renderSelection(); updateEndpoints(); updateStatus();
+      return;
+    }
+    const action = ev.target.closest(".mp-action");
+    if (action) {
+      const a = action.getAttribute("data-action");
+      if (a === "clear")     clearHexModeOverride(hexId);
+      else if (a === "clear-all") clearAllHexModeOverrides();
+      else if (a === "apply")     applyHexModeOverrides();
+      setModePreview(null);
+      hideModePicker();
+      renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
+      return;
+    }
+  };
+
+  // Hover a mode row → preview its pixel set on the highlight canvas.
+  // Lets the user "see what each node version looks like" before pinning.
+  // mouseover/mouseout (not mouseenter/mouseleave) so it works with the
+  // event delegation pattern; check the closest .mp-item to filter.
+  modePickerEl.onmouseover = (ev) => {
+    const item = ev.target.closest(".mp-item");
+    if (!item) return;
+    const mode = item.getAttribute("data-mode");
+    if (mode) {
+      setModePreview({ hexId, modeName: mode });
+    }
+  };
+  modePickerEl.onmouseout = (ev) => {
+    const item = ev.target.closest(".mp-item");
+    if (!item) return;
+    // mouseout fires on every child element too; only clear if we're
+    // actually leaving the item entirely.
+    const related = ev.relatedTarget;
+    if (related && item.contains(related)) return;
+    setModePreview(null);
+  };
+
+  // Position the popup near the cursor but keep it on-screen.
+  const stageRect = stage.getBoundingClientRect();
+  modePickerEl.classList.remove("hidden");
+  // Measure after un-hiding so offsetWidth/Height are valid.
+  const pw = modePickerEl.offsetWidth || 280;
+  const ph = modePickerEl.offsetHeight || 200;
+  let lx = (clientX - stageRect.left) + 8;
+  let ly = (clientY - stageRect.top) + 8;
+  if (lx + pw > stageRect.width)  lx = Math.max(0, stageRect.width  - pw - 4);
+  if (ly + ph > stageRect.height) ly = Math.max(0, stageRect.height - ph - 4);
+  modePickerEl.style.left = lx + "px";
+  modePickerEl.style.top  = ly + "px";
+}
+stage.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  const ipt = stageToImage(e.clientX, e.clientY);
+  if (!ipt) { hideModePicker(); return; }
+  const hx = pointToHex(ipt.x, ipt.y);
+  if (!hx) { hideModePicker(); return; }
+  showModePicker(e.clientX, e.clientY, hx.id);
+});
+// Clicks outside the popup dismiss it. Inside-clicks are handled by the
+// delegated onclick above (which also hides the popup explicitly).
+window.addEventListener("mousedown", (e) => {
+  if (!modePickerEl || modePickerEl.classList.contains("hidden")) return;
+  if (modePickerEl.contains(e.target)) return;
+  hideModePicker();
+});
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && modePickerEl && !modePickerEl.classList.contains("hidden")) {
+    hideModePicker();
+  }
+});
+
 function escapeTooltipHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 // Explain why a given pixel ended up in or out of the route mask (only
 // meaningful when DEBUG_SHOW_MASK is on and a route is active). Returns a
-// multi-line description, or null if there's no useful info. Enumerates the
-// classification reasons:
-//   * Hex membership (on the route's hex path, an adjacent-broadened hex,
-//     or completely outside).
-//   * Thick-river status (in the mask = impassable to the line).
-//   * Subhex class (naval class stranded in a non-water hex = excluded
-//     from the path subhex set).
-//   * Road / ferry restriction (in a road-flagged or ferry hex, mask was
-//     restricted to road pixels; this pixel either is or isn't a road
-//     pixel, and the ferry fallback either did or didn't fire).
+// multi-line description, or null if there's no useful info. Enumerates
+// the classification reasons under the current combo-mode schema:
+//   * Hex membership (on the route's hex path, adjacent to one, or off).
+//   * Mode-graph pick — which (hex, mode) dijkstra chose for this hex.
+//     Modes can be single-kind (LAND / ROAD / ROAD_FERRY / NAVAL) or
+//     combos (LAND+ROAD_FERRY, ROAD+ROAD_FERRY, …) with bundled costs
+//     (e.g., ROAD+ROAD_FERRY = road weight + ferry surcharge).
+//   * Which modes this pixel actually belongs to, and whether any of
+//     them is in the picked-modes set for this hex. The pixel is in the
+//     line mask iff at least one of its owning modes was picked.
+//   * Thick-river status — only in the mask when dijkstra picked a
+//     combo containing ROAD_FERRY (or the single ROAD_FERRY mode) here.
+//   * Ferry-mark pixels (ROAD ∩ THICK overlay) — same rule.
 function explainMaskAtPixel(px, py) {
   if (!SUBHEX_ID_IMG_DATA || !HEX_ID_PX || !SUBHEX_ID_PX) return null;
   const W = SUBHEX_ID_IMG_DATA.width, H = SUBHEX_ID_IMG_DATA.height;
@@ -3798,9 +6368,8 @@ function explainMaskAtPixel(px, py) {
   let category = "Land";
   if (isNavalClass) category = "Naval";
   else if (isRoad)  category = "Infrastructure";
-  if (category === "Land" && isFinite(subW) && isFinite(hexW) && subW > hexW) {
-    category += " (excluded — heavier than assigned)";
-  }
+  // (Heavier-than-assigned land subhexes are no longer excluded; the LAND
+  // mode includes their pixels and the parent hex's terrain drives cost.)
 
   // Path membership — restricted to the active route's segments.
   let onPath = false, adjPath = false;
@@ -3821,6 +6390,18 @@ function explainMaskAtPixel(px, py) {
   if (sub) {
     for (const seg of debugSegments) {
       if (seg.subhexPath && seg.subhexPath.indexOf(sid) >= 0) { inDijkstraPath = true; break; }
+    }
+  }
+  // What mode (single or combo) did dijkstra pick for this hex on the
+  // active route? Lets the tooltip distinguish "you're hovering a LAND
+  // pixel and dijkstra picked LAND" from "you're hovering a LAND pixel
+  // but dijkstra picked ROAD+ROAD_FERRY combo, so this pixel isn't in
+  // the line mask".
+  const pickedModes = [];
+  for (const seg of debugSegments) {
+    if (!seg.modePath) continue;
+    for (const [mhex, mmode] of seg.modePath) {
+      if (mhex === hid) pickedModes.push(mmode);
     }
   }
   if (!onPath) {
@@ -3856,11 +6437,31 @@ function explainMaskAtPixel(px, py) {
     lines.push(`Component: ${compStr}${isRoadComp ? " — ROAD component" : ""}`);
   }
 
-  // ── DIJKSTRA ── did the router use this subhex / road in this hex?
+  // ── DIJKSTRA / MODE-GRAPH ── did the router use this subhex / road in this hex?
   if (sub) {
     if (inDijkstraPath) lines.push("Dijkstra picked this subhex on a chosen path");
-    if (routedViaRoadHere) lines.push("Dijkstra routed this hex VIA a road component");
-    else if (onPath && isRoadSubhex) lines.push("Hex has road components but dijkstra did NOT route via the road here (line may still snap to road in renderer)");
+    if (pickedModes.length > 0) {
+      // Show every mode dijkstra picked for this hex (usually one — but
+      // intra-hex transitions can pick up multiple, e.g., entry mode +
+      // transition into a combo).
+      lines.push(`Mode-graph pick for this hex: ${pickedModes.join(", ")}`);
+    }
+    // Show any debug override pinned on this hex (independent of whether
+    // it's on the active route).
+    const override = HEX_MODE_OVERRIDES.get(hid);
+    if (override) {
+      lines.push(`⚑ Mode override pinned: ${override} (right-click to clear / change)`);
+    }
+    if (routedViaRoadHere) lines.push("→ Mode-graph picked a ROAD or ROAD_FERRY (or combo containing one) for this hex");
+    else if (onPath && isRoadSubhex) {
+      // Under the combo-mode schema, the rendered line mask is exactly
+      // the union of the dijkstra-chosen (hex, mode)'s pixel sets, no
+      // post-hoc broadening. If dijkstra picked a non-road combo here,
+      // the road pixels aren't in the line mask — even though the
+      // subhex contains road pixels — because cost-wise that wasn't the
+      // chosen traversal.
+      lines.push("Hex has road pixels but dijkstra didn't pick any ROAD-containing mode/combo here — the road pixels are NOT in the line mask for this route");
+    }
   }
 
   // ── WEIGHTS ──
@@ -3870,19 +6471,35 @@ function explainMaskAtPixel(px, py) {
     const hexWStr = isFinite(hexW) ? hexW : "?";
     lines.push(`Weights: subhex canonical (${subCanon})=${subWStr} · effective=${effWStr} · hex assigned=${hexWStr}`);
     if (!isNavalClass && !isRoadComp && isFinite(subW) && isFinite(hexW) && subW > hexW) {
-      lines.push("→ Land heavier than assigned: dijkstra cannot traverse this component");
+      lines.push("→ Subhex class is heavier than the hex's assigned terrain — still traversable; cost billed at the hex's assigned weight, not the subhex's class weight.");
     }
   }
 
   // ── FERRY / RIVER / ROAD FLAGS ──
+  // Pixel-level facts. With combo modes, whether a pixel ends up in the
+  // line mask is entirely determined by which (hex, mode) dijkstra picked
+  // — combos like LAND+ROAD_FERRY or ROAD+ROAD_FERRY are explicit graph
+  // nodes whose pixel sets are exactly the painted road / river / land
+  // pixels you'd expect.
+  const isPaintedRiver = !!(RIVER_PIXEL_MASK && RIVER_PIXEL_MASK[idx]);
+  const isFerryMark    = isRoad && isThick;   // road overlaid on thick river
   if (isThick) {
     lines.push("Thick river: pixel is in THICK_RIVER_PIXEL_MASK"
       + (isThickBlock ? " (incl. blocking halo)" : "")
-      + " → impassable unless ferry-restored");
+      + " → in the mask ONLY if dijkstra picked a ROAD_FERRY-containing single mode or combo for this hex");
   }
-  if (isThin) lines.push("Thin river: fordable (green-overlay)");
-  if (isFerryHex) lines.push("Hex flagged as FERRY (road+thick overlay) → road+thick fallback eligible");
-  else if (isRoadComp) {
+  if (isThin) lines.push("Thin river: fordable (green-overlay) — passable to the line");
+  if (isFerryHex) {
+    // The hex is a ferry. Dijkstra has explicit combos for it
+    // (ROAD+ROAD_FERRY, LAND+ROAD_FERRY, etc.) with bundled costs —
+    // road+ferry, land+ferry — and picks the cheapest one whose pixel
+    // union actually connects the route's neighbors.
+    lines.push("Hex is a FERRY hex (road+thick overlay artwork) → combo modes available in dijkstra: ROAD+ROAD_FERRY (road on banks + crossing, road+ferry cost), LAND+ROAD_FERRY (land approach + crossing, land+ferry cost), …");
+  }
+  if (isFerryMark) {
+    lines.push("Ferry-mark pixel: ROAD ∩ THICK_RIVER overlay — DEFINES this hex as a ferry; in the line mask iff dijkstra picked a combo containing ROAD_FERRY");
+  }
+  if (isRoadComp) {
     const compPixCount = SUBHEX_COMPONENT_PIXEL_COUNT
       ? (SUBHEX_COMPONENT_PIXEL_COUNT.get(`${sid}:${compId}`) || 0)
       : 0;
@@ -3895,6 +6512,38 @@ function explainMaskAtPixel(px, py) {
   else if (isRoadSubhex) lines.push("Subhex contains road pixels, but THIS pixel is in the land component of the subhex (billed at class weight)");
   else if (isRoadHex) lines.push("Hex flagged Road (sheet), but THIS subhex has no road pixels — pays land weight");
   if (isRoad) lines.push("Pixel is a road/city pixel");
+  // Per-pixel verdict — which mode(s) own this pixel, and is any of them
+  // a mode dijkstra picked? Under the combo schema, a pixel can belong
+  // to multiple modes at once (e.g., a road pixel belongs to ROAD#0, to
+  // LAND#0 if road pixels are also in landSet, and to every combo that
+  // includes ROAD or LAND). The pixel is in the line mask iff ANY of the
+  // modes it belongs to is in pickedModes for this hex.
+  if (isFerryHex && pickedModes.length > 0) {
+    const pickedSet = new Set(pickedModes);
+    const owningModes = [];
+    if (HEX_MODES && HEX_MODES.get(hid)) {
+      for (const [mname, minfo] of HEX_MODES.get(hid)) {
+        // Cheap membership test: does this mode's pixel array contain idx?
+        // For typical mode sizes (hundreds to thousands of pixels) this is
+        // an O(n) scan per mode, but the tooltip only runs on hover so a
+        // few thousand operations per mouseover is fine.
+        const pxs = minfo.pixels;
+        for (let i = 0; i < pxs.length; i++) {
+          if (pxs[i] === idx) { owningModes.push(mname); break; }
+        }
+      }
+    }
+    if (owningModes.length > 0) {
+      const owningPicked = owningModes.filter(m => pickedSet.has(m));
+      if (owningPicked.length > 0) {
+        lines.push(`Pixel belongs to: ${owningModes.join(", ")} — picked: ${owningPicked.join(", ")}`);
+      } else {
+        lines.push(`Pixel belongs to: ${owningModes.join(", ")} — NONE picked by dijkstra (so not in the line mask)`);
+      }
+    } else {
+      lines.push("Pixel belongs to NO mode of this hex (water barrier / dropped)");
+    }
+  }
 
   // ── ROAD PIXEL COUNTS ── how much road artwork actually exists here.
   // Useful when debugging "why doesn't dijkstra route via this hex's
