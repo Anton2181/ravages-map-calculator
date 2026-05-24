@@ -347,6 +347,34 @@ function updateEndpoints() {
             }
           }
         }
+        // Walk each segment's modePath to identify boundary-surcharge
+        // events: embark (land → naval), disembark (naval → land), and
+        // ford crossings (any chosen mode whose kinds include FORD).
+        // These translate to extra IRL-hour cost the per-hex weight
+        // column doesn't otherwise show — surfaced as tags on the row
+        // where the event occurs.
+        const embarkHexes = new Set();
+        const disembarkHexes = new Set();
+        const fordHexes = new Set();
+        if (typeof HEX_MODES !== "undefined" && HEX_MODES && typeof modeIsNaval === "function") {
+          for (const seg of route.segments) {
+            if (!seg.modePath || seg.modePath.length === 0) continue;
+            let prevIsNaval = null;
+            for (let i = 0; i < seg.modePath.length; i++) {
+              const [hex, mode] = seg.modePath[i];
+              const info = HEX_MODES.get(hex) && HEX_MODES.get(hex).get(mode);
+              if (!info) continue;
+              const isNaval = modeIsNaval(info);
+              if (prevIsNaval !== null) {
+                if (!prevIsNaval && isNaval) embarkHexes.add(hex);
+                else if (prevIsNaval && !isNaval) disembarkHexes.add(hex);
+              }
+              prevIsNaval = isNaval;
+              const kinds = info.kinds || (info.kind ? [info.kind] : []);
+              if (kinds.indexOf("FORD") >= 0) fordHexes.add(hex);
+            }
+          }
+        }
         // First hex of the whole route is the "start" (free).
         for (let k = 0; k < flat.length; k++) {
           const { hid, seg } = flat[k];
@@ -392,8 +420,29 @@ function updateEndpoints() {
           } else {
             costStr = `<span class="cost muted">—</span>`;
           }
-          // Annotations: ferry crossing tag.
+          // Annotations: boundary surcharges + ferry/ford crossings.
+          // Each tag explains a per-hex IRL-hour contribution the hex's
+          // own weight column wouldn't otherwise reveal.
           const tags = [];
+          if (embarkHexes.has(hid)) {
+            const ew = (typeof weights !== "undefined" && weights["Embark"] != null) ? +weights["Embark"] : null;
+            const txt = isFinite(ew) ? ` +${ew}` : "";
+            tags.push(`<span class="tag embark" title="Embark surcharge (boarding ship)">⚓${txt}</span>`);
+          }
+          if (disembarkHexes.has(hid)) {
+            const dw = (typeof weights !== "undefined" && weights["Disembark"] != null) ? +weights["Disembark"] : null;
+            const txt = (isFinite(dw) && dw > 0) ? ` +${dw}` : "";
+            tags.push(`<span class="tag disembark" title="Disembark surcharge (leaving ship)">⚓${txt}</span>`);
+          }
+          if (fordHexes.has(hid)) {
+            // FORD cost is part of the combo's mode-cost (already in
+            // the hex's number), but tag it so the user knows the hex
+            // includes a fording surcharge. armyFordCost reflects the
+            // current Length-driven Fording cost.
+            const fc = (typeof armyFordCost === "function") ? armyFordCost() : null;
+            const txt = isFinite(fc) ? ` +${(+fc).toFixed(1)}` : "";
+            tags.push(`<span class="tag ford" title="Fording surcharge included in this hex's cost">≈${txt}</span>`);
+          }
           if (seg.usedFerryHexes && seg.usedFerryHexes.has(hid)) {
             const fw = (typeof weights !== "undefined" && weights["Ferry"] != null) ? +weights["Ferry"] : null;
             tags.push(`<span class="tag ferry" title="Ferry crossing">⛴${isFinite(fw) ? ` +${fw}` : ""}</span>`);

@@ -264,8 +264,18 @@ function perpDist(p, a, b) {
   return Math.hypot(p.x - cx, p.y - cy);
 }
 
-// Bresenham line-of-sight test: returns true iff every pixel on the line from
-// (x0,y0) to (x1,y1) is mask=1 (inside the passable region).
+// Bresenham line-of-sight test: returns true iff every pixel on the line
+// from (x0,y0) to (x1,y1) is mask=1 (inside the passable region), AND no
+// diagonal step "corner-cuts" through an impassable pixel.
+//
+// The corner-cut clause mirrors aStarInMask: a diagonal step that would
+// take us from (x, y) to (x+sx, y+sy) must have BOTH orthogonal corners
+// (x+sx, y) and (x, y+sy) in the mask. Without this check, plain
+// Bresenham silently slips past a 1-pixel naval/river pinch — the next
+// stepped cell is the diagonal destination, the impassable corner cell
+// is never inspected, lineOfSight returns true, stringPull replaces the
+// safe long way around with the unsafe shortcut, and the rendered line
+// visibly cuts the corner.
 function lineOfSight(mask, w, h, x0, y0, x1, y1) {
   let dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
   let dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
@@ -275,8 +285,21 @@ function lineOfSight(mask, w, h, x0, y0, x1, y1) {
     if (!mask[y0 * w + x0]) return false;
     if (x0 === x1 && y0 === y1) return true;
     const e2 = 2 * err;
-    if (e2 >= dy) { err += dy; x0 += sx; }
-    if (e2 <= dx) { err += dx; y0 += sy; }
+    const stepX = e2 >= dy;
+    const stepY = e2 <= dx;
+    if (stepX && stepY) {
+      // Diagonal step — require both orthogonal corner cells to be
+      // passable, exactly the rule A* uses to decide a diagonal
+      // neighbor is reachable. Out-of-bounds counts as impassable.
+      const cx1 = x0 + sx, cy1 = y0;
+      const cx2 = x0,      cy2 = y0 + sy;
+      if (cx1 < 0 || cx1 >= w || cy1 < 0 || cy1 >= h) return false;
+      if (cx2 < 0 || cx2 >= w || cy2 < 0 || cy2 >= h) return false;
+      if (!mask[cy1 * w + cx1]) return false;
+      if (!mask[cy2 * w + cx2]) return false;
+    }
+    if (stepX) { err += dy; x0 += sx; }
+    if (stepY) { err += dx; y0 += sy; }
   }
 }
 

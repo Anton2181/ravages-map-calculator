@@ -914,7 +914,7 @@ function hexNeighbors(hid) {
 //   4. Save the downloaded `graph_cache.bin` next to neighbors.json.
 //   5. Subsequent loads skip the heavy precomputes.
 // ============================================================================
-const CACHE_VERSION = 13;
+const CACHE_VERSION = 26;
 const CACHE_MAGIC = "RVGCACHE";
 
 // ---- low-level writers ----
@@ -1993,7 +1993,7 @@ function precomputeHexModes() {
   // components because the renderer's broader mask usually still
   // contains the non-river corner pixels, so allowing the diagonal
   // doesn't desync flood-fill from A*'s reachable set.
-  function floodComponents(bucket, strictCornerCut) {
+  function floodComponents(bucket, strictCornerCut, blockOnCorner) {
     const visited = new Set();
     const comps = [];
     for (const seed of bucket) {
@@ -2026,10 +2026,16 @@ function precomputeHexModes() {
               } else {
                 // River-aware corner-cut: rivers act as flood-fill
                 // separators for any mode that doesn't include them.
-                const c1River = (thinMask && thinMask[c1]) || (thickMask && thickMask[c1]);
-                const c2River = (thinMask && thinMask[c2]) || (thickMask && thickMask[c2]);
-                if (c1River && !bucket.has(c1)) continue;
-                if (c2River && !bucket.has(c2)) continue;
+                // blockOnCorner is an additional separator set passed
+                // in by emitComponents (used for naval pixels when
+                // flooding land-side buckets, so a LAND component
+                // can't 8-connect through a lake pixel pinch).
+                const c1Sep = (thinMask && thinMask[c1]) || (thickMask && thickMask[c1])
+                           || (blockOnCorner && blockOnCorner.has(c1));
+                const c2Sep = (thinMask && thinMask[c2]) || (thickMask && thickMask[c2])
+                           || (blockOnCorner && blockOnCorner.has(c2));
+                if (c1Sep && !bucket.has(c1)) continue;
+                if (c2Sep && !bucket.has(c2)) continue;
               }
             }
             visited.add(ni);
@@ -2222,7 +2228,13 @@ function precomputeHexModes() {
     const emitComponents = (kindName, bucket, cost, isFerry) => {
       if (bucket.size === 0 || !isFinite(cost)) return;
       const kindNum = MODE_KIND_NUMS[kindName];
-      const comps = pruneTinyComponents(floodComponents(bucket));
+      // Land-side modes treat naval pixels as flood-fill separators
+      // (the same way rivers already are), so a LAND/ROAD/FORD/
+      // ROAD_FERRY component can't 8-connect through a lake-pixel
+      // pinch — otherwise dijkstra picks a single "land" mode whose
+      // pixel set has a naval gap line A* can't actually walk.
+      const blockOnCorner = (kindName !== "NAVAL") ? navalSet : null;
+      const comps = pruneTinyComponents(floodComponents(bucket, false, blockOnCorner));
       for (let ci = 0; ci < comps.length; ci++) {
         const pixels = comps[ci];
         const name = `${kindName}#${ci}`;
@@ -2382,21 +2394,15 @@ function precomputeHexModes() {
         // any combo that contains BOTH so dijkstra can't use a river
         // mouth as a free river→sea (or sea→river) transition.
         if (kinds.indexOf("FORD") >= 0 && kinds.indexOf("NAVAL") >= 0) continue;
-        // ── DISEMBARK-AT-STRONGHOLD GUARD ────────────────────────────
-        // A combo containing NAVAL + any non-NAVAL kind means the route
-        // can cross the land/water boundary INSIDE this combo (between
-        // pixel modes of the same combo node). Dijkstra's cross-hex
-        // edge check enforces "naval→land requires Stronghold", but it
-        // can't see boundary crossings that happen entirely inside a
-        // single combo. To prevent dijkstra from sneaking past the
-        // stronghold rule via a LAND+NAVAL combo, drop these mixed
-        // combos for hexes that aren't strongholds.
-        const hasNaval    = kinds.indexOf("NAVAL") >= 0;
-        const hasNonNaval = kinds.some(k => k !== "NAVAL");
-        if (hasNaval && hasNonNaval) {
-          const isStronghold = !!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(hid));
-          if (!isStronghold) continue;
-        }
+        // LAND+NAVAL (and any other NAVAL + non-NAVAL) combo is now
+        // emitted at every coastal hex so dijkstra has a real
+        // transition-zone node to pick for embark / disembark routes.
+        // The disembark stronghold rule still applies at the OUTBOUND
+        // cross-hex boundary (combo at hex A → LAND at hex B is blocked
+        // unless B is a stronghold), and the LINE A* is constrained to
+        // draw two hexes at a time (see the pair-mask loop in
+        // routeLineFromModes), so the line can't sneak corner-cuts
+        // across non-stronghold combos.
         if (union.size === 0 || !isFinite(cost) || cost < 0) continue;
         const comboKindName = kinds.join("+");
         // Strict corner-cut for combos: see floodComponents comment. A combo
@@ -2585,14 +2591,29 @@ function checkAndLink(i, j, kA, cA, hA, pixKind, pixComp, pixHex, numToKind, lin
   // You can't enter a river from a different hex — you must arrive on
   // the bank of THIS hex via LAND or ROAD and then traverse the river
   // within the hex via a LAND+FORD / ROAD+FORD / LAND+ROAD_FERRY /
-  // ROAD+ROAD_FERRY combo. Block ANY cross-hex edge where either side
-  // is FORD or ROAD_FERRY. Combos still get their cross-hex edges via
-  // their LAND/ROAD constituents (addComboModeNeighbors).
+  // ROAD+ROAD_FERRY combo. FORD cross-hex is fully blocked (rivers don't
+  // span a hex boundary as a single fording event). ROAD_FERRY allows
+  // ONE exception across hex borders: ROAD_FERRY↔ROAD_FERRY — a ferry
+  // mark painted across a hex boundary lives in both hexes' ferry-mark
+  // buckets and needs the cross-hex link so the line can traverse it
+  // as one continuous crossing. Any mixed pairing with FORD or
+  // ROAD_FERRY on one side stays blocked.
   const FORD       = MODE_KIND_NUMS.FORD;
   const ROAD_FERRY = MODE_KIND_NUMS.ROAD_FERRY;
   if (hA !== hB) {
-    if (kA === FORD || kB === FORD)             return;
-    if (kA === ROAD_FERRY || kB === ROAD_FERRY) return;
+    if (kA === FORD || kB === FORD) return;
+    const aIsFerry = (kA === ROAD_FERRY);
+    const bIsFerry = (kB === ROAD_FERRY);
+    if (aIsFerry !== bIsFerry) return;   // mixed: blocked (e.g., ROAD_FERRY↔LAND)
+    // aIsFerry && bIsFerry → both ROAD_FERRY: allow through.
+    // !aIsFerry && !bIsFerry → no ferry involved: fall through.
+    // Cross-hex DIAGONAL pixel adjacencies don't create a mode edge.
+    // Two hexes in a hex grid share an edge, never just a corner; if
+    // the only pixel adjacency between two modes is a diagonal pinch
+    // there's no orthogonal contact along the shared edge either, so
+    // these aren't really neighbors. Line A*'s corner-cut couldn't
+    // trace through such a pinch in any case.
+    if (dx !== 0 && dy !== 0) return;
   }
   // Corner-cut check on diagonals. MUST match line A*'s rule
   // (aStarInMask in pathfinding.js) so we never create an edge the
@@ -2602,6 +2623,42 @@ function checkAndLink(i, j, kA, cA, hA, pixKind, pixComp, pixHex, numToKind, lin
     const ox = y * W + (x + dx);
     const oy = (y + dy) * W + x;
     if (!pixKind[ox] || !pixKind[oy]) return;
+    // CATEGORY-MATCH for CROSS-HEX diagonals. Line A* operates on the
+    // ROUTE'S mode-pixel mask: a LAND→LAND route includes only LAND-
+    // category pixels, so a NAVAL corner pixel isn't in the mask and
+    // line A* refuses the diagonal. Mirror that here so dijkstra
+    // never picks a "step across a 1-px sea pinch" edge that the line
+    // can't render. Intra-hex diagonals are left alone because the
+    // route mask includes everything in the chosen mode regardless of
+    // kind boundaries.
+    if (hA !== hB) {
+      // Cross-hex diagonal — same side-based rule the renderer's
+      // augmenter uses (routeLineFromModes). The corner kinds must
+      // belong to the same "side" as at least one of the diagonal
+      // endpoints:
+      //   L  = LAND / ROAD            (true land traversal)
+      //   R  = FORD / ROAD_FERRY      (river crossings; hex-internal)
+      //   N  = NAVAL                  (water)
+      // A river pixel can't bridge a LAND-LAND diagonal across a hex
+      // border — the only legal way through a river is the intra-hex
+      // LAND+FORD / ROAD+FORD combo, which pays the fording surcharge.
+      // Same for a ferry-mark pixel.
+      const NAVAL = MODE_KIND_NUMS.NAVAL;
+      const FORD       = MODE_KIND_NUMS.FORD;
+      const ROAD_FERRY = MODE_KIND_NUMS.ROAD_FERRY;
+      const sideOf = (k) => {
+        if (k === NAVAL) return "N";
+        if (k === FORD || k === ROAD_FERRY) return "R";
+        return "L";
+      };
+      const aSide = sideOf(kA);
+      const bSide = sideOf(kB);
+      const c1Side = sideOf(pixKind[ox]);
+      const c2Side = sideOf(pixKind[oy]);
+      const c1Ok = c1Side === aSide || c1Side === bSide;
+      const c2Ok = c2Side === aSide || c2Side === bSide;
+      if (!c1Ok && !c2Ok) return;
+    }
   }
   const aKey = `${hA}:${numToKind[kA]}#${cA}`;
   const bKey = `${hB}:${numToKind[kB]}#${cB}`;
@@ -3236,51 +3293,108 @@ function pointToHex(x, y) {
 // path finder, but stopped at ISOCHRONE_BUDGET. Result: the set of reachable
 // hexes (and the subhexes inside them) within that budget.
 function computeIsochrone() {
+  // Reachability dijkstra runs on the SAME hex-mode graph as route
+  // pathfinding, so every army-aware cost rule is automatically
+  // respected: long-column doubling (baked into LAND/ROAD mode costs),
+  // Can ford / Can embark gates (the active HEX_MODES variant simply
+  // omits FORD / NAVAL modes when those flags are off), bridge
+  // crossings (road pixels overlaid on thin-river are classified as
+  // LAND/ROAD, not FORD, in precomputeHexModes), and ferry crossings
+  // (ROAD_FERRY modes carry the right ferry surcharge). The previous
+  // hex-level simplification ignored every one of those, so an army
+  // that "can't ford" still showed a reachable hex on the other side
+  // of a thin river.
   isochroneHexIds = null; isochroneSubhexIds = null;
   if (isochroneSourceId == null) return;
   const sub = SUBHEX_INDEX.get(isochroneSourceId);
   if (!sub) return;
+  if (!HEX_MODES || !HEX_MODE_NEIGHBORS) return;
   const srcHex = sub.hex;
-  const dist = new Map();
-  dist.set(srcHex, 0);
+  const srcModes = HEX_MODES.get(srcHex);
+  if (!srcModes) return;
+
+  // Per-(hex, mode) cost-to-reach. distHex is the projected per-hex
+  // minimum across modes — used both for the heap-pop staleness check
+  // and as the final reached-hex set.
+  const distMode = new Map();
+  const distHex  = new Map();
   const heap = new MinHeap();
-  heap.push([0, srcHex]);
-  const reached = new Set([srcHex]);
+
+  // Seed every mode of the source hex at cost 0 (free start, same as
+  // route pathfinding).
+  for (const [mName, mInfo] of srcModes) {
+    if (!mInfo || !isFinite(mInfo.cost) || mInfo.cost < 0) continue;
+    const key = `${srcHex}:${mName}`;
+    distMode.set(key, 0);
+    heap.push([0, key, srcHex, mName]);
+  }
+  distHex.set(srcHex, 0);
+
   while (heap.size() > 0) {
-    const [d, u] = heap.pop();
-    if (d > (dist.get(u) ?? Infinity)) continue;
-    const uTerrain = HEX_TERRAIN ? canonicalHexTerrain(HEX_TERRAIN.get(u)) : null;
-    const uIsWater = uTerrain ? WATER_TERRAINS.has(uTerrain) : false;
-    for (const v of hexNeighbors(u)) {
-      const vTerrain = HEX_TERRAIN ? canonicalHexTerrain(HEX_TERRAIN.get(v)) : null;
-      if (!vTerrain) continue;
-      const vIsWater = WATER_TERRAINS.has(vTerrain);
-      const vHasRoad = HEX_ROAD && HEX_ROAD.get(v);
-      let w;
-      if (uIsWater !== vIsWater) {
-        // Land↔water crossing — costs an Embark (or Disembark, which is
-        // free under the default cost model). Blocked entirely when the
-        // army can't board ships.
+    const [d, uKey, uHex, uMode] = heap.pop();
+    if (d > (distMode.get(uKey) ?? Infinity)) continue;
+    const uInfo = HEX_MODES.get(uHex)?.get(uMode);
+    if (!uInfo) continue;
+    const uIsNaval = modeIsNaval(uInfo);
+
+    const neighbors = HEX_MODE_NEIGHBORS.get(uKey);
+    if (!neighbors) continue;
+
+    for (const vKey of neighbors) {
+      const colon = vKey.indexOf(":");
+      const vHex  = +vKey.slice(0, colon);
+      const vMode = vKey.slice(colon + 1);
+      // Intra-hex transitions are free under the mode-graph cost model
+      // (the cost of being IN a hex was already paid on entry). Skip
+      // them — we only care about reaching NEW hexes here.
+      if (vHex === uHex) continue;
+      const vInfo = HEX_MODES.get(vHex)?.get(vMode);
+      if (!vInfo || !isFinite(vInfo.cost) || vInfo.cost < 0) continue;
+
+      // Entering v pays v's mode cost. Land/road/ford/ferry/naval costs
+      // are all already baked into vInfo.cost for the active variant
+      // (HEX_MODES is whichever HEX_MODES_VARIANTS entry matches the
+      // current ARMY_CAN_FORD / ARMY_CAN_EMBARK flags).
+      let nd = d + vInfo.cost;
+
+      // Naval-boundary surcharges. Embark fires on land→naval crossings
+      // (boarding a ship), Disembark on naval→land (and only at hexes
+      // with a Stronghold). ARMY_CAN_EMBARK is enforced both here AND
+      // upstream (NAVAL modes don't even exist in the active variant
+      // when the flag is off), but the runtime check stays as a
+      // belt-and-braces guard for the no-NAVAL-modes-but-still-traversal
+      // edge case.
+      const vIsNaval = modeIsNaval(vInfo);
+      // Mirror the dijkstra rule set. Pure naval → land blocked;
+      // any land → naval pays Embark; combo → land requires the
+      // combo's hex to be a stronghold.
+      const uIsPureNaval = modeIsPureNaval(uInfo);
+      const vIsPureNaval = modeIsPureNaval(vInfo);
+      const uIsLandSide  = !uIsNaval;
+      const vIsLandSide  = !vIsNaval;
+      if (uIsPureNaval && vIsLandSide) {
+        continue;
+      } else if (uIsLandSide && !vIsLandSide) {
         if (!ARMY_CAN_EMBARK) continue;
-        w = +weights["Embark"];
-      } else {
-        const baseW = +(vHasRoad ? roadWeights : weights)[vTerrain];
-        // Long-column penalty doubles the per-hex traversal weight on
-        // land. Water doesn't drag — fleet length doesn't slow a
-        // crossing the way column length slows a march.
-        const isLand = !vIsWater;
-        w = baseW * (isLand ? armyLandMul() : 1);
+        const e = +weights["Embark"];
+        if (isFinite(e) && e > 0) nd += e;
+      } else if (!uIsLandSide && !uIsPureNaval && vIsLandSide) {
+        if (!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(uHex))) continue;
+        const dw = +weights["Disembark"] || 0;
+        if (isFinite(dw) && dw > 0) nd += dw;
       }
-      if (!isFinite(w) || w <= 0) continue;
-      const nd = d + w;
+
       if (nd > ISOCHRONE_BUDGET) continue;
-      if (nd < (dist.get(v) ?? Infinity)) {
-        dist.set(v, nd);
-        reached.add(v);
-        heap.push([nd, v]);
+      if (nd < (distMode.get(vKey) ?? Infinity)) {
+        distMode.set(vKey, nd);
+        heap.push([nd, vKey, vHex, vMode]);
+        if (nd < (distHex.get(vHex) ?? Infinity)) distHex.set(vHex, nd);
       }
     }
   }
+
+  // distHex is the reachable set. Project to subhexes for the overlay.
+  const reached = new Set(distHex.keys());
   isochroneHexIds = reached;
   const subSet = new Set();
   for (const hid of reached) {
@@ -3433,6 +3547,18 @@ function modeIsNaval(info) {
   if (!info) return false;
   if (info.kind === "NAVAL") return true;
   if (info.kinds && info.kinds.indexOf("NAVAL") >= 0) return true;
+  return false;
+}
+// "Pure naval" = NAVAL is the mode's ONLY kind (i.e., it's the NAVAL
+// single, not a combo that also includes LAND/ROAD). Used by dijkstra's
+// disembark rule: a pure naval → land-side cross-hex edge is blocked
+// outright (the only legal disembark is through a LAND+NAVAL combo,
+// which exists at every coastal hex but is the only mode-node that
+// can mix land and naval kinds in one place).
+function modeIsPureNaval(info) {
+  if (!info) return false;
+  if (info.kind === "NAVAL" && !info.isCombo) return true;
+  if (info.kinds && info.kinds.length === 1 && info.kinds[0] === "NAVAL") return true;
   return false;
 }
 function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, toPixIdx) {
@@ -3599,18 +3725,35 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
       const nHex = vHex;
       const nIsStart = false;
       // ── Naval boundary ──
-      // Embark fires only on land → naval (entering water). Cost = Embark.
-      // Disembark fires only on naval → land (leaving water). Blocked
-      // unless the destination hex has a Stronghold flag; cost = Disembark.
-      if (uIsNaval && !vIsNaval) {
-        // Disembark.
-        if (!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(vHex))) continue;
-        const dw = +weights["Disembark"] || 0;
-        if (isFinite(dw) && dw > 0) nd += dw;
-      } else if (!uIsNaval && vIsNaval) {
-        // Embark.
+      // Rule set:
+      //   * pure naval → land-side  : BLOCKED. The only legal
+      //     disembark is through a LAND+NAVAL combo at a stronghold.
+      //   * land-side → any naval   : Embark fires anywhere (no
+      //     stronghold required). Covers both direct land→naval
+      //     cross-hex edges AND the land→combo entry path.
+      //   * combo → land-side       : Disembark, ONLY if the combo
+      //     hex (uHex) carries the Stronghold flag. Pays the
+      //     Disembark surcharge if any.
+      //   * everything else (combo↔combo, combo→naval-pure,
+      //     naval-pure→combo, naval-pure→naval-pure) : no boundary
+      //     surcharge; the combo's own mode-cost already paid for
+      //     the transition.
+      const uIsPureNaval = modeIsPureNaval(uInfo);
+      const vIsPureNaval = modeIsPureNaval(vInfo);
+      const uIsLandSide  = !uIsNaval;
+      const vIsLandSide  = !vIsNaval;
+      if (uIsPureNaval && vIsLandSide) {
+        // Pure naval → land-side: blocked outright.
+        continue;
+      } else if (uIsLandSide && !vIsLandSide) {
+        // Land-side → naval (pure OR combo): Embark fires anywhere.
         const e = +weights["Embark"];
         if (isFinite(e) && e > 0) nd += e;
+      } else if (!uIsLandSide && !uIsPureNaval && vIsLandSide) {
+        // Combo → land-side: only at strongholds (combo hex = port).
+        if (!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(uHex))) continue;
+        const dw = +weights["Disembark"] || 0;
+        if (isFinite(dw) && dw > 0) nd += dw;
       }
 
       const nStateKey = `${vKey}|${nMax}`;
@@ -4132,58 +4275,100 @@ function countFerryCrossings(linePts) {
 // of interest. Cross-hex segments run Dijkstra and aggregate the same edge
 // cost terms updatePathInfo's old loop used (embark counts and all).
 function computeSegment(wa, wb) {
-  // Same-hex segment. Build the in-hex line up front and count subhex-level
-  // embarks on it — two clicks inside a single hex can still cross a
-  // shoreline if one's on a naval subhex and the other isn't.
+  // ── Same-hex segment ───────────────────────────────────────────────
+  // Two waypoints inside one hex. Movement INSIDE a single component
+  // (a LAND# or NAVAL# region with no river / shoreline between the
+  // two click pixels) is free — the user is already in the hex and
+  // doesn't pay the per-hex traversal weight. But a river splitting
+  // the hex into two LAND components, or a stranded sea subhex
+  // between the two click points, means the route has to cross
+  // either via a combo mode (LAND+FORD, LAND+ROAD_FERRY, etc.) or via
+  // a detour out through a neighbour hex. The combo carries the
+  // fording / ferry / embark surcharges as its mode-cost extras, and
+  // those *are* charged even for the starting hex.
   if (wa.hexId === wb.hexId) {
-    const sameSubhex = (wa.subhexId === wb.subhexId);
-    let linePts;
-    if (sameSubhex) {
-      linePts = [{ x: wa.px.x, y: wa.px.y }, { x: wb.px.x, y: wb.px.y }];
-    } else {
-      // Same-hex: pathRoadHexes is just "this hex, if either endpoint
-      // pixel lies on a road component". That gates road-restriction
-      // for an in-hex segment the same way dijkstra's pathRoadHexes
-      // does for cross-hex segments.
-      const sameHexPathRoadHexes = new Set();
-      const _W = SUBHEX_ID_IMG_DATA ? SUBHEX_ID_IMG_DATA.width : 0;
-      if (_W > 0 && SUBHEX_PIXEL_COMPONENT && ROAD_COMPONENTS) {
-        const aIdx = (wa.px.y | 0) * _W + (wa.px.x | 0);
-        const bIdx = (wb.px.y | 0) * _W + (wb.px.x | 0);
-        const aComp = SUBHEX_PIXEL_COMPONENT[aIdx] | 0;
-        const bComp = SUBHEX_PIXEL_COMPONENT[bIdx] | 0;
-        if ((aComp && ROAD_COMPONENTS.has(`${wa.subhexId}:${aComp}`)) ||
-            (bComp && ROAD_COMPONENTS.has(`${wb.subhexId}:${bComp}`))) {
-          sameHexPathRoadHexes.add(wa.hexId);
+    const hexId = wa.hexId;
+    const modes = HEX_MODES && HEX_MODES.get(hexId);
+    const Ws = SUBHEX_ID_IMG_DATA ? SUBHEX_ID_IMG_DATA.width : 0;
+    const fromPixIdx = (Ws > 0) ? ((wa.px.y | 0) * Ws + (wa.px.x | 0)) : null;
+    const toPixIdx   = (Ws > 0) ? ((wb.px.y | 0) * Ws + (wb.px.x | 0)) : null;
+    // Find the cheapest mode of this hex whose pixel set contains
+    // BOTH endpoint pixels. Returns null if no single mode covers
+    // them (caller falls through to the cross-hex detour path).
+    const findCoveringMode = () => {
+      if (!modes || fromPixIdx == null || toPixIdx == null) return null;
+      let bestName = null, bestExtra = Infinity, bestInfo = null;
+      for (const [name, info] of modes) {
+        const pixs = info.pixels;
+        if (!pixs || pixs.length === 0) continue;
+        let hasF = false, hasT = false;
+        for (let i = 0; i < pixs.length; i++) {
+          const p = pixs[i];
+          if (p === fromPixIdx) hasF = true;
+          if (p === toPixIdx)   hasT = true;
+          if (hasF && hasT) break;
+        }
+        if (!(hasF && hasT)) continue;
+        // Same-hex "extras" — the slice of this mode's cost the user
+        // still has to pay even though the hex itself is the start.
+        // LAND / ROAD / NAVAL by themselves contribute zero (free
+        // intra-component movement); FORD and ROAD_FERRY surcharges
+        // are real per-crossing costs we keep.
+        let extra = 0;
+        if (info.kinds) {
+          for (const k of info.kinds) {
+            if (k === "FORD")       extra += armyFordCost();
+            if (k === "ROAD_FERRY") extra += (+weights["Ferry"] || 0);
+          }
+        }
+        if (extra < bestExtra) {
+          bestExtra = extra;
+          bestName = name;
+          bestInfo = info;
         }
       }
-      linePts = routeThroughMask(new Set([wa.subhexId, wb.subhexId]), {
-        fromId: wa.subhexId, toId: wb.subhexId,
-        fromPx: wa.px,       toPx: wb.px,
-        pathHexIds: [wa.hexId],
-        subhexPath: [wa.subhexId, wb.subhexId],
-        pathRoadHexes: sameHexPathRoadHexes,
-        debugSink: {},
-      });
-      if (!linePts || linePts.length === 0) {
-        linePts = [{ x: wa.px.x, y: wa.px.y }, { x: wb.px.x, y: wb.px.y }];
-      }
-    }
-    const embarks = countSubhexEmbarks(linePts);
-    const fr      = countFerryCrossings(linePts);
-    const ferries = fr.count;
-    const usedFerryHexes = fr.used;
-    return {
-      hexIds: [wa.hexId],
-      subhexIds: new Set([wa.subhexId, wb.subhexId]),
-      cost: embarks * (+weights["Embark"]) + ferries * (+weights["Ferry"]),
-      embarks,
-      ferries,
-      usedFerryHexes,
-      sameHex: true, reachable: true,
-      linePts,
-      debugMask: null,
+      if (bestName == null) return null;
+      return { name: bestName, info: bestInfo, extra: bestExtra };
     };
+    const covering = findCoveringMode();
+    if (covering) {
+      // Render via the standard mode-graph pipeline so naval scrub,
+      // corner augmentation, ferry-mark / city waypoint injection, and
+      // ferry thinning all still apply for in-hex traversals.
+      const debugSink = {};
+      const linePts = routeLineFromModes(
+        [[hexId, covering.name]], wa.px, wb.px, debugSink
+      );
+      const finalLine = (linePts && linePts.length > 0)
+        ? linePts
+        : [{ x: wa.px.x, y: wa.px.y }, { x: wb.px.x, y: wb.px.y }];
+      const embarks = countSubhexEmbarks(finalLine);
+      const fr      = countFerryCrossings(finalLine);
+      const ferries = fr.count;
+      const usedFerryHexes = fr.used;
+      return {
+        hexIds: [hexId],
+        subhexIds: new Set([wa.subhexId, wb.subhexId]),
+        // Combo surcharges + line-derived embark/ferry crossings. A
+        // single-LAND/ROAD/NAVAL covering mode contributes nothing on
+        // its own — the cost ends up being purely the boundary
+        // surcharges the rendered line happens to cross.
+        cost: covering.extra
+              + embarks * (+weights["Embark"])
+              + ferries * (+weights["Ferry"]),
+        embarks,
+        ferries,
+        usedFerryHexes,
+        sameHex: true, reachable: true,
+        linePts: finalLine,
+        debugMask: debugSink.mask ? debugSink : null,
+        modePath: [[hexId, covering.name]],
+      };
+    }
+    // Fall through to the dijkstra cross-hex path. The router will
+    // detour out through a neighbour hex and back — that's the only
+    // way to get between the two subhexes if no single mode of this
+    // hex covers both (river impassable, ford disabled, etc.).
   }
   const fromSub = SUBHEX_INDEX.get(wa.subhexId);
   const toSub   = SUBHEX_INDEX.get(wb.subhexId);
@@ -4832,9 +5017,11 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
   // Compute mask bbox = bounding box of every mode's pixels.
   let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
   const modeInfos = [];
+  const routeHexSet = new Set();
   for (const [hex, mode] of modePath) {
     const info = HEX_MODES.get(hex)?.get(mode);
     if (!info) continue;
+    routeHexSet.add(hex);
     modeInfos.push(info);
     for (let i = 0; i < info.pixels.length; i++) {
       const p = info.pixels[i];
@@ -4844,6 +5031,69 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
       if (px > bx1) bx1 = px;
       if (py < by0) by0 = py;
       if (py > by1) by1 = py;
+    }
+  }
+  // ── Adjoining-road sub-threshold widening ───────────────────────
+  // For each route hex whose chosen mode is road-containing, look at
+  // its 6 neighbours. If a neighbour has a single ROAD mode whose
+  // component pixel count is BELOW MIN_PIXELS_PER_PATH_HEX AND whose
+  // pixels are 8-connected to the route hex's chosen-mode pixels,
+  // include that road stub in the mask. Brief line dips through it
+  // get refunded as sub-threshold (cost 0) by countLineMainHexes /
+  // adjustedCost downstream. Anything else from the neighbour stays
+  // out of the mask, so the line is still hex-confined for everything
+  // except tiny adjoining road continuations.
+  const nbModeInfos = [];
+  if (typeof hexNeighbors === "function" && HEX_MODES) {
+    for (const [hex, mode] of modePath) {
+      const info = HEX_MODES.get(hex)?.get(mode);
+      if (!info) continue;
+      const routeKinds = info.kinds || (info.kind ? [info.kind] : []);
+      if (routeKinds.indexOf("ROAD") < 0) continue;
+      // Build a Set of the route mode's pixels so the 8-adjacency
+      // check below is O(1) per neighbour pixel.
+      const routePixSet = new Set();
+      for (let i = 0; i < info.pixels.length; i++) routePixSet.add(info.pixels[i]);
+      for (const nbHex of hexNeighbors(hex)) {
+        if (routeHexSet.has(nbHex)) continue;
+        const nbModes = HEX_MODES.get(nbHex);
+        if (!nbModes) continue;
+        for (const [, nbInfo] of nbModes) {
+          if (nbInfo.isCombo) continue;
+          if (nbInfo.kind !== "ROAD") continue;
+          if (nbInfo.pixels.length >= MIN_PIXELS_PER_PATH_HEX) continue;
+          // 8-adjacency test against the route mode's pixel set.
+          let connected = false;
+          const npx = nbInfo.pixels;
+          for (let i = 0; i < npx.length && !connected; i++) {
+            const p = npx[i];
+            const py = (p / W) | 0;
+            const px = p - py * W;
+            for (let dy = -1; dy <= 1 && !connected; dy++) {
+              const ny = py + dy;
+              if (ny < 0 || ny >= H) continue;
+              for (let dx = -1; dx <= 1; dx++) {
+                if (dx === 0 && dy === 0) continue;
+                const nx = px + dx;
+                if (nx < 0 || nx >= W) continue;
+                if (routePixSet.has(ny * W + nx)) { connected = true; break; }
+              }
+            }
+          }
+          if (!connected) continue;
+          // Adjacent + sub-threshold + contiguous: include it.
+          nbModeInfos.push(nbInfo);
+          for (let i = 0; i < npx.length; i++) {
+            const p = npx[i];
+            const py = (p / W) | 0;
+            const px = p - py * W;
+            if (px < bx0) bx0 = px;
+            if (px > bx1) bx1 = px;
+            if (py < by0) by0 = py;
+            if (py > by1) by1 = py;
+          }
+        }
+      }
     }
   }
   // Include start/end pixels in bbox so snapToMask can reach them.
@@ -4874,6 +5124,47 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
       mask[idx] = 1;
     }
   }
+  // Stamp the side-compatible neighbour mode pixels gathered above so
+  // line A* has them available for brief sub-threshold detours.
+  for (const nbInfo of nbModeInfos) {
+    for (let i = 0; i < nbInfo.pixels.length; i++) {
+      const p = nbInfo.pixels[i];
+      const py = (p / W) | 0;
+      const px = p - py * W;
+      const lx = px - bx0, ly = py - by0;
+      if (lx >= 0 && lx < mw && ly >= 0 && ly < mh) {
+        mask[ly * mw + lx] = 1;
+      }
+    }
+  }
+
+  // ── Pure-land route: scrub naval-subhex pixels from the mask ─────
+  // Routes whose chosen modePath uses no NAVAL kind shouldn't have
+  // any naval pixel in the mask in the first place, but if anything
+  // slips in (combo build, augmenter, off-by-one), the line A* could
+  // still trace through a lake pixel. Belt-and-braces: walk the mask
+  // once, drop any pixel whose subhex is naval-classed. Skipped when
+  // any chosen mode carries the NAVAL kind so legitimate naval routes
+  // keep their pixels.
+  let pathHasNaval = false;
+  for (const info of modeInfos) {
+    const kinds = info.kinds || (info.kind ? [info.kind] : []);
+    if (kinds.indexOf("NAVAL") >= 0) { pathHasNaval = true; break; }
+  }
+  if (!pathHasNaval && SUBHEX_ID_PX && SUBHEX_INDEX) {
+    for (let y = 0; y < mh; y++) {
+      const rowBase = y * mw;
+      for (let x = 0; x < mw; x++) {
+        const localIdx = rowBase + x;
+        if (!mask[localIdx]) continue;
+        const fullIdx = (by0 + y) * W + (bx0 + x);
+        const sid = SUBHEX_ID_PX[fullIdx];
+        if (!sid) continue;
+        const sub = SUBHEX_INDEX.get(sid);
+        if (sub && WATER_TERRAINS.has(sub.class)) mask[localIdx] = 0;
+      }
+    }
+  }
 
   // ── Cross-hex corner augmentation ─────────────────────────────────
   // When two picked-mode pixels are diagonal across a hex border, the
@@ -4902,9 +5193,47 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
     const dxs = [+1, -1, +1, -1];
     const dys = [+1, +1, -1, -1];
     const overrides = HEX_MODE_OVERRIDES;
-    const tryAugment = (localIdx, fullIdx) => {
+    // CATEGORY-MATCH gate with a stronghold guard on naval↔land
+    // crossings. Two stages:
+    //   1. The corner pixel must be on the same "side" (LAND vs NAVAL)
+    //      as at least one of the diagonal endpoints. LAND-side covers
+    //      LAND / ROAD / FORD / ROAD_FERRY; NAVAL is its own side.
+    //      This blocks NAVAL corners on a LAND-LAND diagonal (sea
+    //      pinch) and LAND-side corners on a NAVAL-NAVAL diagonal
+    //      (land pinch).
+    //   2. Mixed naval-land cross-hex diagonals (one endpoint NAVAL,
+    //      the other LAND-side) are allowed only when one of the two
+    //      hexes is a stronghold — that's where dijkstra permits a
+    //      disembark transition, and embark/disembark drawings need
+    //      the corner bridge. Anywhere else the line would be
+    //      "cutting corners" through a shoreline it shouldn't.
+    const NAVAL_KIND      = MODE_KIND_NUMS.NAVAL;
+    const FORD_KIND       = MODE_KIND_NUMS.FORD;
+    const ROAD_FERRY_KIND = MODE_KIND_NUMS.ROAD_FERRY;
+    // Three-way side mapping. FORD / ROAD_FERRY are river-internal
+    // kinds: they can't bridge a cross-hex LAND-LAND diagonal because
+    // crossing a river / ferry mark across a hex border without paying
+    // the corresponding surcharge isn't legal. Mirrors checkAndLink.
+    const sideOf = (k) => {
+      if (k === NAVAL_KIND) return "N";
+      if (k === FORD_KIND || k === ROAD_FERRY_KIND) return "R";
+      return "L";
+    };
+    const tryAugment = (localIdx, fullIdx, aKind, bKind, hexA, hexB) => {
       if (baseMask[localIdx]) return;             // already in mask
-      if (!PIX_MODE_KIND[fullIdx]) return;        // not globally passable
+      const cornerKind = PIX_MODE_KIND[fullIdx];
+      if (!cornerKind) return;                    // not globally passable
+      const aSide = sideOf(aKind);
+      const bSide = sideOf(bKind);
+      const cSide = sideOf(cornerKind);
+      if (cSide !== aSide && cSide !== bSide) return;
+      // Stronghold guard for mixed naval↔land diagonals — disembark at
+      // non-strongholds is illegal, and the drawing must respect that.
+      if ((aSide === "L" && bSide === "N") || (aSide === "N" && bSide === "L")) {
+        const aSth = !!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(hexA));
+        const bSth = !!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(hexB));
+        if (!aSth && !bSth) return;
+      }
       if (overrides && overrides.size > 0) {
         const cHex = HEX_ID_PX[fullIdx];
         if (cHex && overrides.has(cHex)) return;  // pinned hex's strict zone
@@ -4917,6 +5246,7 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
         if (!baseMask[rowBase + x]) continue;
         const fullA = (by0 + y) * W + (bx0 + x);
         const hexA  = HEX_ID_PX[fullA];
+        const aKind = PIX_MODE_KIND[fullA];
         for (let k = 0; k < 4; k++) {
           const nx = x + dxs[k], ny = y + dys[k];
           if (nx < 0 || ny < 0 || nx >= mw || ny >= mh) continue;
@@ -4924,11 +5254,11 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
           const fullB = (by0 + ny) * W + (bx0 + nx);
           const hexB  = HEX_ID_PX[fullB];
           if (hexA === hexB) continue;            // intra-hex — no augmentation
-          // Diagonal pair across a hex border. Augment corners.
+          const bKind = PIX_MODE_KIND[fullB];
           const c1 = rowBase + nx;     // local (nx, y)
           const c2 = ny * mw + x;      // local (x,  ny)
-          tryAugment(c1, (by0 + y)  * W + (bx0 + nx));
-          tryAugment(c2, (by0 + ny) * W + (bx0 + x));
+          tryAugment(c1, (by0 + y)  * W + (bx0 + nx), aKind, bKind, hexA, hexB);
+          tryAugment(c2, (by0 + ny) * W + (bx0 + x), aKind, bKind, hexA, hexB);
         }
       }
     }
@@ -4951,59 +5281,286 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
   // narratively. Picking the centroid of the ferry-mark pixels as an
   // intermediate waypoint and running A* segment-by-segment achieves
   // that without restricting the mask itself.
+  // Each markWaypoint is now tagged with the modePath INDEX of the hex
+  // it lives in. Downstream we use those indices to build a per-leg
+  // sub-mask — the line A* between two waypoints sees only the hexes
+  // BETWEEN them, so the rendered line is confined to the dijkstra
+  // path's hexes and can't shortcut across a distant hex.
   const markWaypoints = [];
   const ferryRoadMask = ROAD_ONLY_PIXEL_MASK || ROAD_PIXEL_MASK;
-  if (HEX_PIXELS && ferryRoadMask && THICK_RIVER_PIXEL_MASK) {
+  if (HEX_PIXELS) {
+    for (let mi = 0; mi < modePath.length; mi++) {
+      const [hex, mode] = modePath[mi];
+      const info = HEX_MODES.get(hex)?.get(mode);
+      if (!info) continue;
+      const hexAllPx = HEX_PIXELS.get(hex);
+      if (!hexAllPx) continue;
+
+      // Ferry hex: snap the line to the painted ferry-mark crossing.
+      const isFerryMode = info.isFerry
+        || (info.kinds && info.kinds.indexOf("ROAD_FERRY") >= 0);
+      if (isFerryMode && ferryRoadMask && THICK_RIVER_PIXEL_MASK) {
+        let sumX = 0, sumY = 0, count = 0;
+        for (let i = 0; i < hexAllPx.length; i++) {
+          const p = hexAllPx[i];
+          if (ferryRoadMask[p] && THICK_RIVER_PIXEL_MASK[p]) {
+            const py = (p / W) | 0;
+            sumX += p - py * W; sumY += py; count++;
+          }
+        }
+        if (count > 0) markWaypoints.push({ x: sumX / count, y: sumY / count, hexIdx: mi });
+        continue;
+      }
+
+      // Stronghold combo (LAND+NAVAL or any NAVAL+non-NAVAL mix) on
+      // the modePath: drop an invisible waypoint at the city-pixel
+      // centroid so the rendered line actually visits the port the
+      // army is disembarking at. "City pixels" are the citiestownsforts
+      // (ctf) layer alone — ROAD_PIXEL_MASK minus ROAD_ONLY_PIXEL_MASK
+      // — so the line snaps to the city, not the road infrastructure
+      // around it.
+      const isMixedCombo = info.kinds
+        && info.kinds.indexOf("NAVAL") >= 0
+        && info.kinds.some(k => k !== "NAVAL");
+      const isStronghold = !!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(hex));
+      if (isMixedCombo && isStronghold && ROAD_PIXEL_MASK) {
+        let sumX = 0, sumY = 0, count = 0;
+        for (let i = 0; i < hexAllPx.length; i++) {
+          const p = hexAllPx[i];
+          const inRoadPlus = !!ROAD_PIXEL_MASK[p];
+          const inRoadOnly = !!(ROAD_ONLY_PIXEL_MASK && ROAD_ONLY_PIXEL_MASK[p]);
+          if (inRoadPlus && !inRoadOnly) {
+            const py = (p / W) | 0;
+            sumX += p - py * W; sumY += py; count++;
+          }
+        }
+        if (count > 0) markWaypoints.push({ x: sumX / count, y: sumY / count, hexIdx: mi });
+      }
+    }
+  }
+
+  // ── Ferry-crossing thinning ────────────────────────────────────────
+  // Visual fix: when a ferry hex's chosen mode is a ROAD_FERRY combo,
+  // the route mask normally contains ALL the road pixels of the hex
+  // PLUS every ferry-mark pixel (the painted road-on-thick-river
+  // overlay). With a curving road that the artist drew along the
+  // riverbank, line A* can "cut" the curve by ducking into the wide
+  // ferry-mark strip — visually wrong, since the ferry mark is the
+  // bridge, not a free-pass area. The fix is to thin the ferry-mark
+  // pixels in the primary mask down to the shortest straight line
+  // connecting the two banks' road approaches; the road pixels stay,
+  // so the line has to follow the road on each bank, then cross via
+  // the minimal strip. If A* can't trace through the thinned mask,
+  // we fall back to the full mask.
+  function bresenhamPath(ax, ay, bx, by) {
+    const out = [];
+    let x = ax | 0, y = ay | 0;
+    const x1 = bx | 0, y1 = by | 0;
+    const dx = Math.abs(x1 - x), dy = Math.abs(y1 - y);
+    const sx = x < x1 ? 1 : -1, sy = y < y1 ? 1 : -1;
+    let err = dx - dy;
+    out.push([x, y]);
+    while (x !== x1 || y !== y1) {
+      const e2 = err * 2;
+      if (e2 > -dy) { err -= dy; x += sx; }
+      if (e2 <  dx) { err += dx; y += sy; }
+      out.push([x, y]);
+      if (out.length > 4096) break;
+    }
+    return out;
+  }
+  function buildThinnedMask() {
+    if (!PIX_MODE_KIND || !PIX_MODE_COMP || !HEX_PIXELS) return null;
+    const ROAD_KIND = MODE_KIND_NUMS.ROAD;
+    const ROAD_FERRY_KIND = MODE_KIND_NUMS.ROAD_FERRY;
+    let touched = false;
+    const thinned = new Uint8Array(mask);
     for (const [hex, mode] of modePath) {
       const info = HEX_MODES.get(hex)?.get(mode);
       if (!info) continue;
       const isFerryMode = info.isFerry
         || (info.kinds && info.kinds.indexOf("ROAD_FERRY") >= 0);
       if (!isFerryMode) continue;
-      const hexAllPx = HEX_PIXELS.get(hex);
-      if (!hexAllPx) continue;
-      // Find road-only + thick (ferry-mark) pixels of this hex and average.
-      // Road-only mask (not the road+ctf mask) is the correct definition
-      // of a ferry mark — a city sitting on a river doesn't draw one.
-      let sumX = 0, sumY = 0, count = 0;
-      for (let i = 0; i < hexAllPx.length; i++) {
-        const p = hexAllPx[i];
-        if (ferryRoadMask[p] && THICK_RIVER_PIXEL_MASK[p]) {
-          const py = (p / W) | 0;
-          sumX += p - py * W; sumY += py; count++;
+      // Group the chosen mode's pixels by road component (banks) and
+      // collect the ferry-mark pixel set. ROAD components in a ferry
+      // hex are separated by the thick river (which lives in FERRY
+      // bucket, not ROAD), so each bank is its own component.
+      const banks = new Map();   // compId -> array of full pixel indices
+      const ferryMarkPixels = [];
+      for (let i = 0; i < info.pixels.length; i++) {
+        const p = info.pixels[i];
+        const kind = PIX_MODE_KIND[p];
+        if (kind === ROAD_KIND) {
+          const comp = PIX_MODE_COMP[p];
+          let arr = banks.get(comp);
+          if (!arr) { arr = []; banks.set(comp, arr); }
+          arr.push(p);
+        } else if (kind === ROAD_FERRY_KIND) {
+          ferryMarkPixels.push(p);
         }
       }
-      if (count === 0) continue;
-      markWaypoints.push({ x: sumX / count, y: sumY / count });
+      if (banks.size < 2 || ferryMarkPixels.length === 0) continue;
+      // Find ferry-mark centroid — used to pick each bank's "approach
+      // pixel" (closest road pixel of that bank to the centroid).
+      // Approximates the closest pair across banks, but O(N) instead
+      // of O(N²) pair-wise.
+      let cx = 0, cy = 0;
+      for (const p of ferryMarkPixels) {
+        const py = (p / W) | 0; cx += p - py * W; cy += py;
+      }
+      cx /= ferryMarkPixels.length; cy /= ferryMarkPixels.length;
+      const approach = [];
+      for (const arr of banks.values()) {
+        let best = -1, bestD2 = Infinity;
+        for (const p of arr) {
+          const py = (p / W) | 0; const px = p - py * W;
+          const dx = px - cx, dy = py - cy;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < bestD2) { bestD2 = d2; best = p; }
+        }
+        if (best >= 0) approach.push(best);
+      }
+      if (approach.length < 2) continue;
+      // Closest pair of approach pixels — the two banks to actually
+      // connect via the shortest straight line.
+      let pa = -1, pb = -1, pdist2 = Infinity;
+      for (let i = 0; i < approach.length; i++) {
+        for (let j = i + 1; j < approach.length; j++) {
+          const ai = approach[i], bj = approach[j];
+          const ay = (ai / W) | 0, ax = ai - ay * W;
+          const by = (bj / W) | 0, bx = bj - by * W;
+          const dx = ax - bx, dy = ay - by;
+          const d2 = dx * dx + dy * dy;
+          if (d2 < pdist2) { pdist2 = d2; pa = ai; pb = bj; }
+        }
+      }
+      if (pa < 0 || pb < 0) continue;
+      const ay = (pa / W) | 0, ax = pa - ay * W;
+      const by = (pb / W) | 0, bx = pb - by * W;
+      const line = bresenhamPath(ax, ay, bx, by);
+      const lineSet = new Set();
+      for (const [px, py] of line) lineSet.add(py * W + px);
+      // Knock every ferry-mark pixel of this hex's mode out of the
+      // thinned mask EXCEPT the ones on the Bresenham strip.
+      for (const p of ferryMarkPixels) {
+        if (lineSet.has(p)) continue;
+        const py = (p / W) | 0; const px = p - py * W;
+        const lx = px - bx0, ly = py - by0;
+        if (lx >= 0 && lx < mw && ly >= 0 && ly < mh) {
+          thinned[ly * mw + lx] = 0;
+        }
+      }
+      // Ensure every strip pixel is in the mask (Bresenham may pass
+      // through pixels that weren't ferry-marks — typically rare since
+      // we pick endpoints from inside the chosen mode, but be safe).
+      for (const [px, py] of line) {
+        const lx = px - bx0, ly = py - by0;
+        if (lx >= 0 && lx < mw && ly >= 0 && ly < mh) {
+          thinned[ly * mw + lx] = 1;
+        }
+      }
+      touched = true;
     }
+    return touched ? thinned : null;
   }
 
-  // Helper: run A* between two points in the mask and return its
-  // smoothed polyline, or null on failure.
-  const runSeg = (a, b) => routeInBinaryMask(mask, mw, mh, bx0, by0, a, b);
-  if (markWaypoints.length === 0) {
-    return runSeg(sPt, ePt) || [];
+  const thinnedMask = buildThinnedMask();
+
+  // Helper: run A* between two points against whichever mask we hand
+  // it. Use the thinned mask for the primary pass when one was built.
+  const runIn = (m, a, b) => routeInBinaryMask(m, mw, mh, bx0, by0, a, b);
+
+  // Build a leg-scoped sub-mask: keep only mask pixels whose hex sits
+  // between modePath[lo] and modePath[hi] (inclusive). The line A*
+  // between two waypoints then physically can't see hexes outside
+  // that span, so a fake waypoint (ferry-mark, stronghold city) now
+  // gets the same "the line stays inside the route's hex path"
+  // discipline that user-placed waypoints get for free (each route
+  // segment is already its own mask).
+  // Pre-compute the set of hexes any nbModeInfo pixels belong to.
+  // Only THOSE neighbours are allowed into the leg mask — keeps the
+  // leg scope tight while still permitting the narrow road-stub dips.
+  const nbAllowedHexes = new Set();
+  for (const nbInfo of nbModeInfos) {
+    if (!nbInfo.pixels || nbInfo.pixels.length === 0) continue;
+    const p0 = nbInfo.pixels[0];
+    const hexId = HEX_ID_PX ? HEX_ID_PX[p0] : 0;
+    if (hexId) nbAllowedHexes.add(hexId);
   }
-  // Multi-segment: start → mark₁ → mark₂ → … → end. Concatenate the
-  // smoothed sub-lines, dropping the duplicated joint point each time.
-  const out = [];
-  let prev = sPt;
-  for (const wp of markWaypoints) {
-    const sub = runSeg(prev, wp);
-    if (!sub || sub.length === 0) {
-      // Fallback: if A* can't reach the mark, do the whole line in one
-      // shot without the waypoint constraint.
-      return runSeg(sPt, ePt) || [];
+  const buildLegMask = (srcMask, lo, hi) => {
+    if (!HEX_ID_PX) return srcMask;
+    const hexSet = new Set(nbAllowedHexes);
+    const a = Math.max(0, Math.min(lo, hi));
+    const b = Math.min(modePath.length - 1, Math.max(lo, hi));
+    for (let i = a; i <= b; i++) hexSet.add(modePath[i][0]);
+    const out = new Uint8Array(srcMask.length);
+    for (let y = 0; y < mh; y++) {
+      const rowBase = y * mw;
+      for (let x = 0; x < mw; x++) {
+        const localIdx = rowBase + x;
+        if (!srcMask[localIdx]) continue;
+        const fullIdx = (by0 + y) * W + (bx0 + x);
+        const hex = HEX_ID_PX[fullIdx];
+        if (hexSet.has(hex)) out[localIdx] = 1;
+      }
     }
-    if (out.length === 0) for (const p of sub) out.push(p);
-    else                  for (let i = 1; i < sub.length; i++) out.push(sub[i]);
-    prev = wp;
+    return out;
+  };
+
+  // Run a sub-A* over a leg-scoped sub-mask first; if that fails,
+  // fall back to the full route mask for that one leg only. Returns
+  // the polyline of pixel points, or null if neither works.
+  const runLeg = (srcMask, fromPt, toPt, lo, hi) => {
+    if (lo === hi || lo == null || hi == null) {
+      // No leg span (same hex on both ends, or no modePath context):
+      // just use the full source mask directly.
+      return runIn(srcMask, fromPt, toPt);
+    }
+    const legMask = buildLegMask(srcMask, lo, hi);
+    const sub = runIn(legMask, fromPt, toPt);
+    if (sub && sub.length > 0) return sub;
+    return runIn(srcMask, fromPt, toPt);
+  };
+
+  // tryFullPath does the multi-segment line over a given mask. Each
+  // leg between two waypoints uses a sub-mask scoped to just those
+  // waypoints' hex span. Returns the polyline or null on failure.
+  const tryFullPath = (m) => {
+    if (markWaypoints.length === 0) {
+      // No fake waypoints — the whole route is one leg from start to
+      // end hex. Scope the mask to the modePath's hex span.
+      const lastIdx = modePath.length - 1;
+      return runLeg(m, sPt, ePt, 0, lastIdx) || null;
+    }
+    const out = [];
+    let prev = sPt;
+    let prevIdx = 0;
+    for (const wp of markWaypoints) {
+      const sub = runLeg(m, prev, wp, prevIdx, wp.hexIdx);
+      if (!sub || sub.length === 0) return null;
+      if (out.length === 0) for (const p of sub) out.push(p);
+      else                  for (let i = 1; i < sub.length; i++) out.push(sub[i]);
+      prev = wp;
+      prevIdx = wp.hexIdx;
+    }
+    const lastIdx = modePath.length - 1;
+    const finalSeg = runLeg(m, prev, ePt, prevIdx, lastIdx);
+    if (!finalSeg || finalSeg.length === 0) return null;
+    if (out.length === 0) for (const p of finalSeg) out.push(p);
+    else                  for (let i = 1; i < finalSeg.length; i++) out.push(finalSeg[i]);
+    return out;
+  };
+
+  // Primary: thinned ferry strip if any, full mask otherwise.
+  if (thinnedMask) {
+    const primary = tryFullPath(thinnedMask);
+    if (primary && primary.length > 0) return primary;
   }
-  const finalSeg = runSeg(prev, ePt);
-  if (!finalSeg || finalSeg.length === 0) return runSeg(sPt, ePt) || [];
-  if (out.length === 0) for (const p of finalSeg) out.push(p);
-  else                  for (let i = 1; i < finalSeg.length; i++) out.push(finalSeg[i]);
-  return out;
+  // Fallback: full mask (entire ferry-mark area, original behavior).
+  const fallback = tryFullPath(mask);
+  if (fallback && fallback.length > 0) return fallback;
+  // Last-ditch single-shot through the full mask.
+  return runIn(mask, sPt, ePt) || [];
 }
 
 // LEGACY: kept for the same-hex code path and a few callers that still

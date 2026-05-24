@@ -391,6 +391,15 @@ canvas {
 .route-card .hex-breakdown .tag.ferry {
   background: rgba(80, 230, 220, 0.18); color: rgb(140, 230, 220);
 }
+/* Boundary-surcharge tags: embark/disembark use a port-ish blue;
+   ford uses a river-ish green. All inherit the .tag base size. */
+.route-card .hex-breakdown .tag.embark,
+.route-card .hex-breakdown .tag.disembark {
+  background: rgba(120, 170, 255, 0.20); color: rgb(170, 200, 255);
+}
+.route-card .hex-breakdown .tag.ford {
+  background: rgba(120, 220, 120, 0.18); color: rgb(170, 230, 170);
+}
 
 .path-totals { border: 1px solid var(--border); }
 .path-totals .totals-head span:first-child {
