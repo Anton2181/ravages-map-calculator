@@ -150,7 +150,12 @@ let HEX_OUTLINE_WIDTH = 1, HEX_OUTLINE_AA = false;
 let DEBUG_SHOW_MASK = false;
 let _lastRouteMask = null;   // { mask: Uint8Array, mw, mh, bx0, by0 } from the most recent routeThroughMask
 let ISOCHRONE_MODE = false;
-let ISOCHRONE_BUDGET = 10;
+// ISOCHRONE_BUDGET is the dijkstra cost budget for reachability (in
+// IRL hours — the same unit dijkstra optimises). The sidebar slider
+// expresses it in DAYS (1..31, multiplied by 24 to get hours) since
+// IRL-day units read better at world-map scale than raw hours. Default
+// is 7 days, a reasonable "one-week march reach" baseline.
+let ISOCHRONE_BUDGET = 7 * 24;
 let ISOCHRONE_COLOR = [120, 220, 255], ISOCHRONE_ALPHA = 110;
 let isochroneSourceId = null;        // clicked subhex id
 let isochroneHexIds = null;          // Set of hex ids reachable within budget
@@ -638,43 +643,141 @@ function isYes(v) {
 // Terrain (main terrain type, used for movement cost) plus the yes/no flag
 // columns Stronghold / River / Road. Populates HEX_TERRAIN and the three
 // HEX_<flag> module globals. Returns HEX_TERRAIN for the loader's convenience.
+//
+// Caching strategy: the CSV text is persisted in localStorage so subsequent
+// loads can populate HEX_TERRAIN instantly without waiting on the network.
+// A background fetch then re-pulls the live sheet; if it differs from the
+// cached copy, the new version is written to localStorage AND hot-swapped
+// into the running session (mode graph re-baked, routes rebuilt). This
+// keeps cold-start fast while letting sheet edits propagate without a
+// manual reload.
+const TERRAIN_CSV_CACHE_KEY = "ravages.hexTerrainCSV.v1";
+function getCachedTerrainCSV() {
+  try { return localStorage.getItem(TERRAIN_CSV_CACHE_KEY); }
+  catch (e) { return null; }
+}
+function setCachedTerrainCSV(text) {
+  try { localStorage.setItem(TERRAIN_CSV_CACHE_KEY, text); }
+  catch (e) { /* quota exceeded / storage disabled — non-fatal */ }
+}
+
+// Parse a CSV text into the four data structures we extract from the
+// hex-terrain sheet. Factored out so the same code applies whether the
+// CSV came from localStorage or the network.
+function parseHexTerrainCSV(text) {
+  const out = { terrains: new Map(), strongholds: new Set(), rivers: new Set(), roads: new Set() };
+  const rows = parseCSV(text);
+  if (rows.length === 0) return out;
+  const header = rows[0];
+  let iId = header.findIndex(h => /hex/i.test(h));
+  let iTerrain = header.findIndex(h => /terrain/i.test(h));
+  if (iId < 0) iId = 0;
+  if (iTerrain < 0) iTerrain = 1;
+  const iStronghold = header.findIndex(h => /stronghold|fort|castle/i.test(h));
+  const iRiver      = header.findIndex(h => /river/i.test(h));
+  const iRoad       = header.findIndex(h => /road/i.test(h));
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || row.length === 0) continue;
+    const id = parseInt(row[iId], 10);
+    if (!Number.isFinite(id)) continue;
+    const terrain = (row[iTerrain] || "").trim();
+    if (terrain) out.terrains.set(id, terrain);
+    if (iStronghold >= 0 && isYes(row[iStronghold])) out.strongholds.add(id);
+    if (iRiver      >= 0 && isYes(row[iRiver]))      out.rivers.add(id);
+    if (iRoad       >= 0 && isYes(row[iRoad]))       out.roads.add(id);
+  }
+  return out;
+}
+
+// Replace the live HEX_TERRAIN / HEX_STRONGHOLD / HEX_RIVER / HEX_ROAD
+// maps with freshly parsed data. Used both at first load and when a
+// background refresh detects a changed sheet.
+function applyHexTerrainData(data) {
+  HEX_TERRAIN    = data.terrains;
+  HEX_STRONGHOLD = new Map();
+  HEX_RIVER      = new Map();
+  HEX_ROAD       = new Map();
+  for (const id of data.strongholds) HEX_STRONGHOLD.set(id, true);
+  for (const id of data.rivers)      HEX_RIVER.set(id, true);
+  for (const id of data.roads)       HEX_ROAD.set(id, true);
+}
+
 async function loadHexTerrains() {
   HEX_STRONGHOLD = new Map();
   HEX_RIVER = new Map();
   HEX_ROAD = new Map();
+  const cached = getCachedTerrainCSV();
+  if (cached) {
+    // Fast path: use the cached CSV immediately so init doesn't block
+    // on the network. Kick off a background refresh that will hot-swap
+    // the live state if the sheet has changed since the snapshot.
+    try {
+      const data = parseHexTerrainCSV(cached);
+      applyHexTerrainData(data);
+      console.log(`Loaded ${HEX_TERRAIN.size} hex terrain entries from cached CSV `
+        + `(${HEX_STRONGHOLD.size} strongholds, ${HEX_RIVER.size} rivers, ${HEX_ROAD.size} roads). `
+        + `Background refresh queued.`);
+      refreshHexTerrainsInBackground(cached);
+      return HEX_TERRAIN;
+    } catch (e) {
+      console.warn("Failed to parse cached terrain CSV — falling back to network:", e);
+    }
+  }
+  // First visit (or unparseable cache): fetch the live sheet, save it,
+  // and use it. This is the only path that blocks init on the network.
   try {
     const r = await fetch(HEX_TERRAIN_CSV_URL, { cache: "no-store" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const text = await r.text();
     const rows = parseCSV(text);
     if (rows.length === 0) throw new Error("empty CSV");
-    const header = rows[0];
-    let iId = header.findIndex(h => /hex/i.test(h));
-    let iTerrain = header.findIndex(h => /terrain/i.test(h));
-    if (iId < 0) iId = 0;
-    if (iTerrain < 0) iTerrain = 1;
-    // Optional flag columns — find by header name; missing column => all false.
-    const iStronghold = header.findIndex(h => /stronghold|fort|castle/i.test(h));
-    const iRiver      = header.findIndex(h => /river/i.test(h));
-    const iRoad       = header.findIndex(h => /road/i.test(h));
-    const out = new Map();
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!row || row.length === 0) continue;
-      const id = parseInt(row[iId], 10);
-      if (!Number.isFinite(id)) continue;
-      const terrain = (row[iTerrain] || "").trim();
-      if (terrain) out.set(id, terrain);
-      if (iStronghold >= 0 && isYes(row[iStronghold])) HEX_STRONGHOLD.set(id, true);
-      if (iRiver      >= 0 && isYes(row[iRiver]))      HEX_RIVER.set(id, true);
-      if (iRoad       >= 0 && isYes(row[iRoad]))       HEX_ROAD.set(id, true);
-    }
-    console.log(`Loaded ${out.size} hex terrain entries from sheet `
-      + `(${HEX_STRONGHOLD.size} strongholds, ${HEX_RIVER.size} rivers, ${HEX_ROAD.size} roads).`);
-    return out;
+    setCachedTerrainCSV(text);
+    const data = parseHexTerrainCSV(text);
+    applyHexTerrainData(data);
+    console.log(`Loaded ${HEX_TERRAIN.size} hex terrain entries from sheet `
+      + `(${HEX_STRONGHOLD.size} strongholds, ${HEX_RIVER.size} rivers, ${HEX_ROAD.size} roads). `
+      + `Cached for next session.`);
+    return HEX_TERRAIN;
   } catch (e) {
     console.warn("Failed to load terrain CSV:", e);
     return new Map();
+  }
+}
+
+// Background sheet refresh — fires after init completes if a cached CSV
+// was used. Compares the live sheet text to the cached snapshot; if it
+// differs, writes the new text to localStorage and re-runs every
+// derived precompute that depends on HEX_TERRAIN so the running session
+// reflects the new sheet without a manual reload.
+async function refreshHexTerrainsInBackground(cachedText) {
+  try {
+    const r = await fetch(HEX_TERRAIN_CSV_URL, { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const text = await r.text();
+    if (text === cachedText) {
+      console.log("Background terrain refresh: sheet unchanged.");
+      return;
+    }
+    setCachedTerrainCSV(text);
+    const data = parseHexTerrainCSV(text);
+    applyHexTerrainData(data);
+    console.log(`Background terrain refresh: sheet changed — applying new version `
+      + `(${HEX_TERRAIN.size} terrain entries, ${HEX_STRONGHOLD.size} strongholds, `
+      + `${HEX_RIVER.size} rivers, ${HEX_ROAD.size} roads).`);
+    // Re-run terrain-dependent precomputes. LAND_HEX_WATER_PIXELS keys
+    // off the canonical hex terrain; HEX_MODES bakes per-hex terrain
+    // into every mode's cost. Routes need a rebuild after the mode
+    // graph is re-baked so segment costs and chosen modes refresh.
+    if (typeof precomputeLandHexWaterPixels === "function") precomputeLandHexWaterPixels();
+    if (typeof recomputeHexModeGraph === "function") recomputeHexModeGraph();
+    if (typeof rebuildAllRoutes === "function") rebuildAllRoutes();
+    if (typeof renderSelection === "function") renderSelection();
+    if (typeof updateEndpoints === "function") updateEndpoints();
+    if (typeof updatePathInfo === "function") updatePathInfo();
+    if (typeof updateStatus === "function") updateStatus();
+  } catch (e) {
+    console.warn("Background terrain refresh failed:", e);
   }
 }
 
@@ -3614,7 +3717,7 @@ function buildSubhexMaskForHexPath(hexPath, fromSubId, toSubId) {
 // hexes (which are typically dozens of centerline pixels across). Mutable
 // — bound to a slider in the Path-line settings so users can tune it for
 // their own map's hex pixel size.
-let MIN_PIXELS_PER_PATH_HEX = 10;
+let MIN_PIXELS_PER_PATH_HEX = 50;
 
 // Walk the rendered line pixel-by-pixel using the same Bresenham+thick
 // stamp drawPathLine uses, counting DISTINCT painted pixels per hex.

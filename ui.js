@@ -633,16 +633,6 @@ function buildLineControls() {
     () => POINT_SIZE + "px");
   lineEl.appendChild(psRow);
 
-  const aaRow = document.createElement("div");
-  aaRow.className = "layer-row";
-  aaRow.innerHTML = `<input type="checkbox" id="line-aa" ${LINE_AA ? "checked" : ""} />`
-    + `<label for="line-aa">Anti-aliasing</label>`;
-  aaRow.querySelector("input").addEventListener("change", (e) => {
-    LINE_AA = e.target.checked;
-    renderSelection();
-  });
-  lineEl.appendChild(aaRow);
-
   const hoRow = document.createElement("div");
   hoRow.className = "layer-row";
   hoRow.innerHTML = `<input type="checkbox" id="show-hex-outline" ${SHOW_HEX_OUTLINE ? "checked" : ""} />`
@@ -652,34 +642,6 @@ function buildLineControls() {
     renderSelection();
   });
   lineEl.appendChild(hoRow);
-
-  const owRow = document.createElement("div");
-  owRow.className = "weight-row";
-  owRow.innerHTML = `<span class="name">Outline width</span>`
-    + `<input type="range" min="1" max="10" step="0.5" value="${HEX_OUTLINE_WIDTH}" />`
-    + `<span class="alpha-val">${HEX_OUTLINE_WIDTH}px</span>`;
-  const owSlider = owRow.querySelector("input");
-  const owLabel  = owRow.querySelector(".alpha-val");
-  owSlider.addEventListener("input", (e) => {
-    HEX_OUTLINE_WIDTH = +e.target.value;
-    owLabel.textContent = HEX_OUTLINE_WIDTH + "px";
-    renderSelection();
-  });
-  makeEditable(owLabel,
-    (t) => { const n = parseFloat(t); return isFinite(n) ? Math.max(1, Math.min(10, n)) : null; },
-    (v) => { HEX_OUTLINE_WIDTH = v; owSlider.value = v; renderSelection(); },
-    () => HEX_OUTLINE_WIDTH + "px");
-  lineEl.appendChild(owRow);
-
-  const oaaRow = document.createElement("div");
-  oaaRow.className = "layer-row";
-  oaaRow.innerHTML = `<input type="checkbox" id="outline-aa" ${HEX_OUTLINE_AA ? "checked" : ""} />`
-    + `<label for="outline-aa">Outline anti-aliasing</label>`;
-  oaaRow.querySelector("input").addEventListener("change", (e) => {
-    HEX_OUTLINE_AA = e.target.checked;
-    renderSelection();
-  });
-  lineEl.appendChild(oaaRow);
 
   // [debug] Route-mask overlay — paints the binary mask routeThroughMask
   // actually fed to A* as a translucent magenta layer over hl-canvas. Useful
@@ -803,28 +765,43 @@ function buildIsochroneControls() {
   });
   isoEl.appendChild(onRow);
 
+  // "Days" slider — the underlying ISOCHRONE_BUDGET stays in hours
+  // (every cost in the cost model is hours), but the user-facing knob
+  // is days because IRL-week-scale reach is the typical question.
+  // 1..31 days = 24..744 hours.
+  const initDays = Math.max(1, Math.min(31, Math.round(ISOCHRONE_BUDGET / 24)));
+  // Re-snap the budget to the rounded day so the slider position and
+  // actual budget agree on first paint (otherwise a budget like 10h
+  // would show "1 day" on the slider while dijkstra used 10h).
+  ISOCHRONE_BUDGET = initDays * 24;
   const bRow = document.createElement("div");
   bRow.className = "weight-row";
-  bRow.innerHTML = `<span class="name">Budget</span>`
-    + `<input type="range" min="1" max="200" step="1" value="${ISOCHRONE_BUDGET}" />`
-    + `<span class="alpha-val">${ISOCHRONE_BUDGET}</span>`;
+  bRow.innerHTML = `<span class="name">Days</span>`
+    + `<input type="range" min="1" max="31" step="1" value="${initDays}" />`
+    + `<span class="alpha-val">${initDays}</span>`;
   const bSlider = bRow.querySelector("input");
   const bLabel  = bRow.querySelector(".alpha-val");
   bSlider.addEventListener("input", (e) => {
-    ISOCHRONE_BUDGET = +e.target.value;
-    bLabel.textContent = ISOCHRONE_BUDGET;
+    const days = +e.target.value;
+    ISOCHRONE_BUDGET = days * 24;
+    bLabel.textContent = days;
     if (ISOCHRONE_MODE && isochroneSourceId != null) {
       computeIsochrone();
       renderLayers(); renderSelection(); updateStatus();
     }
   });
   makeEditable(bLabel,
-    (t) => { const n = parseFloat(t); return isFinite(n) && n > 0 ? n : null; },
+    (t) => {
+      const n = parseFloat(t);
+      if (!isFinite(n) || n < 1) return null;
+      return Math.min(31, Math.round(n));
+    },
     (v) => {
-      ISOCHRONE_BUDGET = v; bSlider.value = v;
+      ISOCHRONE_BUDGET = v * 24;
+      bSlider.value = v;
       if (ISOCHRONE_MODE && isochroneSourceId != null) { computeIsochrone(); renderLayers(); renderSelection(); updateStatus(); }
     },
-    () => String(ISOCHRONE_BUDGET));
+    () => String(Math.round(ISOCHRONE_BUDGET / 24)));
   isoEl.appendChild(bRow);
 
   const cRow = document.createElement("div");
