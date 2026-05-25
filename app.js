@@ -3601,6 +3601,27 @@ function computeIsochrone() {
         if (sid) subSet.add(sid);
       }
     };
+    // Combo fallback: only project pixels whose PIX_MODE_KIND is 0
+    // (unstamped). Stamped pixels belong to a kind that has a single
+    // mode at this hex; if that single weren't reached, it'd already
+    // be in singlesByHex and we wouldn't be in the fallback branch.
+    // So a stamped pixel here means: the kind's single exists, but
+    // the army didn't reach it — projecting those pixels would
+    // falsely mark subhexes the army never traversed (the case where
+    // a hex has tiny pruned naval pixels + a full LAND single, and
+    // the army arrives naval-only via combo: only the naval bit should
+    // light up, not the entire LAND subhex via combo's LAND pixels).
+    const addComboFallbackPixels = (info) => {
+      const pxs = info.pixels;
+      for (let i = 0; i < pxs.length; i++) {
+        const p = pxs[i];
+        // Unstamped (kind-pruned) pixels only — the only way the
+        // constituent kind's footprint can be represented.
+        if (PIX_MODE_KIND && PIX_MODE_KIND[p] !== 0) continue;
+        const sid = SUBHEX_ID_PX[p];
+        if (sid) subSet.add(sid);
+      }
+    };
     for (const hid of reached) {
       const singles = singlesByHex.get(hid);
       if (singles && singles.length > 0) {
@@ -3608,7 +3629,7 @@ function computeIsochrone() {
         continue;
       }
       const combos = combosByHex.get(hid);
-      if (combos) for (const info of combos) addPixels(info);
+      if (combos) for (const info of combos) addComboFallbackPixels(info);
     }
   } else {
     // No subhex pixel map yet — fall back to the old whole-hex fill.
