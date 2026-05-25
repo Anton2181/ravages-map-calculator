@@ -31,8 +31,8 @@ const DEFAULT_WEIGHTS = {
   // Cheap relative to overland because ships move much faster than a
   // land party.
   "Lake": 2.5, "Sea": 2.5, "Ocean": 2.5,
-  // Embark — boarding a ship (land -> water). Heavy: 7.
-  "Embark": 7,
+  // Embark — boarding a ship (land -> water). Heavy: 7*24 (7 days).
+  "Embark": 7*24,
   // Disembark — leaving a ship (water -> land). Allowed only at a hex
   // flagged Stronghold; cost defaults to 0 because the time-penalty is
   // baked into the Embark surcharge on the way out.
@@ -62,7 +62,7 @@ const DEFAULT_ROAD_WEIGHTS = {
   "Flatlands": 15, "Hills": 15, "Mountains": 30,
   // Water and embark/disembark mirror the default column.
   "Lake": 2.5, "Sea": 2.5, "Ocean": 2.5,
-  "Embark": 7,
+  "Embark": 7*24,
   "Disembark": 0,
   "Ferry": 0,
   "Fording": 5,
@@ -77,7 +77,7 @@ const DEFAULT_ROAD_WEIGHTS = {
 const DEFAULT_FORCED_WEIGHTS = {
   "Flatlands": 24, "Hills": 24, "Mountains": 48,
   "Lake": 2.5, "Sea": 2.5, "Ocean": 2.5,
-  "Embark": 7,
+  "Embark": 7*24,
   "Disembark": 0,
   "Ferry": 0,
   "Fording": 5,
@@ -86,7 +86,7 @@ const DEFAULT_FORCED_WEIGHTS = {
 const DEFAULT_FORCED_ROAD_WEIGHTS = {
   "Flatlands": 12, "Hills": 12, "Mountains": 24,
   "Lake": 2.5, "Sea": 2.5, "Ocean": 2.5,
-  "Embark": 7,
+  "Embark": 7*24,
   "Disembark": 0,
   "Ferry": 0,
   "Fording": 5,
@@ -161,6 +161,36 @@ let isochroneSourceId = null;        // clicked subhex id
 let isochroneHexIds = null;          // Set of hex ids reachable within budget
 let isochroneSubhexIds = null;       // Set of subhex ids for the mask fill
 
+// ── Blocked-hex painting (isochrone) ──────────────────────────────────
+// User-paintable set of hex ids that dijkstra has to avoid when computing
+// reachability. Two sets so painting doesn't trigger a recompute on
+// every click — only an explicit Apply moves draft → applied and runs
+// dijkstra again.
+//   * DRAFT   = what the user has currently painted; rendered as a
+//               translucent red overlay so they can see the in-progress
+//               selection.
+//   * APPLIED = what dijkstra actually skips. The two diverge between
+//               clicks; Apply copies draft → applied and recomputes.
+// ISOCHRONE_PAINT_MODE gates whether map clicks paint hexes (true) or
+// re-set the isochrone source (false). Both require ISOCHRONE_MODE on.
+let ISOCHRONE_BLOCKED_DRAFT = new Set();
+let ISOCHRONE_BLOCKED_APPLIED = new Set();
+let ISOCHRONE_PAINT_MODE = false;
+let ISOCHRONE_BLOCKED_COLOR = [220, 40, 40];
+let ISOCHRONE_BLOCKED_ALPHA = 140;
+
+// Cache of computed isochrone results keyed by the ford/embark combo
+// (same key shape as HEX_MODES_VARIANTS — "FE", "F_", "_E", "__"). The
+// user wants flipping Can ford / Can embark to be near-instant after the
+// first compute for each combo; everything else (source click, budget
+// slider, Apply, weight change, army length change) invalidates the
+// whole cache because those rewrite the dijkstra inputs.
+let ISOCHRONE_RESULT_CACHE = null;
+function isoComboKey() {
+  return `${ARMY_CAN_FORD ? "F" : "_"}${ARMY_CAN_EMBARK ? "E" : "_"}`;
+}
+function invalidateIsochroneCache() { ISOCHRONE_RESULT_CACHE = null; }
+
 // =================== DOM ===================
 const stage       = document.getElementById("stage");
 const mapCanvas   = document.getElementById("map-canvas");
@@ -175,6 +205,7 @@ const armyEl      = document.getElementById("army");
 const colorsEl    = document.getElementById("colors");
 const lineEl      = document.getElementById("line-style");
 const isoEl       = document.getElementById("isochrone");
+const blockedEl   = document.getElementById("blocked-hexes");
 const tooltipEl   = document.getElementById("hover-tooltip");
 const statusEl    = document.getElementById("status");
 const loadingEl   = document.getElementById("loading");
@@ -296,6 +327,14 @@ let SUBHEX_COMPONENT_COUNT = null;       // Map<subhexId, number of components>
 // "skip road components smaller than MIN_PIXELS_PER_PATH_HEX") consult the
 // component's actual artwork size without rescanning pixels.
 let SUBHEX_COMPONENT_PIXEL_COUNT = null;  // Map<"sid:comp", number of pixels>
+// Same shape as SUBHEX_COMPONENT_PIXEL_COUNT, but only counting pixels that
+// are actually in ROAD_PIXEL_MASK (i.e. painted road or city/town/fort
+// artwork). The mixed flood-fill component spans land + road, so the total
+// pixel count is dominated by surrounding land — useless for "is this a
+// meaningfully-on-the-road component" decisions. This is the count that
+// drives the road-weight discount in componentEffectiveWeight and the
+// freebie mask inclusion in routeLineFromModes. 0 for non-road components.
+let SUBHEX_COMPONENT_ROAD_PIXEL_COUNT = null;  // Map<"sid:comp", number of road pixels>
 // Full pixel-index list per (subhex, component). Captured at flood-fill
 // time so the per-hex MODE pixel sets can be assembled cheaply by union
 // without rescanning the bbox. Feeds the (hex, mode) graph the mode-based
@@ -914,7 +953,7 @@ function hexNeighbors(hid) {
 //   4. Save the downloaded `graph_cache.bin` next to neighbors.json.
 //   5. Subsequent loads skip the heavy precomputes.
 // ============================================================================
-const CACHE_VERSION = 26;
+const CACHE_VERSION = 27;
 const CACHE_MAGIC = "RVGCACHE";
 
 // ---- low-level writers ----
@@ -1230,6 +1269,7 @@ function _cacheManifest() {
     { name: "SUBHEX_PIXEL_COMPONENT",       type: "u16",         get: () => SUBHEX_PIXEL_COMPONENT,       set: v => { SUBHEX_PIXEL_COMPONENT = v; } },
     { name: "SUBHEX_COMPONENT_COUNT",       type: "map_i_n",     get: () => SUBHEX_COMPONENT_COUNT,       set: v => { SUBHEX_COMPONENT_COUNT = v; } },
     { name: "SUBHEX_COMPONENT_PIXEL_COUNT", type: "map_s_n",     get: () => SUBHEX_COMPONENT_PIXEL_COUNT, set: v => { SUBHEX_COMPONENT_PIXEL_COUNT = v; } },
+    { name: "SUBHEX_COMPONENT_ROAD_PIXEL_COUNT", type: "map_s_n", get: () => SUBHEX_COMPONENT_ROAD_PIXEL_COUNT, set: v => { SUBHEX_COMPONENT_ROAD_PIXEL_COUNT = v; } },
     { name: "SUBHEX_COMPONENT_PIXELS",      type: "map_s_u32",   get: () => SUBHEX_COMPONENT_PIXELS,      set: v => { SUBHEX_COMPONENT_PIXELS = v; } },
     { name: "ROAD_COMPONENTS",              type: "set_s",       get: () => ROAD_COMPONENTS,              set: v => { ROAD_COMPONENTS = v; } },
     { name: "THICK_RIVER_COMPONENTS",       type: "set_s",       get: () => THICK_RIVER_COMPONENTS,       set: v => { THICK_RIVER_COMPONENTS = v; } },
@@ -1600,6 +1640,12 @@ function recomputeHexModeGraph() {
       if (!modes || !modes.has(mode)) HEX_MODE_OVERRIDES.delete(hid);
     }
   }
+
+  // Every cached isochrone result was computed against the OLD HEX_MODES
+  // catalog. Anything that triggers a full mode-graph rebuild (weights,
+  // army length crossing the doubling threshold, etc.) must drop the
+  // cache so the next compute reflects the new costs.
+  invalidateIsochroneCache();
 }
 
 // Swap HEX_MODES / HEX_MODES_FORCED to point at the variant matching
@@ -1658,6 +1704,7 @@ function precomputeSubhexComponents() {
   SUBHEX_PIXEL_COMPONENT = new Uint16Array(N);
   SUBHEX_COMPONENT_COUNT = new Map();
   SUBHEX_COMPONENT_PIXEL_COUNT = new Map();
+  SUBHEX_COMPONENT_ROAD_PIXEL_COUNT = new Map();
   SUBHEX_COMPONENT_PIXELS = new Map();
   ROAD_COMPONENTS = new Set();
   THICK_RIVER_COMPONENTS = new Set();
@@ -1704,6 +1751,12 @@ function precomputeSubhexComponents() {
           let compHasRoad  = !!(road && road[i]);
           let compHasThick = !!(thickPx && thickPx[i]);
           let compPixCount = 1;
+          // Road-only pixel count for this component — counts pixels in
+          // ROAD_PIXEL_MASK (road artwork + city/town/fort footprint). This
+          // is the count that drives "is the road big enough to matter?"
+          // decisions (road-weight discount, freebie mask widening), as
+          // opposed to compPixCount which is the whole mixed flood-fill.
+          let compRoadPixCount = (road && road[i]) ? 1 : 0;
           SUBHEX_PIXEL_COMPONENT[i] = compId;
           let head = 0, tail = 0;
           queue[tail++] = i;
@@ -1719,7 +1772,7 @@ function precomputeSubhexComponents() {
               const ni = idx + 1;
               if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0) {
                 SUBHEX_PIXEL_COMPONENT[ni] = compId;
-                if (road && road[ni]) compHasRoad = true;
+                if (road && road[ni]) { compHasRoad = true; compRoadPixCount++; }
                 if (thickPx && thickPx[ni]) compHasThick = true;
                 compPixCount++;
                 queue[tail++] = ni;
@@ -1729,7 +1782,7 @@ function precomputeSubhexComponents() {
               const ni = idx - 1;
               if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0) {
                 SUBHEX_PIXEL_COMPONENT[ni] = compId;
-                if (road && road[ni]) compHasRoad = true;
+                if (road && road[ni]) { compHasRoad = true; compRoadPixCount++; }
                 if (thickPx && thickPx[ni]) compHasThick = true;
                 compPixCount++;
                 queue[tail++] = ni;
@@ -1739,7 +1792,7 @@ function precomputeSubhexComponents() {
               const ni = idx + W;
               if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0) {
                 SUBHEX_PIXEL_COMPONENT[ni] = compId;
-                if (road && road[ni]) compHasRoad = true;
+                if (road && road[ni]) { compHasRoad = true; compRoadPixCount++; }
                 if (thickPx && thickPx[ni]) compHasThick = true;
                 compPixCount++;
                 queue[tail++] = ni;
@@ -1749,7 +1802,7 @@ function precomputeSubhexComponents() {
               const ni = idx - W;
               if (subhexPx[ni] === subId && !(blockThick && thick && thick[ni]) && SUBHEX_PIXEL_COMPONENT[ni] === 0) {
                 SUBHEX_PIXEL_COMPONENT[ni] = compId;
-                if (road && road[ni]) compHasRoad = true;
+                if (road && road[ni]) { compHasRoad = true; compRoadPixCount++; }
                 if (thickPx && thickPx[ni]) compHasThick = true;
                 compPixCount++;
                 queue[tail++] = ni;
@@ -1759,6 +1812,7 @@ function precomputeSubhexComponents() {
           if (compHasRoad)  ROAD_COMPONENTS.add(`${subId}:${compId}`);
           if (compHasThick) THICK_RIVER_COMPONENTS.add(`${subId}:${compId}`);
           SUBHEX_COMPONENT_PIXEL_COUNT.set(`${subId}:${compId}`, compPixCount);
+          SUBHEX_COMPONENT_ROAD_PIXEL_COUNT.set(`${subId}:${compId}`, compRoadPixCount);
           // Snapshot this component's pixels before the queue gets
           // overwritten by the next flood. tail === compPixCount at this
           // point, so queue[0..compPixCount-1] is the full pixel list.
@@ -2396,15 +2450,34 @@ function precomputeHexModes() {
       // pixel set has a naval gap line A* can't actually walk.
       const blockOnCorner = (kindName !== "NAVAL") ? navalSet : null;
       const comps = pruneTinyComponents(floodComponents(bucket, false, blockOnCorner));
+      // Only ROAD modes care about a road-artwork-only pixel count. For
+      // every other kind we'd just be counting pixels in ROAD_PIXEL_MASK
+      // that happen to coincide with land/ferry/etc. — meaningless.
+      const isRoadKind = (kindName === "ROAD");
+      const roadMask   = ROAD_PIXEL_MASK;
       for (let ci = 0; ci < comps.length; ci++) {
         const pixels = comps[ci];
         const name = `${kindName}#${ci}`;
+        // For ROAD modes, count pixels that are actually painted road
+        // artwork (or ctf pixels — both live in ROAD_PIXEL_MASK). This is
+        // the "infrastructure size" the disembark mechanism inflated past
+        // — at strongholds, pixels.length includes the whole city-promoted
+        // subhex, but roadPixelCount stays at the painted-artwork count.
+        // It's the right number for the freebie-inclusion threshold and
+        // anywhere else we're asking "is the road big enough to matter?".
+        let roadPixelCount = 0;
+        if (isRoadKind && roadMask) {
+          for (let i = 0; i < pixels.length; i++) {
+            if (roadMask[pixels[i]]) roadPixelCount++;
+          }
+        }
         hexModes.set(name, {
           mode: name,
           kind: kindName,
           pixels,
           cost,
           isFerry,
+          roadPixelCount,   // only meaningful for ROAD kinds; 0 elsewhere
         });
         // Stamp per-pixel lookup so precomputeHexModeNeighbors and
         // hexModeAtPixel can resolve "what mode owns this pixel" in O(1).
@@ -2696,6 +2769,121 @@ function precomputeHexModes() {
     }
 
     if (hexModes.size > 0) HEX_MODES.set(hid, hexModes);
+  }
+
+  // ── Freebie-aware ROAD cost adjustment ────────────────────────────────
+  // When a single ROAD mode's road-artwork count is below
+  // MIN_PIXELS_PER_PATH_HEX, the line drawing will bill any brief dip
+  // through it as "free" (the per-hex pixel count falls under the
+  // freebie threshold), AND routeLineFromModes will splice that mode's
+  // pixels into an adjacent ROAD-routed hex's mask as a freebie. But
+  // dijkstra picks modes on per-hex cost alone — without this pass, it
+  // sees the sub-threshold ROAD mode at full road weight (or LAND
+  // weight, post-fix) and routes around it, missing the freebie path
+  // entirely (e.g. straight through 2 LAND hexes at 30 each instead of
+  // stair-stepping through 3 freebie-eligible ROAD hexes at 0 each).
+  //
+  // The rule:
+  //   * roadPixelCount >= MIN_PIXELS_PER_PATH_HEX  → real road, leave
+  //     cost at road weight.
+  //   * roadPixelCount  <  MIN_PIXELS_PER_PATH_HEX AND 8-adjacent (across
+  //     hex border) to a neighbour-hex ROAD mode that IS above threshold
+  //     → freebie-eligible: drop cost to 0 so dijkstra treats it like
+  //     the line will (a brief, free dip).
+  //   * roadPixelCount  <  MIN_PIXELS_PER_PATH_HEX AND no real-road
+  //     neighbour → isolated scrap: bump cost to LAND weight so dijkstra
+  //     doesn't bias toward this hex; the line won't be able to freebie
+  //     through it either (the freebie widening requires an adjacent
+  //     route hex to already be ROAD-routed).
+  //
+  // Combos are intentionally left alone — they use kind-level baseCosts,
+  // and combo-routing through a stronghold is a separate code path with
+  // its own disembark / embark cost semantics. Single ROAD is where the
+  // line-vs-dijkstra mismatch actually bit.
+  if (HEX_MODES && SUBHEX_ID_IMG_DATA) {
+    const Wsub = SUBHEX_ID_IMG_DATA.width;
+    const Hsub = SUBHEX_ID_IMG_DATA.height;
+    const minPx = MIN_PIXELS_PER_PATH_HEX;
+    // Pre-build a per-hex set of "real road" pixel positions (i.e. the
+    // union of pixels of every above-threshold single ROAD mode in that
+    // hex). Used as the 8-adjacency target by the sub-threshold sweep.
+    const realRoadPixSetByHex = new Map();
+    for (const [hid, modes] of HEX_MODES) {
+      let set = null;
+      for (const [, info] of modes) {
+        if (info.isCombo) continue;
+        if (info.kind !== "ROAD") continue;
+        if ((info.roadPixelCount || 0) < minPx) continue;
+        if (!set) set = new Set();
+        const pxs = info.pixels;
+        for (let i = 0; i < pxs.length; i++) set.add(pxs[i]);
+      }
+      if (set) realRoadPixSetByHex.set(hid, set);
+    }
+    // Now adjust sub-threshold ROAD modes hex by hex.
+    for (const [hid, modes] of HEX_MODES) {
+      // Collect neighbour hex IDs once per hex.
+      const nbHexIds = (typeof hexNeighbors === "function")
+        ? hexNeighbors(hid)
+        : [];
+      // Pre-collect the neighbour-hex real-road pixel sets we'll probe.
+      const nbRealRoadSets = [];
+      for (const nbHex of nbHexIds) {
+        const s = realRoadPixSetByHex.get(nbHex);
+        if (s) nbRealRoadSets.push(s);
+      }
+      // Per-hex terrain weight, used as the isolated-road fallback. We
+      // can read it off any single LAND mode of this hex (its cost was
+      // set to hexW). Falls back to leaving the road weight alone if no
+      // LAND mode exists (very rare — naval-only hexes won't reach this
+      // block because they have no ROAD mode).
+      let landCost = NaN;
+      for (const [, info] of modes) {
+        if (info.isCombo) continue;
+        if (info.kind === "LAND") { landCost = info.cost; break; }
+      }
+      for (const [, info] of modes) {
+        if (info.isCombo) continue;
+        if (info.kind !== "ROAD") continue;
+        const rpc = info.roadPixelCount || 0;
+        if (rpc >= minPx) continue;              // real road — leave alone
+        // 8-adjacency test against any neighbour-hex real-road pixel.
+        let eligible = false;
+        if (nbRealRoadSets.length > 0) {
+          const pxs = info.pixels;
+          for (let i = 0; i < pxs.length && !eligible; i++) {
+            const p = pxs[i];
+            const py = (p / Wsub) | 0;
+            const px = p - py * Wsub;
+            for (let dy = -1; dy <= 1 && !eligible; dy++) {
+              const ny = py + dy;
+              if (ny < 0 || ny >= Hsub) continue;
+              for (let dx = -1; dx <= 1 && !eligible; dx++) {
+                if (dx === 0 && dy === 0) continue;
+                const nx = px + dx;
+                if (nx < 0 || nx >= Wsub) continue;
+                const nidx = ny * Wsub + nx;
+                for (let s = 0; s < nbRealRoadSets.length; s++) {
+                  if (nbRealRoadSets[s].has(nidx)) { eligible = true; break; }
+                }
+              }
+            }
+          }
+        }
+        // Stamp the adjusted cost + a debug flag so the tooltip can
+        // distinguish freebie-eligible from isolated scraps.
+        if (eligible) {
+          info.cost = 0;
+          info.freebieEligible = true;
+        } else if (isFinite(landCost)) {
+          info.cost = landCost;
+          info.freebieEligible = false;
+        }
+        // else: leave cost as the road weight (no LAND mode to compare
+        // against). Vanishingly rare — only fires if a hex has a ROAD
+        // mode but no LAND mode at all.
+      }
+    }
   }
 }
 
@@ -3475,10 +3663,17 @@ function componentEffectiveWeight(sub, compId) {
     // same MIN_PIXELS_PER_PATH_HEX the user controls in the Path-line
     // panel — that way it doubles as the "min size for a road node to
     // count" knob.
-    const pixCount = SUBHEX_COMPONENT_PIXEL_COUNT
-      ? (SUBHEX_COMPONENT_PIXEL_COUNT.get(`${sub.id}:${compId}`) || 0)
+    //
+    // Count ROAD pixels only — not the whole mixed flood-fill component.
+    // The flood doesn't split at the road/non-road boundary, so the total
+    // pixel count is dominated by surrounding land and would let a 5-px
+    // road scrap inside a 2000-px subhex sail past the threshold. The
+    // separate count below is the actual road-artwork population (also
+    // includes city/town/fort pixels via ROAD_PIXEL_MASK).
+    const roadPixCount = SUBHEX_COMPONENT_ROAD_PIXEL_COUNT
+      ? (SUBHEX_COMPONENT_ROAD_PIXEL_COUNT.get(`${sub.id}:${compId}`) || 0)
       : 0;
-    if (pixCount >= MIN_PIXELS_PER_PATH_HEX) {
+    if (roadPixCount >= MIN_PIXELS_PER_PATH_HEX) {
       const pt = HEX_TERRAIN ? canonicalHexTerrain(HEX_TERRAIN.get(sub.hex)) : null;
       if (pt) {
         const rw = +roadWeights[pt];
@@ -3560,6 +3755,13 @@ function computeIsochrone() {
   const srcHex = sub.hex;
   const srcModes = HEX_MODES.get(srcHex);
   if (!srcModes) return;
+  // User-painted blocked hexes — dijkstra treats them as if they were not
+  // in the graph at all. Source itself counts: if the user blocked their
+  // own origin, the iso area collapses to the source subhex (added back
+  // unconditionally at the end as the "you are here" marker).
+  const blocked = ISOCHRONE_BLOCKED_APPLIED;
+  const hasBlocks = blocked && blocked.size > 0;
+  if (hasBlocks && blocked.has(srcHex)) return;
 
   // Pixel index of the clicked subhex's centroid — used both to filter
   // the source-seeded modes (so dijkstra doesn't free-start from a mode
@@ -3631,6 +3833,10 @@ function computeIsochrone() {
       const colon = vKey.indexOf(":");
       const vHex  = +vKey.slice(0, colon);
       const vMode = vKey.slice(colon + 1);
+      // Blocked-hex gate: skip every edge into a user-painted hex.
+      // Cheaper than filtering blocked hexes at graph-build time and
+      // lets us toggle the Applied set without rebuilding HEX_MODES.
+      if (hasBlocks && blocked.has(vHex)) continue;
       const vInfo = HEX_MODES.get(vHex)?.get(vMode);
       if (!vInfo || !isFinite(vInfo.cost) || vInfo.cost < 0) continue;
       const vIsNaval     = modeIsNaval(vInfo);
@@ -3805,6 +4011,31 @@ function computeIsochrone() {
   isochroneSubhexIds = subSet;
 }
 
+// Cached wrapper around computeIsochrone — keys the result by the current
+// ford/embark combo so flipping those toggles back and forth is a Map.get
+// instead of a full dijkstra. Any other input change (source click,
+// budget slider, Apply on the blocked-hex paint, weight/army change)
+// invalidates the cache via invalidateIsochroneCache before calling this.
+function computeIsochroneCached() {
+  if (isochroneSourceId == null) {
+    isochroneHexIds = null; isochroneSubhexIds = null;
+    return;
+  }
+  if (!ISOCHRONE_RESULT_CACHE) ISOCHRONE_RESULT_CACHE = new Map();
+  const key = isoComboKey();
+  const hit = ISOCHRONE_RESULT_CACHE.get(key);
+  if (hit) {
+    isochroneHexIds = hit.hexIds;
+    isochroneSubhexIds = hit.subhexIds;
+    return;
+  }
+  computeIsochrone();
+  ISOCHRONE_RESULT_CACHE.set(key, {
+    hexIds: isochroneHexIds,
+    subhexIds: isochroneSubhexIds,
+  });
+}
+
 // =================== Pathfinding (per-segment) ===================
 // One hex-graph Dijkstra, factored out so each route segment between two
 // adjacent waypoints can be computed independently. Returns the ordered
@@ -3968,6 +4199,16 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
   const fromModes = HEX_MODES.get(fromHexId);
   const toModes   = HEX_MODES.get(toHexId);
   if (!fromModes || !toModes) return null;
+  // User-painted blocked hexes act as walls for the regular From/To
+  // pathfinder too — same set the isochrone uses. If the user blocked
+  // the destination, the route is unreachable; if they blocked the
+  // origin, dijkstra can't seed any neighbor (every edge out skips a
+  // blocked hex on either side). Either way we return null and the
+  // route renders as "no path", which matches the user's expectation
+  // when they explicitly painted a barrier across the endpoint.
+  const blockedRoute = ISOCHRONE_BLOCKED_APPLIED;
+  const hasBlocksRoute = blockedRoute && blockedRoute.size > 0;
+  if (hasBlocksRoute && (blockedRoute.has(fromHexId) || blockedRoute.has(toHexId))) return null;
   // Multi-start / multi-end semantics: the start hex contributes 0 to
   // total cost regardless of which mode is used (free start), and the
   // line A* snaps the click pixel to whichever mode dijkstra picks. So
@@ -4103,6 +4344,10 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
       const colonV = vKey.indexOf(":");
       const vHex = +vKey.slice(0, colonV);
       const vMode = vKey.slice(colonV + 1);
+      // Blocked-hex gate: skip every edge into a user-painted hex.
+      // Same approach as computeIsochrone — cheaper than rebuilding
+      // HEX_MODES whenever Apply moves a hex in or out of the set.
+      if (hasBlocksRoute && blockedRoute.has(vHex)) continue;
       const vInfo = HEX_MODES.get(vHex)?.get(vMode);
       // Cost of 0 is valid (e.g., Ferry surcharge defaulting to 0).
       // Skip only if cost is non-finite or negative.
@@ -5570,7 +5815,19 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
         for (const [, nbInfo] of nbModes) {
           if (nbInfo.isCombo) continue;
           if (nbInfo.kind !== "ROAD") continue;
-          if (nbInfo.pixels.length >= MIN_PIXELS_PER_PATH_HEX) continue;
+          // Use the road-artwork pixel count, NOT the mode's full
+          // pixels.length. At strongholds the city-promotion pass dumps
+          // the entire city subhex into the ROAD mode's pixels (so the
+          // disembark mechanism can lift off the city's full footprint),
+          // which would push pixels.length well past the freebie
+          // threshold even when the actual painted road is tiny. The
+          // disembark inflation and the "is this a thin road we should
+          // gift to a neighbour" question are separate decisions — keep
+          // them separate.
+          const rpCount = (nbInfo.roadPixelCount != null)
+            ? nbInfo.roadPixelCount
+            : nbInfo.pixels.length;
+          if (rpCount >= MIN_PIXELS_PER_PATH_HEX) continue;
           // 8-adjacency test against the route mode's pixel set.
           let connected = false;
           const npx = nbInfo.pixels;
@@ -6892,6 +7149,7 @@ function renderLayers() {
     // Insert the iso overlay JUST before the first "above" layer in the stack.
     if (!drewIso && LAYERS_ABOVE_ISO.has(l.id)) {
       drawIsoOnMap();
+      drawBlockedHexesOnMap();
       drewIso = true;
     }
     if (!l.on || !IMAGES[l.id]) continue;
@@ -6899,7 +7157,7 @@ function renderLayers() {
     mapCtx.drawImage(IMAGES[l.id], 0, 0);
   }
   // If no "above" layers exist in LAYERS, draw iso at the top of the stack.
-  if (!drewIso) drawIsoOnMap();
+  if (!drewIso) { drawIsoOnMap(); drawBlockedHexesOnMap(); }
   mapCtx.globalAlpha = 1.0;
 }
 
@@ -6931,6 +7189,46 @@ function drawIsoOnMap() {
   mapCtx.globalAlpha = 1.0;
   mapCtx.drawImage(_isoCanvas, 0, 0);
 }
+
+// Blocked-hex paint overlay. Shows the DRAFT set (everything the user
+// has currently painted, applied or not) in translucent red whenever
+// paint mode is on OR the draft set is non-empty. We render the draft
+// rather than the applied set because the draft IS the applied set
+// immediately after Apply, and during painting the user wants to see
+// what they've selected before committing. Iterates HEX_ID_PX once per
+// render — same cost shape as drawIsoOnMap. Skipped entirely when the
+// set is empty and paint mode is off, so the common case (nothing
+// painted, not painting) is free.
+const _blockCanvas = document.createElement("canvas");
+const _blockCtx = _blockCanvas.getContext("2d");
+function drawBlockedHexesOnMap() {
+  const set = ISOCHRONE_BLOCKED_DRAFT;
+  if (!set || set.size === 0) return;
+  if (!HEX_ID_PX || !HEX_DATA) return;
+  const W = HEX_DATA.image_width, H = HEX_DATA.image_height;
+  if (_blockCanvas.width !== W || _blockCanvas.height !== H) {
+    _blockCanvas.width = W; _blockCanvas.height = H;
+  } else {
+    _blockCtx.clearRect(0, 0, W, H);
+  }
+  const img = _blockCtx.createImageData(W, H);
+  const N = W * H;
+  let oi = 0;
+  for (let i = 0; i < N; i++) {
+    const hid = HEX_ID_PX[i];
+    if (hid && set.has(hid)) {
+      img.data[oi]   = ISOCHRONE_BLOCKED_COLOR[0];
+      img.data[oi+1] = ISOCHRONE_BLOCKED_COLOR[1];
+      img.data[oi+2] = ISOCHRONE_BLOCKED_COLOR[2];
+      img.data[oi+3] = ISOCHRONE_BLOCKED_ALPHA;
+    }
+    oi += 4;
+  }
+  _blockCtx.putImageData(img, 0, 0);
+  mapCtx.globalAlpha = 1.0;
+  mapCtx.drawImage(_blockCanvas, 0, 0);
+}
+
 const _scratchCanvas = document.createElement("canvas");
 const _scratchCtx = _scratchCanvas.getContext("2d");
 // Fill every pixel whose subhex id is in subSet with rgba(rgb, alpha).
@@ -7561,6 +7859,15 @@ function lookupSubhex(px, py) {
 
 // =================== Interaction ===================
 let panning = false, panStart = null, mouseDownPos = null;
+// Drag-paint state. When Paint blocked hexes is on, a left-mouse drag
+// hijacks the pan loop: each hex the cursor crosses is added to (or
+// removed from) ISOCHRONE_BLOCKED_DRAFT. paintStrokeAdd is decided once
+// at mousedown based on the first hex's current membership — the same
+// "toggle-from-first-cell" pattern most paint apps use, so the stroke
+// reads consistently as "painting" or "erasing".
+let painting = false;
+let paintStrokeAdd = true;
+let paintLastHex = null;
 // Returns true if the given event's target is inside the mode-picker popup
 // (or any other interactive overlay that should swallow stage clicks). Used
 // by the mousedown / mouseup handlers below to skip pan + click-to-waypoint
@@ -7571,15 +7878,59 @@ function eventInsidePicker(e) {
   if (!mp || mp.classList.contains("hidden")) return false;
   return mp.contains(e.target);
 }
+// Apply the current stroke direction to the hex at `hid`. No-op when
+// the hex is already in the desired state or when we just painted it
+// this frame (keeps the renderer cool when the cursor lingers in one
+// hex). Returns true if the set actually changed.
+function applyPaintAt(hid) {
+  if (!hid) return false;
+  if (paintLastHex === hid) return false;
+  paintLastHex = hid;
+  const has = ISOCHRONE_BLOCKED_DRAFT.has(hid);
+  if (paintStrokeAdd && !has) {
+    ISOCHRONE_BLOCKED_DRAFT.add(hid);
+  } else if (!paintStrokeAdd && has) {
+    ISOCHRONE_BLOCKED_DRAFT.delete(hid);
+  } else {
+    return false;
+  }
+  renderLayers();
+  return true;
+}
 stage.addEventListener("mousedown", (e) => {
   if (e.button !== 0) return;
   if (eventInsidePicker(e)) return;
+  // Paint mode hijacks the drag — pan comes back the instant the user
+  // unchecks Paint blocked hexes. Resolve the first hex up front so
+  // the stroke direction (add vs erase) is locked in for the rest of
+  // the gesture, matching the toggle behavior the user saw on the
+  // initial single-click implementation.
+  if (ISOCHRONE_PAINT_MODE) {
+    const ipt = stageToImage(e.clientX, e.clientY);
+    if (!ipt) return;
+    const hex = pointToHex(ipt.x, ipt.y);
+    if (!hex) return;
+    painting = true;
+    paintStrokeAdd = !ISOCHRONE_BLOCKED_DRAFT.has(hex.id);
+    paintLastHex = null;
+    applyPaintAt(hex.id);
+    e.preventDefault();
+    return;
+  }
   panning = true;
   panStart = { x: e.clientX - view.x, y: e.clientY - view.y };
   mouseDownPos = { x: e.clientX, y: e.clientY };
   stage.classList.add("panning");
 });
 window.addEventListener("mousemove", (e) => {
+  if (painting) {
+    const ipt = stageToImage(e.clientX, e.clientY);
+    if (!ipt) return;
+    const hex = pointToHex(ipt.x, ipt.y);
+    if (!hex) return;
+    applyPaintAt(hex.id);
+    return;
+  }
   if (panning) {
     view.x = e.clientX - panStart.x;
     view.y = e.clientY - panStart.y;
@@ -7587,6 +7938,16 @@ window.addEventListener("mousemove", (e) => {
   }
 });
 window.addEventListener("mouseup", (e) => {
+  if (painting) {
+    painting = false;
+    paintLastHex = null;
+    // Status text shows draft / applied counts; refresh now that the
+    // stroke is committed. Deferred until mouseup so we don't thrash
+    // the DOM on every hovered hex during the stroke itself.
+    if (typeof refreshIsochroneBlockedStatus === "function") refreshIsochroneBlockedStatus();
+    updateStatus();
+    return;
+  }
   if (!panning) return;
   panning = false;
   stage.classList.remove("panning");
@@ -8029,13 +8390,56 @@ function explainMaskAtPixel(px, py) {
     lines.push("Ferry-mark pixel: ROAD ∩ THICK_RIVER overlay — DEFINES this hex as a ferry; in the line mask iff dijkstra picked a combo containing ROAD_FERRY");
   }
   if (isRoadComp) {
+    // Two distinct sizes for a road-bearing component:
+    //   * compPixCount     — whole mixed flood-fill (land + road artwork).
+    //     "Infrastructure size." This is what disembark / mask building
+    //     sees as the mode's pixel footprint.
+    //   * compRoadPixCount — pixels that are actually painted road or
+    //     ctf (city/town/fort) artwork. "Road artwork size." This is
+    //     what drives the road-weight discount and the freebie-inclusion
+    //     decision in routeLineFromModes.
     const compPixCount = SUBHEX_COMPONENT_PIXEL_COUNT
       ? (SUBHEX_COMPONENT_PIXEL_COUNT.get(`${sid}:${compId}`) || 0)
       : 0;
-    if (compPixCount < MIN_PIXELS_PER_PATH_HEX) {
-      lines.push(`This pixel sits in a ROAD COMPONENT but it's only ${compPixCount} px (< ${MIN_PIXELS_PER_PATH_HEX}) — too small, billed at land weight (road discount skipped)`);
+    const compRoadPixCount = SUBHEX_COMPONENT_ROAD_PIXEL_COUNT
+      ? (SUBHEX_COMPONENT_ROAD_PIXEL_COUNT.get(`${sid}:${compId}`) || 0)
+      : 0;
+    const sizeStr = `infrastructure ${compPixCount} px · road ${compRoadPixCount} px`;
+    // Find this hex's single ROAD mode(s) and check the freebie-eligible
+    // flag stamped on them by precomputeHexModes's freebie-aware pass.
+    // (Sub-threshold ROAD modes are dropped to cost 0 when 8-adjacent to a
+    // neighbour's real road, and bumped to LAND cost when isolated.)
+    let roadModeCost = NaN, roadModeFreebie = null;
+    if (HEX_MODES && HEX_MODES.get(hid)) {
+      for (const [, info] of HEX_MODES.get(hid)) {
+        if (info.isCombo) continue;
+        if (info.kind !== "ROAD") continue;
+        // Pick the mode whose pixel set contains THIS pixel — that's
+        // the one the tooltip is actually describing.
+        const pxs = info.pixels;
+        let owns = false;
+        for (let i = 0; i < pxs.length; i++) {
+          if (pxs[i] === idx) { owns = true; break; }
+        }
+        if (!owns) continue;
+        roadModeCost = info.cost;
+        roadModeFreebie = (info.freebieEligible != null) ? info.freebieEligible : null;
+        break;
+      }
+    }
+    if (compRoadPixCount < MIN_PIXELS_PER_PATH_HEX) {
+      let tail;
+      if (roadModeFreebie === true) {
+        tail = ` Freebie-eligible: 8-adjacent to a neighbour's real road, so dijkstra prices this ROAD mode at 0 (a brief dip through it is free), and the line mask will splice it into the adjacent ROAD-routed hex's mask.`;
+      } else if (roadModeFreebie === false) {
+        tail = ` ISOLATED road scrap (no real-road neighbour), so dijkstra prices this ROAD mode at LAND weight — the line can't freebie through it either.`;
+      } else {
+        tail = ` Eligible to be added as a FREEBIE to an adjacent ROAD-routed hex's mask.`;
+      }
+      const dCostStr = isFinite(roadModeCost) ? ` dijkstra ROAD-mode cost: ${roadModeCost}.` : "";
+      lines.push(`This pixel sits in a ROAD COMPONENT (${sizeStr}) but the road artwork is only ${compRoadPixCount} px (< ${MIN_PIXELS_PER_PATH_HEX}) — too thin for a standalone road discount.${dCostStr}${tail}`);
     } else {
-      lines.push(`This pixel sits in a ROAD COMPONENT (${compPixCount} px) — billed at road weight`);
+      lines.push(`This pixel sits in a ROAD COMPONENT (${sizeStr}) — road artwork meets the ${MIN_PIXELS_PER_PATH_HEX}-px threshold, billed at road weight.`);
     }
   }
   else if (isRoadSubhex) lines.push("Subhex contains road pixels, but THIS pixel is in the land component of the subhex (billed at class weight)");
@@ -8120,11 +8524,19 @@ function explainMaskAtPixel(px, py) {
 function handleClick(e) {
   const ipt = stageToImage(e.clientX, e.clientY);
   if (!ipt) return;
+  // Paint mode takes precedence and is independent of ISOCHRONE_MODE —
+  // the user can paint a barrier set first and turn on the isochrone
+  // later. Most clicks here come from drag-paint with moved<4 (i.e.
+  // the user clicked without dragging); the dedicated drag handlers in
+  // the Interaction section already painted on mousedown, so we just
+  // skip this path when paint mode is on to avoid double-toggling.
+  if (ISOCHRONE_PAINT_MODE) return;
   const sid = lookupSubhex(ipt.x | 0, ipt.y | 0);
   if (!sid) return;
   if (ISOCHRONE_MODE) {
     isochroneSourceId = sid;
-    computeIsochrone();
+    invalidateIsochroneCache();
+    computeIsochroneCached();
     renderLayers(); renderSelection(); updateStatus();
     return;
   }
@@ -8140,6 +8552,7 @@ function handleClick(e) {
   buildColorControls();
   buildLineControls();
   buildIsochroneControls();
+  buildBlockedHexControls();
   updateEndpoints();
   try { await loadAll(); }
   catch (e) {
@@ -8150,3 +8563,4 @@ function handleClick(e) {
   renderLayers();
   resetView();
 })();
+

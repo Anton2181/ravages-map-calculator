@@ -132,7 +132,9 @@ function buildWeightControls() {
         recomputePath(); renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
       }
       if (ISOCHRONE_MODE && isochroneSourceId != null) {
-        computeIsochrone(); renderLayers(); renderSelection(); updateStatus();
+        // recomputeHexModeGraph already invalidated the cache; this
+        // repopulates the active-combo entry.
+        computeIsochroneCached(); renderLayers(); renderSelection(); updateStatus();
       }
     };
     inputs[0].addEventListener("change", (e) => {
@@ -830,7 +832,9 @@ function buildArmyControls() {
     if (typeof rebuildAllRoutes === "function") rebuildAllRoutes();
     renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
     if (ISOCHRONE_MODE && isochroneSourceId != null) {
-      computeIsochrone(); renderLayers();
+      // recomputeHexModeGraph already drops the cache; this just
+      // repopulates the active-combo entry.
+      computeIsochroneCached(); renderLayers();
     }
   };
   const armyRerouteLight = () => {
@@ -838,7 +842,10 @@ function buildArmyControls() {
     if (typeof rebuildAllRoutes === "function") rebuildAllRoutes();
     renderSelection(); updateEndpoints(); updatePathInfo(); updateStatus();
     if (ISOCHRONE_MODE && isochroneSourceId != null) {
-      computeIsochrone(); renderLayers();
+      // Light reroute = toggled Can ford / Can embark. Other combos'
+      // cached results are still valid; this fills in the new combo on
+      // first toggle, then becomes a Map.get on subsequent flips.
+      computeIsochroneCached(); renderLayers();
     }
   };
 
@@ -882,6 +889,11 @@ function buildArmyControls() {
   armyEl.appendChild(embRow);
 }
 
+// Status-text refresher for the Blocked-hexes sub-section. Hoisted to
+// module scope (rather than closed over inside buildIsochroneControls)
+// so handleClick in app.js can ping it after each painted toggle.
+let refreshIsochroneBlockedStatus = () => {};
+
 // ----- Reachability (isochrone) panel -----
 function buildIsochroneControls() {
   isoEl.innerHTML = "";
@@ -893,11 +905,16 @@ function buildIsochroneControls() {
   onRow.querySelector("input").addEventListener("change", (e) => {
     ISOCHRONE_MODE = e.target.checked;
     if (!ISOCHRONE_MODE) {
+      // Don't touch paint mode here — it lives in its own panel and is
+      // a separate mechanism (the user can paint barriers without ever
+      // turning on reachability).
       isochroneSourceId = null;
       isochroneHexIds = null;
       isochroneSubhexIds = null;
     } else if (isochroneSourceId != null) {
-      computeIsochrone();
+      // Re-enabling with the same source/budget — cache should still be
+      // valid, so this is just a Map.get under the hood.
+      computeIsochroneCached();
     }
     renderLayers(); renderSelection(); updateStatus();
   });
@@ -924,7 +941,10 @@ function buildIsochroneControls() {
     ISOCHRONE_BUDGET = days * 24;
     bLabel.textContent = days;
     if (ISOCHRONE_MODE && isochroneSourceId != null) {
-      computeIsochrone();
+      // Budget changes the dijkstra result for every ford/embark combo,
+      // so blow away the whole cache before recomputing the active one.
+      invalidateIsochroneCache();
+      computeIsochroneCached();
       renderLayers(); renderSelection(); updateStatus();
     }
   });
@@ -937,7 +957,11 @@ function buildIsochroneControls() {
     (v) => {
       ISOCHRONE_BUDGET = v * 24;
       bSlider.value = v;
-      if (ISOCHRONE_MODE && isochroneSourceId != null) { computeIsochrone(); renderLayers(); renderSelection(); updateStatus(); }
+      if (ISOCHRONE_MODE && isochroneSourceId != null) {
+        invalidateIsochroneCache();
+        computeIsochroneCached();
+        renderLayers(); renderSelection(); updateStatus();
+      }
     },
     () => String(Math.round(ISOCHRONE_BUDGET / 24)));
   isoEl.appendChild(bRow);
@@ -969,6 +993,92 @@ function buildIsochroneControls() {
     () => Math.round((ISOCHRONE_ALPHA / 255) * 100) + "%");
   isoEl.appendChild(cRow);
 }
+
+// ----- Blocked hexes panel (independent of isochrone enable) ----------
+// Lives in its own #blocked-hexes panel-section because the user wanted
+// the paint mechanism decoupled from the iso checkbox: you can paint a
+// barrier set up first and only later flip on the isochrone to test
+// reach against it. The state itself (DRAFT / APPLIED / PAINT_MODE)
+// lives in app.js so handleClick and the drag-paint mouse handlers can
+// reach it without crossing through ui.js.
+function buildBlockedHexControls() {
+  if (!blockedEl) return;
+  blockedEl.innerHTML = "";
+
+  const paintRow = document.createElement("div");
+  paintRow.className = "layer-row";
+  paintRow.innerHTML = `<input type="checkbox" id="iso-paint" ${ISOCHRONE_PAINT_MODE ? "checked" : ""} />`
+    + `<label for="iso-paint">Paint blocked hexes (drag to paint)</label>`;
+  paintRow.querySelector("input").addEventListener("change", (e) => {
+    ISOCHRONE_PAINT_MODE = e.target.checked;
+    // No recompute on paint-mode toggle — the applied set hasn't moved.
+    // We DO want to re-render so the overlay flips on/off cleanly (the
+    // overlay shows while painting OR whenever the draft set is non-empty).
+    renderLayers();
+    refreshIsochroneBlockedStatus();
+    updateStatus();
+  });
+  blockedEl.appendChild(paintRow);
+
+  const statusRow = document.createElement("div");
+  statusRow.className = "help";
+  statusRow.id = "iso-block-status";
+  statusRow.style.margin = "4px 0";
+  blockedEl.appendChild(statusRow);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "button-row";
+  btnRow.style.marginBottom = "6px";
+  btnRow.innerHTML = `<span class="button primary" id="iso-apply">Apply</span>`
+    + `<span class="button" id="iso-clear-blocks">Clear blocked</span>`;
+  blockedEl.appendChild(btnRow);
+
+  refreshIsochroneBlockedStatus = () => {
+    const el = document.getElementById("iso-block-status");
+    if (!el) return;
+    const draftN   = ISOCHRONE_BLOCKED_DRAFT.size;
+    const appliedN = ISOCHRONE_BLOCKED_APPLIED.size;
+    // Two-set diff so the user knows if their paint is pending or live.
+    let pending = 0;
+    for (const h of ISOCHRONE_BLOCKED_DRAFT) if (!ISOCHRONE_BLOCKED_APPLIED.has(h)) pending++;
+    for (const h of ISOCHRONE_BLOCKED_APPLIED) if (!ISOCHRONE_BLOCKED_DRAFT.has(h)) pending++;
+    el.textContent = pending > 0
+      ? `Painted: ${draftN} hex${draftN === 1 ? "" : "es"} (${pending} unapplied — click Apply to recompute). Currently blocking: ${appliedN}.`
+      : `Painted: ${draftN} hex${draftN === 1 ? "" : "es"}. Currently blocking: ${appliedN}.`;
+  };
+  refreshIsochroneBlockedStatus();
+
+  // Shared post-Apply / post-Clear pipeline. The blocked-hex set now
+  // gates the From/To pathfinder too, so any change has to reroute
+  // every existing route AND refresh the iso (if it's running).
+  const applyBlocksAndRecompute = () => {
+    invalidateIsochroneCache();
+    if (typeof rebuildAllRoutes === "function") rebuildAllRoutes();
+    if (ISOCHRONE_MODE && isochroneSourceId != null) {
+      computeIsochroneCached();
+    }
+    renderLayers(); renderSelection();
+    if (typeof updateEndpoints === "function") updateEndpoints();
+    if (typeof updatePathInfo === "function") updatePathInfo();
+    updateStatus();
+    refreshIsochroneBlockedStatus();
+  };
+
+  document.getElementById("iso-apply").addEventListener("click", () => {
+    // Snapshot draft → applied (defensive copy so subsequent paints
+    // don't retroactively mutate the applied set), then rerun every
+    // route + the active isochrone against the new barrier set.
+    ISOCHRONE_BLOCKED_APPLIED = new Set(ISOCHRONE_BLOCKED_DRAFT);
+    applyBlocksAndRecompute();
+  });
+
+  document.getElementById("iso-clear-blocks").addEventListener("click", () => {
+    if (ISOCHRONE_BLOCKED_DRAFT.size === 0 && ISOCHRONE_BLOCKED_APPLIED.size === 0) return;
+    ISOCHRONE_BLOCKED_DRAFT = new Set();
+    ISOCHRONE_BLOCKED_APPLIED = new Set();
+    applyBlocksAndRecompute();
+  });
+}
 // Reachability section show/hide toggle (mirrors the Settings panel pattern:
 // the heading + body live in a sibling panel-section that gets hidden, so the
 // whole section vanishes when collapsed and only the toggle button remains).
@@ -979,12 +1089,18 @@ function buildIsochroneControls() {
     tbtn.addEventListener("click", () => {
       const isHidden = tpanels.classList.toggle("hidden");
       tbtn.textContent = isHidden ? "Show reachability" : "Hide reachability";
-      if (isHidden && ISOCHRONE_MODE) {
-        // Collapse the panel -> also turn off the click-capture mode so normal
-        // From/To clicking comes back. Keeps state in case you re-open it.
-        ISOCHRONE_MODE = false;
-        renderLayers(); renderSelection();
-        buildIsochroneControls();
+      if (isHidden) {
+        // Collapse the panel -> turn off both click-capture modes so
+        // normal From/To clicking + drag-to-pan come back. State is
+        // preserved so re-opening the panel restores the prior view.
+        let changed = false;
+        if (ISOCHRONE_MODE)       { ISOCHRONE_MODE = false; changed = true; }
+        if (ISOCHRONE_PAINT_MODE) { ISOCHRONE_PAINT_MODE = false; changed = true; }
+        if (changed) {
+          renderLayers(); renderSelection();
+          buildIsochroneControls();
+          buildBlockedHexControls();
+        }
       }
     });
   }
