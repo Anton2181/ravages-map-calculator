@@ -70,6 +70,18 @@ function buildLayerControls() {
     });
     layersEl.appendChild(row);
   }
+  // Path hex outline — not a painted image layer, but logically a layer
+  // the user toggles on/off. Lives in the Layers panel for discoverability
+  // (used to be tucked away in path-line settings).
+  const hoRow = document.createElement("div");
+  hoRow.className = "layer-row";
+  hoRow.innerHTML = `<input type="checkbox" id="layer-hex-outline" ${SHOW_HEX_OUTLINE ? "checked" : ""} />`
+    + `<label for="layer-hex-outline">Path hex outline</label>`;
+  hoRow.querySelector("input").addEventListener("change", (e) => {
+    SHOW_HEX_OUTLINE = e.target.checked;
+    renderSelection();
+  });
+  layersEl.appendChild(hoRow);
 }
 
 const WEIGHT_LABELS = {
@@ -448,13 +460,20 @@ function updateEndpoints() {
             tags.push(`<span class="tag ferry" title="Ferry crossing">⛴${isFinite(fw) ? ` +${fw}` : ""}</span>`);
           }
           const row = document.createElement("div");
-          row.className = "hex-row" + (k === 0 ? " is-start" : "") + (k === flat.length - 1 ? " is-end" : "");
+          row.className = "hex-row clickable" + (k === 0 ? " is-start" : "") + (k === flat.length - 1 ? " is-end" : "");
           row.innerHTML =
               `<span class="hex-num">${k + 1}</span>`
             + `<span class="hex-id">${hid}</span>`
             + `<span class="hex-terrain">${escapeHtml(visitedStr)}${sheetSuffix}</span>`
             + tags.join("")
             + costStr;
+          // Click anywhere on the row to pan the map to this hex's
+          // centre, keeping current zoom. Lets the user scrub through
+          // the breakdown and follow the route on the map.
+          row.title = `Pan to hex ${hid}`;
+          row.addEventListener("click", () => {
+            if (typeof panToHex === "function") panToHex(hid);
+          });
           tbl.appendChild(row);
         }
         det.appendChild(tbl);
@@ -689,15 +708,8 @@ function buildLineControls() {
     () => POINT_SIZE + "px");
   lineEl.appendChild(psRow);
 
-  const hoRow = document.createElement("div");
-  hoRow.className = "layer-row";
-  hoRow.innerHTML = `<input type="checkbox" id="show-hex-outline" ${SHOW_HEX_OUTLINE ? "checked" : ""} />`
-    + `<label for="show-hex-outline">Hex outlines</label>`;
-  hoRow.querySelector("input").addEventListener("change", (e) => {
-    SHOW_HEX_OUTLINE = e.target.checked;
-    renderSelection();
-  });
-  lineEl.appendChild(hoRow);
+  // Path hex outline moved to the Layers panel (bottom). See
+  // buildLayerControls() for the toggle.
 
   // [debug] Route-mask overlay — paints the binary mask routeThroughMask
   // actually fed to A* as a translucent magenta layer over hl-canvas. Useful

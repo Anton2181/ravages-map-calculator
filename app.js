@@ -2425,6 +2425,69 @@ function precomputeHexModes() {
 
     emitComponents("LAND", landSet, hexW, false);
     emitComponents("ROAD", roadSet, roadW, false, cityPromotedPixels);
+    // Mark every land-side SINGLE mode for two disembark-validity
+    // checks used in the intra-hex stronghold disembark rule:
+    //
+    //   * hasCtf            — pixels include a ctf (city/town/fort).
+    //                         The disembark must land ONTO the city,
+    //                         not just any random land single in the
+    //                         hex.
+    //   * dockableFromNaval — pixels include at least one pixel that
+    //                         is 8-adjacent to a naval pixel of this
+    //                         hex WITHOUT crossing a thick river at
+    //                         the diagonal corner. This is the
+    //                         "physically reachable from a ship" test
+    //                         — if the city's land sits on the far
+    //                         side of an internal thick river from
+    //                         the naval body, the army cannot dock
+    //                         there.
+    //
+    // Both flags must be true for the intra-hex disembark to fire.
+    if (ROAD_PIXEL_MASK && SUBHEX_ID_IMG_DATA) {
+      const roadsOnly = ROAD_ONLY_PIXEL_MASK || ROAD_PIXEL_MASK;
+      const thickRiver = THICK_RIVER_PIXEL_MASK;
+      const Wfull = SUBHEX_ID_IMG_DATA.width;
+      const Hfull = SUBHEX_ID_IMG_DATA.height;
+      for (const [, info] of hexModes) {
+        if (info.isCombo) continue;
+        if (info.kind !== "LAND" && info.kind !== "ROAD") continue;
+        info.hasCtf = false;
+        info.dockableFromNaval = navalSet.size === 0
+          ? false       // no naval in this hex at all — can't dock
+          : false;      // tentative, set true on first qualifying neighbour
+        const pxs = info.pixels;
+        for (let i = 0; i < pxs.length; i++) {
+          const p = pxs[i];
+          if (ROAD_PIXEL_MASK[p] && !roadsOnly[p]) info.hasCtf = true;
+          if (!info.dockableFromNaval && navalSet.size > 0) {
+            const py = (p / Wfull) | 0;
+            const px = p - py * Wfull;
+            // 8-neighbour sweep around p looking for a naval pixel.
+            for (let dy = -1; dy <= 1 && !info.dockableFromNaval; dy++) {
+              const ny = py + dy;
+              if (ny < 0 || ny >= Hfull) continue;
+              for (let dx = -1; dx <= 1; dx++) {
+                if (dx === 0 && dy === 0) continue;
+                const nx = px + dx;
+                if (nx < 0 || nx >= Wfull) continue;
+                const ni = ny * Wfull + nx;
+                if (!navalSet.has(ni)) continue;
+                if (dx !== 0 && dy !== 0) {
+                  // Diagonal — thick river at either orthogonal
+                  // corner blocks (no corner-cut across a river).
+                  const c1 = py * Wfull + nx;
+                  const c2 = ny * Wfull + px;
+                  if (thickRiver && (thickRiver[c1] || thickRiver[c2])) continue;
+                }
+                info.dockableFromNaval = true;
+                break;
+              }
+            }
+          }
+          if (info.hasCtf && info.dockableFromNaval) break;
+        }
+      }
+    }
     const isHexNaval = hexT && WATER_TERRAINS.has(hexT);
     const navalW = isHexNaval ? hexW : +weights["Sea"];
     // Naval modes are gated on ARMY_CAN_EMBARK — when off, the army
@@ -2468,18 +2531,27 @@ function precomputeHexModes() {
     //   ROAD       → road weight
     //   ROAD_FERRY → ferry surcharge alone (the road portion is the
     //                ROAD kind's responsibility if it's also in the combo)
-    //   NAVAL      → naval weight (hex's terrain if water, else "Sea")
+    //   NAVAL      → Embark surcharge (NOT naval-sailing weight). A
+    //                naval-touching combo at a coastal hex represents
+    //                the army DOCKED at this hex — boarding / leaving a
+    //                ship — not sailing through it. So NAVAL's contribution
+    //                to the combo cost is the one-time embark fee, not
+    //                the sailing-cost weight. The cross-hex rule below
+    //                drops the LAND→combo embark surcharge to match, so
+    //                the Embark fee fires exactly once per embarkation.
+    //   FORD       → fording surcharge
     //
     // We only generate combos whose pixel union is strictly larger than
     // any constituent kind's set — same pixels at a higher cost would
     // just be dominated, so they're not worth emitting. In practice this
     // skips LAND+ROAD (road ⊂ land already) and any combo whose
     // constituent kinds have empty buckets.
+    const embarkSurchargeForCombo = +weights["Embark"] || 0;
     const baseCosts = {
       LAND: hexW,
       ROAD: roadW,
       ROAD_FERRY: ferrySurcharge,
-      NAVAL: navalW,
+      NAVAL: embarkSurchargeForCombo,
       FORD: fordSurcharge,
     };
     const kindSets = {
@@ -3581,7 +3653,17 @@ function computeIsochrone() {
       if (vHex === uHex) {
         if (uHexIsStronghold
             && !uIsLandSide && vIsLandSide
-            && ARMY_CAN_EMBARK) {
+            && ARMY_CAN_EMBARK
+            // Target must be a SINGLE land/road mode that:
+            //   (a) contains ctf pixels — disembarks ONTO the city,
+            //       not onto a random land single, and
+            //   (b) is 8-adjacent to a naval pixel without a thick
+            //       river at the diagonal corner — physically
+            //       reachable from a ship, no skipping the river.
+            // Combos are transition zones, not landing targets.
+            && !vInfo.isCombo
+            && vInfo.hasCtf
+            && vInfo.dockableFromNaval) {
           let nd = d + vInfo.cost;
           const dw = +weights["Disembark"] || 0;
           if (isFinite(dw) && dw > 0) nd += dw;
@@ -3603,21 +3685,25 @@ function computeIsochrone() {
       // Naval-boundary surcharges.
       //   * pure naval → land-side cross-hex: blocked. The only legal
       //     disembark is the intra-hex stronghold edge above.
-      //   * land-side → any naval: Embark fires anywhere (no
+      //   * land-side → PURE naval: Embark fires anywhere (no
       //     stronghold required, as on the path-finding side).
-      //   * naval combo → land-side cross-hex: ALSO blocked now. The
-      //     prior rule "combo→neighbor-land at stronghold" let dijkstra
-      //     skip over the stronghold's own land subhex entirely; the
-      //     intra-hex disembark above is the correct path.
+      //   * land-side → naval COMBO: NO extra Embark surcharge —
+      //     the combo's own mode-cost includes the Embark fee as the
+      //     NAVAL constituent contribution. Charging again here would
+      //     double-bill the boarding.
+      //   * naval combo → land-side cross-hex: blocked. The prior rule
+      //     let routes hop sea→neighbor-land without traversing the
+      //     stronghold's own land subhex; intra-hex disembark above is
+      //     the correct path.
       if (uIsPureNaval && vIsLandSide) {
         continue;
       } else if (uIsLandSide && !vIsLandSide) {
         if (!ARMY_CAN_EMBARK) continue;
-        const e = +weights["Embark"];
-        if (isFinite(e) && e > 0) nd += e;
+        if (vIsPureNaval) {
+          const e = +weights["Embark"];
+          if (isFinite(e) && e > 0) nd += e;
+        }
       } else if (!uIsLandSide && !uIsPureNaval && vIsLandSide) {
-        // Naval combo at u → land-side at neighbor: blocked. Force the
-        // disembark through u's own LAND single via the intra-hex edge.
         continue;
       }
 
@@ -4056,7 +4142,14 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
       if (vHex === uHex) {
         if (uHexIsStronghold
             && !uIsLandSide && vIsLandSide
-            && ARMY_CAN_EMBARK) {
+            && ARMY_CAN_EMBARK
+            // See the matching gate in computeIsochrone — the disembark
+            // target must be the city's own SINGLE land/road component
+            // (hasCtf) AND physically reachable from a ship without
+            // skipping over an internal thick river (dockableFromNaval).
+            && !vInfo.isCombo
+            && vInfo.hasCtf
+            && vInfo.dockableFromNaval) {
           const naval_paid_now = uIsStart ? 0 : uMax;
           const dw = +weights["Disembark"] || 0;
           const nd = d + naval_paid_now + (isFinite(dw) && dw > 0 ? dw : 0);
@@ -4082,12 +4175,15 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
       // Rule set:
       //   * pure naval → land-side  : BLOCKED. The only legal
       //     disembark is the intra-hex stronghold edge above.
-      //   * land-side → any naval   : Embark fires anywhere (no
-      //     stronghold required).
-      //   * naval combo → land-side : ALSO BLOCKED at the cross-hex
-      //     level now. The army must first take the intra-hex
-      //     disembark to the stronghold's land single, THEN cross
-      //     to the neighbor. The previous shortcut let routes hop
+      //   * land-side → PURE naval  : Embark fires (army actually
+      //     boards a ship to sail through a sea hex).
+      //   * land-side → naval COMBO : NO extra Embark surcharge.
+      //     The combo's own mode-cost already includes the Embark
+      //     fee via the NAVAL constituent contribution; charging
+      //     again here would double-bill the boarding.
+      //   * naval combo → land-side : BLOCKED at cross-hex. The
+      //     intra-hex stronghold disembark above is the correct
+      //     path — the prior cross-hex shortcut let routes hop
       //     sea→neighbor-land without ever traversing the
       //     stronghold's own land subhex.
       //   * everything else (combo↔combo, combo→naval-pure,
@@ -4096,8 +4192,10 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
       if (uIsPureNaval && vIsLandSide) {
         continue;
       } else if (uIsLandSide && !vIsLandSide) {
-        const e = +weights["Embark"];
-        if (isFinite(e) && e > 0) nd += e;
+        if (vIsPureNaval) {
+          const e = +weights["Embark"];
+          if (isFinite(e) && e > 0) nd += e;
+        }
       } else if (!uIsLandSide && !uIsPureNaval && vIsLandSide) {
         continue;
       }
@@ -4859,11 +4957,22 @@ function computeSegment(wa, wb) {
     pathComponents,            // empty under mode graph; kept for compat
     modePath,                  // [[hex, mode], ...] — the actual graph path
     lineHexPath: lineMain.hexPath,
-    hexWeights: lineMain.hexWeights.size > 0 ? lineMain.hexWeights : hexWeights,
-                               // Line-derived weights for the breakdown UI
-                               // when available — falls back to dijkstra's
-                               // per-hex mode cost. Sub-threshold hexes
-                               // appear here with weight 0.
+    hexWeights: (() => {
+      // Per-hex weight for the breakdown UI. Use the CHOSEN MODE'S cost
+      // (dijkstra-derived) so a hex traversed via NAVAL through a Sea
+      // subhex of a Flatlands hex bills at 2.5 (naval speed), not at
+      // 30 (the hex's Flatlands assignment that the line briefly
+      // grazed in a land subhex). Sub-threshold hexes still reset to
+      // 0 so the "barely touched, billed free" UI tag is honoured.
+      const merged = new Map(hexWeights);   // start from djk mode costs
+      if (lineMain.subThresholdHexes) {
+        for (const subHex of lineMain.subThresholdHexes) {
+          if (subHex === wa.hexId || subHex === wb.hexId) continue;
+          merged.set(subHex, 0);
+        }
+      }
+      return merged;
+    })(),
     dijkstraHexWeights: hexWeights,
     subThresholdHexes: lineMain.subThresholdHexes,
     hexPxCount:        lineMain.pxCount,
@@ -7403,6 +7512,25 @@ function resetView() {
   view.scale = Math.min(sx, sy);
   view.x = (r.width - HEX_DATA.image_width * view.scale) / 2;
   view.y = (r.height - HEX_DATA.image_height * view.scale) / 2;
+  applyView();
+}
+// Pan the view so the given hex's centre is at the centre of the stage.
+// Keeps the current zoom level — only changes view.x / view.y. Used by
+// the per-route hex breakdown rows so clicking a hex pans to it without
+// jumping zoom level.
+function panToHex(hexId) {
+  if (!HEX_DATA || !HEX_DATA.geometry) return;
+  const cpr = HEX_DATA.cols_per_row;
+  const row = Math.floor((hexId - 1) / cpr);
+  const col = (hexId - 1) % cpr;
+  if (row < 0 || row >= HEX_DATA.rows.length || col < 0 || col >= cpr) return;
+  const g = HEX_DATA.geometry;
+  const cx0 = (row % 2 === 0) ? g.first_cx_even : g.first_cx_odd;
+  const cx = cx0 + col * g.hex_width;
+  const cy = g.first_cy + row * g.row_spacing;
+  const r = stage.getBoundingClientRect();
+  view.x = r.width  / 2 - cx * view.scale;
+  view.y = r.height / 2 - cy * view.scale;
   applyView();
 }
 function zoomAt(clientX, clientY, factor) {

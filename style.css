@@ -375,6 +375,17 @@ canvas {
   align-items: center;
   padding: 1px 0;
 }
+.route-card .hex-breakdown .hex-row.clickable {
+  cursor: pointer;
+  border-radius: 3px;
+  padding-left: 2px;
+  padding-right: 2px;
+  margin-left: -2px;
+  margin-right: -2px;
+}
+.route-card .hex-breakdown .hex-row.clickable:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
 .route-card .hex-breakdown .hex-row.is-start .hex-num,
 .route-card .hex-breakdown .hex-row.is-end   .hex-num { color: var(--accent); }
 .route-card .hex-breakdown .hex-num { color: var(--muted); text-align: right; }
