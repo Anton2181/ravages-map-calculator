@@ -2153,23 +2153,34 @@ function precomputeHexModes() {
           }
           if (isThinPix) {
             // ── Bridge detection ─────────────────────────────────────
-            // A road that physically crosses a thin river is a bridge:
-            // a real road pixel (not a city) overlaying the river's
-            // strict (1-px) core lets the column cross at road cost,
-            // no fording surcharge.
+            // Two ways a thin-river pixel can count as a bridge (road,
+            // no fording surcharge) instead of a ford:
             //
-            // STRICT_RIVER_PIXEL_MASK is the alpha>230 mask — only the
-            // painted river core, no AA halo. Using it here (instead
-            // of the expanded thin mask) keeps a road running parallel
-            // to a river along the bank from accidentally registering
-            // as a continuous bridge via AA-pixel overlap.
+            // 1) A real road (roads.png, NOT a city) overlaying the
+            //    river's strict 1-px core. STRICT_RIVER_PIXEL_MASK is
+            //    the alpha>230 mask — only the painted river core, no
+            //    AA halo. The strict-core check keeps a road running
+            //    parallel to the river along the bank from accidentally
+            //    registering as a continuous bridge through AA overlap.
             //
-            // Road-only (no ctf) for the same reason ferries are: a
-            // city sitting on a river isn't a bridge, only a road
-            // overlay drawn by the artist counts.
+            // 2) ANY ctf pixel (city / town / fort) that overlaps a
+            //    thin river — halo OR strict core. The assumption is
+            //    that a settlement straddling a river has bridges
+            //    built into its streets; the entire city footprint
+            //    should travel at road cost. Without this, a city
+            //    straddling a stream got split across road subhexes
+            //    and a ford subhex along the river line.
+            //
+            // ctf gets the looser rule (no strict-core requirement)
+            // because a city's own footprint is meaningful even at the
+            // edges, while a road's AA halo is just artwork bleed.
             const isRoadOnlyPix = !!(roadOnlyMask && roadOnlyMask[p]);
+            // ctf = in the full road mask (roads ∪ ctf) but NOT in the
+            // roads-only mask. Pixels that are both road AND ctf still
+            // satisfy isRoadOnlyPix; the strict-core path handles them.
+            const isCtfPix = isRoadPix && !isRoadOnlyPix;
             const isStrictRiverCore = !!(STRICT_RIVER_PIXEL_MASK && STRICT_RIVER_PIXEL_MASK[p]);
-            if (isRoadOnlyPix && isStrictRiverCore) {
+            if ((isRoadOnlyPix && isStrictRiverCore) || isCtfPix) {
               landSet.add(p);
               if (roadAccepted) roadSet.add(p);
               continue;
@@ -2216,6 +2227,89 @@ function precomputeHexModes() {
         }
       }
     }
+    // ── Bridge small road↔ferry / road↔ford gaps ───────────────────
+    // Sometimes the artist's road stops a pixel or two short of the
+    // river it's crossing. Without bridging, roadSet and the target
+    // river bucket (ferrySet for thick / ford for thin) flood-fill as
+    // two disconnected blobs and the ROAD+ROAD_FERRY / ROAD+FORD combo
+    // gets pruned or splits — forcing the army onto the more expensive
+    // LAND+… combo, or failing to route at all.
+    //
+    // For each road pixel, check a small chebyshev neighbourhood for
+    // a target pixel. If one is within MIN_MODE_COMPONENT_PIXELS steps
+    // but isn't directly adjacent (gap ≥ 2), Bresenham-line from the
+    // road pixel to the closest target pixel and add the intermediate
+    // pixels to roadSet — they're now part of the road bucket, so the
+    // combo's union 8-connects across.
+    //
+    // Safety: a bridge that would pass through thick river or naval
+    // pixels is abandoned (no inventing roads across open water).
+    // Bridges over land / thin-river pixels are fine.
+    const bridgeRoadToBucket = (target) => {
+      if (target.size === 0 || roadSet.size === 0) return;
+      if (!SUBHEX_ID_IMG_DATA || !THICK_RIVER_PIXEL_MASK) return;
+      const W = SUBHEX_ID_IMG_DATA.width;
+      const GAP = MIN_MODE_COMPONENT_PIXELS;          // chebyshev max gap
+      const thick = THICK_RIVER_PIXEL_MASK;
+      const bridgePixels = [];
+      for (const r of roadSet) {
+        const ry = (r / W) | 0;
+        const rx = r - ry * W;
+        // Find the closest target pixel within a (2*GAP+1)² window.
+        let bestT = -1, bestD = Infinity;
+        for (let dy = -GAP; dy <= GAP; dy++) {
+          for (let dx = -GAP; dx <= GAP; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const py = ry + dy;
+            const px = rx + dx;
+            if (px < 0 || py < 0 || px >= W) continue;
+            const idx = py * W + px;
+            if (!target.has(idx)) continue;
+            const d = Math.max(Math.abs(dx), Math.abs(dy));
+            if (d < bestD) { bestD = d; bestT = idx; }
+            if (bestD === 1) break;
+          }
+          if (bestD === 1) break;
+        }
+        if (bestT < 0 || bestD <= 1 || bestD > GAP) continue;
+        // Bresenham from (rx, ry) to the target pixel. Collect
+        // intermediate pixels (excluding the endpoints — r is already
+        // in roadSet and bestT is in the target bucket). Abandon if
+        // any intermediate pixel sits on thick river or naval.
+        const ty = (bestT / W) | 0;
+        const tx = bestT - ty * W;
+        const dxAbs = Math.abs(tx - rx), dyAbs = Math.abs(ty - ry);
+        const sx = rx < tx ? 1 : -1, sy = ry < ty ? 1 : -1;
+        let x = rx | 0, y = ry | 0, err = dxAbs - dyAbs;
+        const segment = [];
+        let aborted = false;
+        while (x !== tx || y !== ty) {
+          const e2 = err * 2;
+          if (e2 > -dyAbs) { err -= dyAbs; x += sx; }
+          if (e2 <  dxAbs) { err += dxAbs; y += sy; }
+          if (x === tx && y === ty) break;       // reached target endpoint
+          const idx = y * W + x;
+          if (thick[idx] || navalSet.has(idx)) { aborted = true; break; }
+          segment.push(idx);
+        }
+        if (aborted) continue;
+        for (const idx of segment) bridgePixels.push(idx);
+      }
+      for (const p of bridgePixels) {
+        // Lift the pixel out of competing buckets so the road bucket's
+        // flood-fill isn't fighting another bucket for the same pixel.
+        // fordSet is the only realistic conflict (a thin river crossing
+        // the road's approach); converting it to road effectively adds
+        // a tiny bridge there — fine, matches the ctf-on-thin-river
+        // rule we already use.
+        if (fordSet.has(p)) fordSet.delete(p);
+        roadSet.add(p);
+        landSet.add(p);
+      }
+    };
+    bridgeRoadToBucket(ferrySet);
+    bridgeRoadToBucket(fordSet);
+    bridgeRoadToBucket(navalSet);
     // fordSet: every thin-river pixel of the hex (any hex).
 
     const hexModes = new Map();
@@ -3320,20 +3414,55 @@ function computeIsochrone() {
   const srcModes = HEX_MODES.get(srcHex);
   if (!srcModes) return;
 
+  // Pixel index of the clicked subhex's centroid — used both to filter
+  // the source-seeded modes (so dijkstra doesn't free-start from a mode
+  // on the wrong side of the source hex, like LAND when the user
+  // clicked a sea subhex) and as a "you are here" guarantee at the end.
+  const Wsub = SUBHEX_ID_IMG_DATA ? SUBHEX_ID_IMG_DATA.width : 0;
+  const srcPixIdx = (Wsub > 0 && sub.centroid)
+    ? ((sub.centroid[1] | 0) * Wsub + (sub.centroid[0] | 0))
+    : null;
+  const modeContainsPixel = (info, idx) => {
+    if (idx == null) return true;
+    const pxs = info.pixels;
+    for (let i = 0; i < pxs.length; i++) if (pxs[i] === idx) return true;
+    return false;
+  };
+
   // Per-(hex, mode) cost-to-reach. distHex is the projected per-hex
-  // minimum across modes — used both for the heap-pop staleness check
-  // and as the final reached-hex set.
+  // minimum across modes — used for the heap-pop staleness check.
   const distMode = new Map();
   const distHex  = new Map();
   const heap = new MinHeap();
 
-  // Seed every mode of the source hex at cost 0 (free start, same as
-  // route pathfinding).
+  // ── SOURCE SEEDING ──────────────────────────────────────────────────
+  // Restrict the cost-0 seed to modes whose pixel set contains the
+  // clicked subhex's centroid. Without this, EVERY mode of the source
+  // hex would start for free — a naval army clicked on the sea subhex
+  // of a coastal hex would also free-start its LAND mode, and the
+  // overlay would then paint the land subhex of the source hex.
+  // Mirrors the modeContainsPixel filter dijkstraHexModePath applies at
+  // its start.
+  let seeded = 0;
   for (const [mName, mInfo] of srcModes) {
     if (!mInfo || !isFinite(mInfo.cost) || mInfo.cost < 0) continue;
+    if (!modeContainsPixel(mInfo, srcPixIdx)) continue;
     const key = `${srcHex}:${mName}`;
     distMode.set(key, 0);
     heap.push([0, key, srcHex, mName]);
+    seeded++;
+  }
+  // Fallback for the (rare) case where the centroid pixel doesn't sit
+  // in any mode — e.g. it landed on a thick-river pixel of a subhex
+  // that's otherwise empty. Seed every mode so the user at least gets
+  // SOME reachability rather than a silent zero-mask.
+  if (seeded === 0) {
+    for (const [mName, mInfo] of srcModes) {
+      if (!mInfo || !isFinite(mInfo.cost) || mInfo.cost < 0) continue;
+      const key = `${srcHex}:${mName}`;
+      distMode.set(key, 0);
+      heap.push([0, key, srcHex, mName]);
+    }
   }
   distHex.set(srcHex, 0);
 
@@ -3347,38 +3476,64 @@ function computeIsochrone() {
     const neighbors = HEX_MODE_NEIGHBORS.get(uKey);
     if (!neighbors) continue;
 
+    const uIsPureNaval = modeIsPureNaval(uInfo);
+    const uIsLandSide  = !uIsNaval;
+    const uHexIsStronghold = !!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(uHex));
+
     for (const vKey of neighbors) {
       const colon = vKey.indexOf(":");
       const vHex  = +vKey.slice(0, colon);
       const vMode = vKey.slice(colon + 1);
-      // Intra-hex transitions are free under the mode-graph cost model
-      // (the cost of being IN a hex was already paid on entry). Skip
-      // them — we only care about reaching NEW hexes here.
-      if (vHex === uHex) continue;
       const vInfo = HEX_MODES.get(vHex)?.get(vMode);
       if (!vInfo || !isFinite(vInfo.cost) || vInfo.cost < 0) continue;
+      const vIsNaval     = modeIsNaval(vInfo);
+      const vIsPureNaval = modeIsPureNaval(vInfo);
+      const vIsLandSide  = !vIsNaval;
 
+      // ── INTRA-HEX TRANSITIONS ─────────────────────────────────────
+      // Normally skipped — the cost of being IN a hex was already paid
+      // on entry, and dijkstra is supposed to "pick one mode per hex".
+      // ONE exception: at a stronghold, naval-side → land-side is the
+      // DISEMBARK transition. The army stops being a ship-in-port and
+      // becomes a land column standing on the stronghold's land subhex.
+      // Pays the Disembark surcharge plus the land mode's cost (which
+      // is the cost of actually being on land in this hex). Without
+      // this edge, the stronghold's LAND mode would never enter the
+      // graph from a naval approach — the only way it'd light up is
+      // as a back-step from a neighbor's LAND, which is the exact bug
+      // the user saw ("neighbor land subhexes paint first, stronghold
+      // land subhex only later").
+      if (vHex === uHex) {
+        if (uHexIsStronghold
+            && !uIsLandSide && vIsLandSide
+            && ARMY_CAN_EMBARK) {
+          let nd = d + vInfo.cost;
+          const dw = +weights["Disembark"] || 0;
+          if (isFinite(dw) && dw > 0) nd += dw;
+          if (nd > ISOCHRONE_BUDGET) continue;
+          if (nd < (distMode.get(vKey) ?? Infinity)) {
+            distMode.set(vKey, nd);
+            heap.push([nd, vKey, vHex, vMode]);
+            if (nd < (distHex.get(vHex) ?? Infinity)) distHex.set(vHex, nd);
+          }
+        }
+        continue;
+      }
+
+      // ── CROSS-HEX TRANSITIONS ─────────────────────────────────────
       // Entering v pays v's mode cost. Land/road/ford/ferry/naval costs
-      // are all already baked into vInfo.cost for the active variant
-      // (HEX_MODES is whichever HEX_MODES_VARIANTS entry matches the
-      // current ARMY_CAN_FORD / ARMY_CAN_EMBARK flags).
+      // are all already baked into vInfo.cost for the active variant.
       let nd = d + vInfo.cost;
 
-      // Naval-boundary surcharges. Embark fires on land→naval crossings
-      // (boarding a ship), Disembark on naval→land (and only at hexes
-      // with a Stronghold). ARMY_CAN_EMBARK is enforced both here AND
-      // upstream (NAVAL modes don't even exist in the active variant
-      // when the flag is off), but the runtime check stays as a
-      // belt-and-braces guard for the no-NAVAL-modes-but-still-traversal
-      // edge case.
-      const vIsNaval = modeIsNaval(vInfo);
-      // Mirror the dijkstra rule set. Pure naval → land blocked;
-      // any land → naval pays Embark; combo → land requires the
-      // combo's hex to be a stronghold.
-      const uIsPureNaval = modeIsPureNaval(uInfo);
-      const vIsPureNaval = modeIsPureNaval(vInfo);
-      const uIsLandSide  = !uIsNaval;
-      const vIsLandSide  = !vIsNaval;
+      // Naval-boundary surcharges.
+      //   * pure naval → land-side cross-hex: blocked. The only legal
+      //     disembark is the intra-hex stronghold edge above.
+      //   * land-side → any naval: Embark fires anywhere (no
+      //     stronghold required, as on the path-finding side).
+      //   * naval combo → land-side cross-hex: ALSO blocked now. The
+      //     prior rule "combo→neighbor-land at stronghold" let dijkstra
+      //     skip over the stronghold's own land subhex entirely; the
+      //     intra-hex disembark above is the correct path.
       if (uIsPureNaval && vIsLandSide) {
         continue;
       } else if (uIsLandSide && !vIsLandSide) {
@@ -3386,9 +3541,9 @@ function computeIsochrone() {
         const e = +weights["Embark"];
         if (isFinite(e) && e > 0) nd += e;
       } else if (!uIsLandSide && !uIsPureNaval && vIsLandSide) {
-        if (!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(uHex))) continue;
-        const dw = +weights["Disembark"] || 0;
-        if (isFinite(dw) && dw > 0) nd += dw;
+        // Naval combo at u → land-side at neighbor: blocked. Force the
+        // disembark through u's own LAND single via the intra-hex edge.
+        continue;
       }
 
       if (nd > ISOCHRONE_BUDGET) continue;
@@ -3400,13 +3555,71 @@ function computeIsochrone() {
     }
   }
 
-  // distHex is the reachable set. Project to subhexes for the overlay.
+  // Project the reached (hex, mode) set to subhexes via each mode's
+  // pixel set. distHex is the union over modes per hex — same set as
+  // before, used as isochroneHexIds. The subhex mask is derived from
+  // the PIXELS dijkstra was able to traverse, not from "every subhex
+  // of every touched hex".
+  //
+  // Per-hex priority: single-kind modes first, combos only as a fallback.
+  // A single mode's pixel set is BY CONSTRUCTION restricted to one kind
+  // (LAND mode = land pixels only, NAVAL = naval pixels only, etc.), so
+  // projecting it lights up exactly the right subhexes. A combo mode's
+  // pixel set straddles multiple kinds — LAND+NAVAL spans the whole
+  // coastal hex, ROAD+ROAD_FERRY spans road-on-banks + the river pixels,
+  // and so on. If a single-kind mode of the SAME hex is also reached,
+  // its pixels already cover the kind(s) the army actually traversed —
+  // projecting the combo on top would re-include the OTHER constituent's
+  // pixels (the land side, for a LAND+NAVAL we entered naval-first),
+  // bleeding the fill into subhexes the army can't actually occupy
+  // ("filled the rest of the hex but didn't leave it" — what we saw
+  // when a naval army reached a coastal hex via the LAND+NAVAL combo
+  // for free). Combos are still projected when they're the ONLY way a
+  // hex was reached — e.g. a road that only crosses via ROAD+ROAD_FERRY
+  // — otherwise the hex would silently drop out of the mask.
   const reached = new Set(distHex.keys());
   isochroneHexIds = reached;
   const subSet = new Set();
-  for (const hid of reached) {
-    for (const s of (SUBHEXES_BY_HEX.get(hid) || [])) subSet.add(s.id);
+  if (SUBHEX_ID_PX) {
+    const singlesByHex = new Map();   // hex -> array of single-kind infos
+    const combosByHex  = new Map();   // hex -> array of combo infos
+    for (const key of distMode.keys()) {
+      const colon = key.indexOf(":");
+      const hid   = +key.slice(0, colon);
+      const mName = key.slice(colon + 1);
+      const info  = HEX_MODES.get(hid)?.get(mName);
+      if (!info || !info.pixels) continue;
+      const bucket = info.isCombo ? combosByHex : singlesByHex;
+      let list = bucket.get(hid);
+      if (!list) { list = []; bucket.set(hid, list); }
+      list.push(info);
+    }
+    const addPixels = (info) => {
+      const pxs = info.pixels;
+      for (let i = 0; i < pxs.length; i++) {
+        const sid = SUBHEX_ID_PX[pxs[i]];
+        if (sid) subSet.add(sid);
+      }
+    };
+    for (const hid of reached) {
+      const singles = singlesByHex.get(hid);
+      if (singles && singles.length > 0) {
+        for (const info of singles) addPixels(info);
+        continue;
+      }
+      const combos = combosByHex.get(hid);
+      if (combos) for (const info of combos) addPixels(info);
+    }
+  } else {
+    // No subhex pixel map yet — fall back to the old whole-hex fill.
+    for (const hid of reached) {
+      for (const s of (SUBHEXES_BY_HEX.get(hid) || [])) subSet.add(s.id);
+    }
   }
+  // Always include the clicked subhex itself as a "you are here" marker,
+  // even if the centroid sat on a thick-river pixel and no mode's pixel
+  // set actually covers it.
+  subSet.add(isochroneSourceId);
   isochroneSubhexIds = subSet;
 }
 
@@ -3700,6 +3913,10 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
 
     const uIsNaval = modeIsNaval(uInfo);
 
+    const uIsPureNaval = modeIsPureNaval(uInfo);
+    const uIsLandSide  = !uIsNaval;
+    const uHexIsStronghold = !!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(uHex));
+
     for (const vKey of neighbors) {
       const colonV = vKey.indexOf(":");
       const vHex = +vKey.slice(0, colonV);
@@ -3713,17 +3930,51 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
       // hex via the pinned mode (or fail).
       const vOverride = HEX_MODE_OVERRIDES.get(vHex);
       if (vOverride && vMode !== vOverride) continue;
-      const vIsNaval = modeIsNaval(vInfo);
+      const vIsNaval     = modeIsNaval(vInfo);
+      const vIsPureNaval = modeIsPureNaval(vInfo);
+      const vIsLandSide  = !vIsNaval;
 
-      // ── ONE MODE PER HEX ──
-      // Intra-hex transitions (vHex === uHex) are disabled. Every hex
-      // must be entered AND exited via the same mode. Multi-kind
-      // traversal within a hex has to use a combo mode that bundles
-      // the relevant kinds + their sum-cost. Without this skip,
-      // dijkstra would chain singletons via free intra-hex moves and
-      // the cheapest path would routinely pick multiple modes per
-      // hex, defeating the "one picked mode per hex" rule.
-      if (vHex === uHex) continue;
+      // ── INTRA-HEX TRANSITIONS ────────────────────────────────────
+      // Normally disabled — every hex must be entered and exited via
+      // the same mode, and multi-kind traversal within a hex is
+      // represented by a combo. ONE exception: at a stronghold, an
+      // intra-hex naval-side → land-side step IS the disembark.
+      // The army was at the dock as a ship, now it's a column on
+      // the stronghold's land subhex.
+      //
+      // Cost accounting: pay this hex's naval mode-cost (uMax) NOW
+      // — it would otherwise have been paid on cross-hex exit — plus
+      // the Disembark surcharge. Then reset the running max to v's
+      // land cost, which will be paid on the next cross-hex exit.
+      // Total in-hex cost = naval + disembark + land, same as the
+      // old "LAND+NAVAL combo + disembark-on-exit-to-neighbor" path,
+      // but the army now visibly traverses the stronghold's own
+      // LAND single — line A* draws through both subhexes, and
+      // isochrone reachability lands on the stronghold's land
+      // subhex before any neighbor's.
+      //
+      // Start-hex forgiveness: if uIsStart, uMax is forgiven (the
+      // start hex's mode cost is free) but the Disembark surcharge
+      // still fires. uIsStart is preserved into the new state — we
+      // haven't physically left the start hex yet.
+      if (vHex === uHex) {
+        if (uHexIsStronghold
+            && !uIsLandSide && vIsLandSide
+            && ARMY_CAN_EMBARK) {
+          const naval_paid_now = uIsStart ? 0 : uMax;
+          const dw = +weights["Disembark"] || 0;
+          const nd = d + naval_paid_now + (isFinite(dw) && dw > 0 ? dw : 0);
+          const nMax = vInfo.cost;
+          const nStateKey = `${vKey}|${nMax}`;
+          if (nd < (dist.get(nStateKey) ?? Infinity)) {
+            dist.set(nStateKey, nd);
+            prev.set(nStateKey, uStateKey);
+            heap.push([nd, vKey, nMax, uHex, uIsStart]);
+          }
+        }
+        continue;
+      }
+
       // Cross-hex transition. Pay leaving hex's running max (0 if we
       // never left start), reset to v's mode cost.
       const close = uIsStart ? 0 : uMax;
@@ -3734,33 +3985,25 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
       // ── Naval boundary ──
       // Rule set:
       //   * pure naval → land-side  : BLOCKED. The only legal
-      //     disembark is through a LAND+NAVAL combo at a stronghold.
+      //     disembark is the intra-hex stronghold edge above.
       //   * land-side → any naval   : Embark fires anywhere (no
-      //     stronghold required). Covers both direct land→naval
-      //     cross-hex edges AND the land→combo entry path.
-      //   * combo → land-side       : Disembark, ONLY if the combo
-      //     hex (uHex) carries the Stronghold flag. Pays the
-      //     Disembark surcharge if any.
+      //     stronghold required).
+      //   * naval combo → land-side : ALSO BLOCKED at the cross-hex
+      //     level now. The army must first take the intra-hex
+      //     disembark to the stronghold's land single, THEN cross
+      //     to the neighbor. The previous shortcut let routes hop
+      //     sea→neighbor-land without ever traversing the
+      //     stronghold's own land subhex.
       //   * everything else (combo↔combo, combo→naval-pure,
       //     naval-pure→combo, naval-pure→naval-pure) : no boundary
-      //     surcharge; the combo's own mode-cost already paid for
-      //     the transition.
-      const uIsPureNaval = modeIsPureNaval(uInfo);
-      const vIsPureNaval = modeIsPureNaval(vInfo);
-      const uIsLandSide  = !uIsNaval;
-      const vIsLandSide  = !vIsNaval;
+      //     surcharge.
       if (uIsPureNaval && vIsLandSide) {
-        // Pure naval → land-side: blocked outright.
         continue;
       } else if (uIsLandSide && !vIsLandSide) {
-        // Land-side → naval (pure OR combo): Embark fires anywhere.
         const e = +weights["Embark"];
         if (isFinite(e) && e > 0) nd += e;
       } else if (!uIsLandSide && !uIsPureNaval && vIsLandSide) {
-        // Combo → land-side: only at strongholds (combo hex = port).
-        if (!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(uHex))) continue;
-        const dw = +weights["Disembark"] || 0;
-        if (isFinite(dw) && dw > 0) nd += dw;
+        continue;
       }
 
       const nStateKey = `${vKey}|${nMax}`;
@@ -5319,18 +5562,43 @@ function routeLineFromModes(modePath, startPt, endPt, debugSink) {
         continue;
       }
 
-      // Stronghold combo (LAND+NAVAL or any NAVAL+non-NAVAL mix) on
-      // the modePath: drop an invisible waypoint at the city-pixel
+      // Stronghold-disembark waypoint — drop one at the city-pixel
       // centroid so the rendered line actually visits the port the
       // army is disembarking at. "City pixels" are the citiestownsforts
       // (ctf) layer alone — ROAD_PIXEL_MASK minus ROAD_ONLY_PIXEL_MASK
       // — so the line snaps to the city, not the road infrastructure
       // around it.
+      //
+      // Fires for EITHER signature of a stronghold disembark:
+      //   (a) A mixed combo (LAND+NAVAL or NAVAL+other) picked at the
+      //       stronghold — the legacy combo-disembark encoding.
+      //   (b) The same hex appearing in modePath with BOTH a naval-side
+      //       and a land-side mode — the new intra-hex disembark encoding
+      //       (NAVAL(X) → LAND(X) intra-hex at stronghold).
       const isMixedCombo = info.kinds
         && info.kinds.indexOf("NAVAL") >= 0
         && info.kinds.some(k => k !== "NAVAL");
       const isStronghold = !!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(hex));
-      if (isMixedCombo && isStronghold && ROAD_PIXEL_MASK) {
+      let hasIntraHexDisembark = false;
+      if (isStronghold && !isMixedCombo) {
+        // Look for a different mode at the same hex of the opposite
+        // side (naval vs land). One match in either direction is enough.
+        const thisIsNaval = modeIsNaval(info);
+        for (let mj = 0; mj < modePath.length; mj++) {
+          if (mj === mi) continue;
+          const [hex2, mode2] = modePath[mj];
+          if (hex2 !== hex) continue;
+          const info2 = HEX_MODES.get(hex2)?.get(mode2);
+          if (!info2) continue;
+          if (modeIsNaval(info2) !== thisIsNaval) { hasIntraHexDisembark = true; break; }
+        }
+      }
+      // Dedupe via hexIdx: if both modes at the same hex would emit a
+      // waypoint, only emit for the first one encountered.
+      const alreadyEmitted = markWaypoints.some(w => w.hexIdx != null
+        && modePath[w.hexIdx] && modePath[w.hexIdx][0] === hex);
+      if ((isMixedCombo || hasIntraHexDisembark) && isStronghold
+          && !alreadyEmitted && ROAD_PIXEL_MASK) {
         let sumX = 0, sumY = 0, count = 0;
         for (let i = 0; i < hexAllPx.length; i++) {
           const p = hexAllPx[i];
