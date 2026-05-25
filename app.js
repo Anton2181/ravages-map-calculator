@@ -2309,7 +2309,74 @@ function precomputeHexModes() {
     };
     bridgeRoadToBucket(ferrySet);
     bridgeRoadToBucket(fordSet);
-    bridgeRoadToBucket(navalSet);
+    // ── Stronghold city-subhex promotion ────────────────────────────
+    // At stronghold hexes, promote every non-naval / non-thick-river
+    // pixel of the SUBHEX(es) containing ctf (city) pixels into the
+    // road bucket. The ROAD+NAVAL combo's pixel union then covers the
+    // whole city subhex + the hex's naval pixels, so the army can
+    // embark/disembark across the city's full footprint — no need for
+    // fragile gap-bridging that picked the wrong naval body. The
+    // rendered line is independently snapped to the city-pixel
+    // centroid by markWaypoints (the "fake waypoint" snap), so the
+    // visible route still goes THROUGH the actual painted city even
+    // when the road component itself is tiny relative to the subhex.
+    //
+    // Replaces the old road↔naval bridgeRoadToBucket pass, which
+    // would Bresenham-line to whichever naval pixel was nearest —
+    // sometimes landing on an unrelated naval body in the hex.
+    // Pixels added to roadSet by the stronghold promotion below. These
+    // get a SPECIAL treatment in emitComponents — they're part of the
+    // ROAD mode's pixel list (so combo unions include them and a click
+    // on a city subhex still resolves through ROAD/combo modes) but
+    // their PIX_MODE_KIND stamp is preserved as LAND. That way
+    // precomputeHexModeNeighbors doesn't see them as ROAD when scanning
+    // hex boundaries, so cross-hex ROAD↔ROAD edges only form via
+    // painted road artwork — the user's complaint was that promoting
+    // the whole city subhex caused fake ROAD edges to neighbors whose
+    // painted roads didn't actually reach this hex.
+    const cityPromotedPixels = new Set();
+    const isStronghold = !!(HEX_STRONGHOLD && HEX_STRONGHOLD.get(hid));
+    if (isStronghold && ROAD_PIXEL_MASK && SUBHEX_COMPONENT_PIXELS) {
+      const ctfOnlyMask = ROAD_PIXEL_MASK;
+      const roadsOnly   = ROAD_ONLY_PIXEL_MASK || ROAD_PIXEL_MASK;
+      const thick       = THICK_RIVER_PIXEL_MASK;
+      for (const sub of subs) {
+        if (WATER_TERRAINS.has(sub.class)) continue;
+        const compCount = SUBHEX_COMPONENT_COUNT.get(sub.id) || 0;
+        // First sweep: does this subhex contain a ctf pixel?
+        // ctf = in ROAD_PIXEL_MASK (roads ∪ ctf) but NOT in roads-only.
+        let hasCtf = false;
+        for (let comp = 1; comp <= compCount && !hasCtf; comp++) {
+          const pixels = SUBHEX_COMPONENT_PIXELS.get(`${sub.id}:${comp}`);
+          if (!pixels) continue;
+          for (let pi = 0; pi < pixels.length; pi++) {
+            const p = pixels[pi];
+            if (ctfOnlyMask[p] && !roadsOnly[p]) { hasCtf = true; break; }
+          }
+        }
+        if (!hasCtf) continue;
+        // Second sweep: promote the subhex's non-naval, non-thick-river
+        // pixels into roadSet (and landSet, defensively — pure-land
+        // pixels are already there). Naval and thick-river pixels are
+        // left alone; the combo's union picks them up via navalSet /
+        // ferrySet as appropriate. Track every pixel we ADD to roadSet
+        // (skip pixels that were already there — those are real road
+        // artwork and should keep their ROAD stamp).
+        for (let comp = 1; comp <= compCount; comp++) {
+          const pixels = SUBHEX_COMPONENT_PIXELS.get(`${sub.id}:${comp}`);
+          if (!pixels) continue;
+          for (let pi = 0; pi < pixels.length; pi++) {
+            const p = pixels[pi];
+            if (thick && thick[p]) continue;
+            if (navalSet.has(p))    continue;
+            if (roadSet.has(p))     continue;  // already real road, leave alone
+            roadSet.add(p);
+            landSet.add(p);
+            cityPromotedPixels.add(p);
+          }
+        }
+      }
+    }
     // fordSet: every thin-river pixel of the hex (any hex).
 
     const hexModes = new Map();
@@ -2319,7 +2386,7 @@ function precomputeHexModes() {
     // `${kind}#${idx}`. This is what fixes thick-river-split land: the
     // two halves end up as LAND#0 and LAND#1 with no in-hex edge between
     // them, so dijkstra has to go around (or via a ROAD_FERRY mode).
-    const emitComponents = (kindName, bucket, cost, isFerry) => {
+    const emitComponents = (kindName, bucket, cost, isFerry, noStampSet) => {
       if (bucket.size === 0 || !isFinite(cost)) return;
       const kindNum = MODE_KIND_NUMS[kindName];
       // Land-side modes treat naval pixels as flood-fill separators
@@ -2341,15 +2408,23 @@ function precomputeHexModes() {
         });
         // Stamp per-pixel lookup so precomputeHexModeNeighbors and
         // hexModeAtPixel can resolve "what mode owns this pixel" in O(1).
+        // noStampSet pixels are still part of this component's pixel
+        // list (so combos see them and modeContainsPixel finds them),
+        // but their PIX_MODE_KIND stamp is preserved as the kind that
+        // emitted earlier — used for city-promoted pixels at strongholds
+        // so cross-hex ROAD edges don't form through them when the
+        // painted road artwork doesn't actually reach the hex boundary.
         for (let i = 0; i < pixels.length; i++) {
-          PIX_MODE_KIND[pixels[i]] = kindNum;
-          PIX_MODE_COMP[pixels[i]] = ci;
+          const p = pixels[i];
+          if (noStampSet && noStampSet.has(p)) continue;
+          PIX_MODE_KIND[p] = kindNum;
+          PIX_MODE_COMP[p] = ci;
         }
       }
     };
 
     emitComponents("LAND", landSet, hexW, false);
-    emitComponents("ROAD", roadSet, roadW, false);
+    emitComponents("ROAD", roadSet, roadW, false, cityPromotedPixels);
     const isHexNaval = hexT && WATER_TERRAINS.has(hexT);
     const navalW = isHexNaval ? hexW : +weights["Sea"];
     // Naval modes are gated on ARMY_CAN_EMBARK — when off, the army
@@ -4863,6 +4938,17 @@ function computeRouteTotals(route) {
   };
   if (route.waypoints.length === 0) { totals.reachable = true; return totals; }
   const fullHexSeq = [];
+  // Unified per-hex weight map across ALL segments. A hex shared by two
+  // consecutive segments (end of seg N = start of seg N+1) must contribute
+  // its weight to the total exactly ONCE, regardless of how the user split
+  // the route into waypoints. The previous "totals.cost += seg.cost" model
+  // double-counted at every internal waypoint: dijkstra paid the goal hex
+  // in segment N AND, when the next segment's dijkstra picked a different
+  // mode for the same hex as a start (combo vs single, etc.), the cost
+  // contribution drifted away from what a single end-to-end dijkstra
+  // would have charged. The user observed this as a ~2× IRL Time
+  // inflation on an 8-waypoint route vs the same path with 2 waypoints.
+  const hexWeightMap = new Map();
   for (const seg of route.segments) {
     if (!seg.reachable) totals.reachable = false;
     for (const hid of seg.hexIds) {
@@ -4870,7 +4956,18 @@ function computeRouteTotals(route) {
         fullHexSeq.push(hid);
       }
     }
-    totals.cost    += seg.cost;
+    if (seg.hexWeights) {
+      for (const [hid, w] of seg.hexWeights) {
+        if (!isFinite(w)) continue;
+        const prev = hexWeightMap.get(hid);
+        // Take the MAX weight reported by any segment for this hex —
+        // mirrors dijkstra's running-max accounting (the hex's
+        // contribution is the heaviest mode used in it). Sub-threshold
+        // hexes report weight 0, so a real-weight from another segment
+        // still wins.
+        if (prev == null || w > prev) hexWeightMap.set(hid, w);
+      }
+    }
     totals.embarks += seg.embarks;
     totals.ferries += (seg.ferries || 0);
   }
@@ -4882,6 +4979,38 @@ function computeRouteTotals(route) {
   const allSubhexes = new Set();
   for (const seg of route.segments) for (const sid of seg.subhexIds) allSubhexes.add(sid);
   totals.subhexes = allSubhexes.size;
+  // Hex-weight total: sum every hex in the deduped sequence EXCEPT the
+  // very first (the route's overall start hex, which dijkstra also
+  // forgives). Then add boundary surcharges (Embark fires once per
+  // land↔naval crossing, Ferry once per ferry hex traversal). This
+  // matches what a single end-to-end dijkstra would optimise over and
+  // is invariant to how the user split the route into waypoints.
+  let costAcc = 0;
+  for (let i = 1; i < fullHexSeq.length; i++) {
+    const w = hexWeightMap.get(fullHexSeq[i]);
+    if (isFinite(w)) costAcc += w;
+  }
+  const embarkW = +weights["Embark"] || 0;
+  const ferryW  = +weights["Ferry"]  || 0;
+  if (isFinite(embarkW) && embarkW > 0) costAcc += totals.embarks * embarkW;
+  if (isFinite(ferryW)  && ferryW  > 0) costAcc += totals.ferries * ferryW;
+  // Same-hex segments don't populate hexWeights (their hex's cost was
+  // already paid by whatever cross-hex segment owned that hex, OR by
+  // a sibling same-hex segment). What they DO carry that isn't in
+  // hexWeights is the combo surcharge — a same-hex FORD/ROAD_FERRY
+  // traversal pays the Fording/Ferry weight as part of the combo's
+  // mode cost, which the old code recorded in seg.cost. Re-add that
+  // here so a same-hex ferry/ford crossing inside a multi-waypoint
+  // route still bills correctly. The Embark/Ferry surcharge portion
+  // of seg.cost is already covered above via totals.embarks /
+  // totals.ferries, so subtract it out before re-adding.
+  for (const seg of route.segments) {
+    if (!seg.sameHex) continue;
+    const ec = (seg.embarks || 0) * embarkW + (seg.ferries || 0) * ferryW;
+    const extra = (seg.cost || 0) - ec;
+    if (isFinite(extra) && extra > 0) costAcc += extra;
+  }
+  totals.cost = costAcc;
   for (const hid of fullHexSeq) {
     const terrain = HEX_TERRAIN ? HEX_TERRAIN.get(hid) : null;
     if (terrain) totals.byTerrain[terrain] = (totals.byTerrain[terrain] || 0) + 1;
