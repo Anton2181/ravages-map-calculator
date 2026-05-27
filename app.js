@@ -3887,6 +3887,29 @@ function computeIsochrone() {
             if (nd < (distHex.get(vHex) ?? Infinity)) distHex.set(vHex, nd);
           }
         }
+        // Intra-hex EMBARK — mirror of the disembark above. Boarding
+        // a ship is now stronghold-gated like disembarking. Source
+        // mode must be a SINGLE LAND/ROAD with hasCtf + dockableFromNaval
+        // (we're embarking from the city's own land at its dock); target
+        // mode must be a NAVAL single. Cost = naval mode's cost +
+        // Embark surcharge.
+        if (uHexIsStronghold
+            && uIsLandSide && !vIsLandSide
+            && vIsPureNaval
+            && ARMY_CAN_EMBARK
+            && !uInfo.isCombo
+            && uInfo.hasCtf
+            && uInfo.dockableFromNaval) {
+          let nd = d + vInfo.cost;
+          const e = +weights["Embark"] || 0;
+          if (isFinite(e) && e > 0) nd += e;
+          if (nd > ISOCHRONE_BUDGET) continue;
+          if (nd < (distMode.get(vKey) ?? Infinity)) {
+            distMode.set(vKey, nd);
+            heap.push([nd, vKey, vHex, vMode]);
+            if (nd < (distHex.get(vHex) ?? Infinity)) distHex.set(vHex, nd);
+          }
+        }
         continue;
       }
 
@@ -3895,28 +3918,12 @@ function computeIsochrone() {
       // are all already baked into vInfo.cost for the active variant.
       let nd = d + vInfo.cost;
 
-      // Naval-boundary surcharges.
-      //   * pure naval → land-side cross-hex: blocked. The only legal
-      //     disembark is the intra-hex stronghold edge above.
-      //   * land-side → PURE naval: Embark fires anywhere (no
-      //     stronghold required, as on the path-finding side).
-      //   * land-side → naval COMBO: NO extra Embark surcharge —
-      //     the combo's own mode-cost includes the Embark fee as the
-      //     NAVAL constituent contribution. Charging again here would
-      //     double-bill the boarding.
-      //   * naval combo → land-side cross-hex: blocked. The prior rule
-      //     let routes hop sea→neighbor-land without traversing the
-      //     stronghold's own land subhex; intra-hex disembark above is
-      //     the correct path.
-      if (uIsPureNaval && vIsLandSide) {
-        continue;
-      } else if (uIsLandSide && !vIsLandSide) {
-        if (!ARMY_CAN_EMBARK) continue;
-        if (vIsPureNaval) {
-          const e = +weights["Embark"];
-          if (isFinite(e) && e > 0) nd += e;
-        }
-      } else if (!uIsLandSide && !uIsPureNaval && vIsLandSide) {
+      // Naval-boundary rule — symmetric. Embark and disembark BOTH
+      // only happen via the intra-hex stronghold edges above; every
+      // cross-hex land↔naval transition is blocked, regardless of
+      // whether the naval side is single or combo. See the matching
+      // block in dijkstraHexModePath for the full rationale.
+      if (uIsLandSide !== vIsLandSide) {
         continue;
       }
 
@@ -4339,9 +4346,24 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
     // long as the mode's pixels include the click pixel's subhex (so
     // the line A* actually reaches the click point, not the opposite
     // bank of a river). Pinned end hex further restricts to override.
+    //
+    // Naval-touching combos (LAND+NAVAL, ROAD+NAVAL, …) are NOT valid
+    // endpoints. Their pixel set unions LAND + NAVAL pixels, so a
+    // click on a land subhex falls inside the combo's pixels and the
+    // bare modeContainsPixel check would accept it as a goal — letting
+    // a sea route "land" at any coastal hex by arriving at the combo,
+    // even when the hex isn't a stronghold and no real disembark
+    // happened. The legitimate landing path is naval-single → intra-
+    // hex disembark → LAND-single (the disembark edge above), which
+    // produces a LAND single as the goal state. At a stronghold this
+    // path is available; at a non-stronghold coastal hex the LAND
+    // single is unreachable from sea and the destination is correctly
+    // unreachable. Pure naval-side goals (clicks on a sea subhex)
+    // still work — those modes carry only the NAVAL kind, no combo.
     if (uHex === toHexId
         && (!endOverride || uMode === endOverride)
-        && uInfo && modeContainsPixel(uInfo, toPixIdx)) {
+        && uInfo && modeContainsPixel(uInfo, toPixIdx)
+        && !(uInfo.isCombo && uInfo.kinds && uInfo.kinds.indexOf("NAVAL") >= 0)) {
       // Close out destination hex's running max (0 if we never left start).
       const close = uIsStart ? 0 : uMax;
       const total = d + close;
@@ -4425,6 +4447,39 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
             heap.push([nd, vKey, nMax, uHex, uIsStart]);
           }
         }
+        // Intra-hex EMBARK — mirror of the disembark above. At a
+        // stronghold, the army boards a ship by walking off the city's
+        // land subhex onto a NAVAL single in the same hex. Pays the
+        // current land mode's cost (uMax, forgiven if isStart) plus
+        // the Embark surcharge. Gates parallel the disembark side:
+        //   * uInfo must be a SINGLE LAND/ROAD mode (the land column
+        //     is standing on a real land component, not on a combo's
+        //     transition zone) that ALSO has hasCtf + dockableFromNaval
+        //     (we're embarking AT the city's dock — same physical
+        //     constraint the disembark uses to pick a landing spot).
+        //   * vInfo must be a NAVAL single — boarding moves the army
+        //     onto a discrete ship subhex, not into a transition combo.
+        // Without this rule the army would only be able to disembark
+        // at strongholds but could embark anywhere coastal — the user
+        // wants the two operations symmetric.
+        if (uHexIsStronghold
+            && uIsLandSide && !vIsLandSide
+            && vIsPureNaval
+            && ARMY_CAN_EMBARK
+            && !uInfo.isCombo
+            && uInfo.hasCtf
+            && uInfo.dockableFromNaval) {
+          const land_paid_now = uIsStart ? 0 : uMax;
+          const e = +weights["Embark"] || 0;
+          const nd = d + land_paid_now + (isFinite(e) && e > 0 ? e : 0);
+          const nMax = vInfo.cost;
+          const nStateKey = `${vKey}|${nMax}`;
+          if (nd < (dist.get(nStateKey) ?? Infinity)) {
+            dist.set(nStateKey, nd);
+            prev.set(nStateKey, uStateKey);
+            heap.push([nd, vKey, nMax, uHex, uIsStart]);
+          }
+        }
         continue;
       }
 
@@ -4436,31 +4491,26 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
       const nHex = vHex;
       const nIsStart = false;
       // ── Naval boundary ──
-      // Rule set:
-      //   * pure naval → land-side  : BLOCKED. The only legal
-      //     disembark is the intra-hex stronghold edge above.
-      //   * land-side → PURE naval  : Embark fires (army actually
-      //     boards a ship to sail through a sea hex).
-      //   * land-side → naval COMBO : NO extra Embark surcharge.
-      //     The combo's own mode-cost already includes the Embark
-      //     fee via the NAVAL constituent contribution; charging
-      //     again here would double-bill the boarding.
-      //   * naval combo → land-side : BLOCKED at cross-hex. The
-      //     intra-hex stronghold disembark above is the correct
-      //     path — the prior cross-hex shortcut let routes hop
-      //     sea→neighbor-land without ever traversing the
-      //     stronghold's own land subhex.
+      // Embark and disembark are now symmetric — both happen ONLY
+      // via the intra-hex stronghold edges above. Every cross-hex
+      // land↔naval transition is blocked, regardless of which side
+      // is single or combo:
+      //   * pure naval → land-side  : BLOCKED. Disembark must be the
+      //     intra-hex stronghold edge above.
+      //   * naval combo → land-side : BLOCKED for the same reason —
+      //     prior shortcut let routes hop sea→neighbor-land without
+      //     touching the stronghold's land subhex.
+      //   * land-side → PURE naval  : BLOCKED. Embark must be the
+      //     intra-hex stronghold edge above; allowing cross-hex
+      //     embark anywhere let an army board a ship from any
+      //     coastline, defeating the stronghold gate.
+      //   * land-side → naval COMBO : BLOCKED. The combo's cost
+      //     bakes in the embark fee, so letting cross-hex pick it
+      //     up would still constitute boarding away from a port.
       //   * everything else (combo↔combo, combo→naval-pure,
       //     naval-pure→combo, naval-pure→naval-pure) : no boundary
-      //     surcharge.
-      if (uIsPureNaval && vIsLandSide) {
-        continue;
-      } else if (uIsLandSide && !vIsLandSide) {
-        if (vIsPureNaval) {
-          const e = +weights["Embark"];
-          if (isFinite(e) && e > 0) nd += e;
-        }
-      } else if (!uIsLandSide && !uIsPureNaval && vIsLandSide) {
+      //     surcharge, no block — pure naval-side sailing.
+      if (uIsLandSide !== vIsLandSide) {
         continue;
       }
 
