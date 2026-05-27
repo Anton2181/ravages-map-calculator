@@ -12,6 +12,13 @@ const LAYERS = [
   { id: "rivers",      file: "rivers.png",              label: "Rivers",                 on: true,  opacity: 1.00 },
   { id: "roads",       file: "Roads.png",               label: "Roads",                  on: true,  opacity: 1.00 },
   { id: "ctf",         file: "citiestownsforts.png",    label: "Cities / towns / forts", on: true,  opacity: 1.00 },
+  // Stronghold names overlay — visually piggybacks on the ctf layer's
+  // visibility (drawn when ctf is on, hidden when ctf is off). NOT
+  // included in any mask computation: buildPixelMasks reads explicit
+  // layer-ID lists and this id is not in any of them. `hidden: true`
+  // keeps the row out of the Layers panel; `linkTo` is consulted by
+  // renderLayers to gate drawing on the parent layer's `on` flag.
+  { id: "stronghold-names", file: "Stronghold names.png", label: "Stronghold names",  on: true,  opacity: 1.00, hidden: true, linkTo: "ctf" },
   { id: "simple",      file: "simple grid.png",         label: "Hex grid",               on: false, opacity: 0.40 },
   { id: "base",        file: "Ravages_ver_6.3_hex.png", label: "Hex ID map",             on: false, opacity: 1.00 },
 ];
@@ -4294,6 +4301,18 @@ function dijkstraHexModePath(fromHexId, fromMode, toHexId, toMode, fromPixIdx, t
     if (!isFinite(mInfo.cost) || mInfo.cost < 0) continue;
     if (startOverride && mName !== startOverride) continue;
     if (!modeContainsPixel(mInfo, fromPixIdx)) continue;
+    // ── No combo seeds at the start hex ──────────────────────────────
+    // A combo (LAND+NAVAL, ROAD+NAVAL, …) represents the army DOCKED at
+    // a coastal hex — mid-transition, with the embark surcharge baked
+    // into the combo's cost. Seeding it as a start state lets isStart=
+    // true forgive that surcharge on the way out (close=0), so the
+    // route effectively boards a ship for free. A user clicking on a
+    // pixel just picks where the army IS — land-side clicks should
+    // start in LAND/ROAD, sea-side clicks in NAVAL. The normal cross-
+    // hex rule (LAND→pure-naval adds Embark; LAND→naval-combo defers
+    // to the combo's cost) charges the boarding correctly from then on.
+    // startOverride still bypasses this if a debug pin forces a combo.
+    if (mInfo.isCombo && !startOverride) continue;
     const sKey = `${fromHexId}:${mName}`;
     const sStateKey = `${sKey}|${mInfo.cost}`;
     dist.set(sStateKey, 0);
@@ -7145,6 +7164,10 @@ const LAYERS_ABOVE_ISO = new Set(["rivers", "roads", "ctf", "simple", "base"]);
 function renderLayers() {
   mapCtx.clearRect(0, 0, mapCanvas.width, mapCanvas.height);
   let drewIso = false;
+  // Index for fast `linkTo` lookups so a child layer only paints when
+  // its parent layer's `on` flag is true. Cheap to rebuild per render.
+  const byId = new Map();
+  for (const l of LAYERS) byId.set(l.id, l);
   for (const l of LAYERS) {
     // Insert the iso overlay JUST before the first "above" layer in the stack.
     if (!drewIso && LAYERS_ABOVE_ISO.has(l.id)) {
@@ -7153,6 +7176,12 @@ function renderLayers() {
       drewIso = true;
     }
     if (!l.on || !IMAGES[l.id]) continue;
+    // Linked layers (e.g., stronghold names → ctf) piggyback on the
+    // parent's visibility. Skip drawing when the parent is off.
+    if (l.linkTo) {
+      const parent = byId.get(l.linkTo);
+      if (!parent || !parent.on) continue;
+    }
     mapCtx.globalAlpha = l.opacity;
     mapCtx.drawImage(IMAGES[l.id], 0, 0);
   }
